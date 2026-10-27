@@ -1,8 +1,6 @@
 openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
 ================================================
 
-注：ISC 声明已按 reviewer 2026-10-22 裁决删除（包内无 alist-encrypt 派生代码）。
-
 1. OpenList-Worker（AGPL-3.0-only）
    本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
    上游基线 commit：5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
@@ -25,7 +23,8 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    libuv、ada、mbedtls、quickjs、libffi 均命中）。
    mbedtls 含本项目 2026-10-22 的窄修复（TLS1.2 PSS，补丁 sha256
    cd1d269777facec3a07c3b0549c451c4b9d8278b8e4593e50fd9da85adbdae98），
-   该修改的源码与构建方式见 SOURCE-OFFER 与源码归档 work/txiki-26.9/。
+   该修改的源码与构建方式见 SOURCE-OFFER；运行期完整源码树与构建记录按
+   SOURCE-OFFER 第三节的联系方式书面索取。
 
 4. 许可证全文（包内 /usr/share/openlist-txiki/）
    LICENSE.AGPL-3.0    AGPL-3.0（OpenList-Worker 修改版）

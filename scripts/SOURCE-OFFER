@@ -1,15 +1,15 @@
 openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 ================================================================
 
-包名与版本：openlist-txiki 0.1.0-r17（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
+包名与版本：openlist-txiki 0.1.0-r18（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
 
 本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js），
 按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本包按对外分发口径发布。
 
 一、源码归档（对外可达地址）
 
-  归档文件名：openlist-txiki-source-0.1.0-r17.tar.gz
-  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r17/openlist-txiki-source-0.1.0-r17.tar.gz
+  归档文件名：openlist-txiki-source-0.1.0-r18.tar.gz
+  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r18/openlist-txiki-source-0.1.0-r18.tar.gz
   sha256 与字节数：见同目录 build-manifest.json 的 source_archive_sha256 / source_archive_bytes
   （打包时现算，与归档文件逐字节一致）。
 

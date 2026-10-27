@@ -22,7 +22,7 @@
 
 每个 Release 附带：
 
-1. `openlist-txiki-<版本>-source.tar.gz`：上游 `5f53f58` 的完整源码树 + 全部补丁 + 构建脚本，足以重建同一份 bundle 与 tjs；
+1. `openlist-txiki-source-<版本>.tar.gz`：上游 `5f53f58` 的完整源码树 + 全部补丁 + 构建脚本，足以重建同一份 bundle 与 tjs；
 2. `SOURCE-OFFER`：书面要约，写明获取方式与有效期。
 
 重建步骤见 `docs/BUILD.md`。

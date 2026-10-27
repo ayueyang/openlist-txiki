@@ -1,0 +1,92 @@
+#!/bin/sh
+# openlist-txiki @VERSION@ Linux 启动脚本（x86_64-linux-musl 静态 tjs）
+# 用法：./run.sh start        启动服务
+#       ./run.sh --help       显示用法
+# 默认数据目录：$XDG_DATA_HOME/openlist-txiki，未设则 $HOME/.local/share/openlist-txiki
+# 与 apk 版不同：这里不写 /etc（免 root）；需要 /etc/openlist-txiki 时显式设 TJS_DATA_DIR。
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+  cat <<'EOF'
+Usage: ./run.sh start
+
+  start    start openlist-txiki on 127.0.0.1:15244
+           first run generates the admin password and the JWT secret under
+           ${XDG_DATA_HOME:-$HOME/.local/share}/openlist-txiki (mode 600) and
+           prints the password once; later runs reuse those files
+  --help   show this help
+
+Env (all optional): TJS_PORT TJS_HOST TJS_DATA_DIR TJS_ADMIN_PASS
+                    TJS_JWT_SECRET OPENLIST_TXIKI_READONLY
+EOF
+}
+
+case "${1:-}" in
+  start) ;;
+  -h|--help|"")
+    usage
+    exit 0
+    ;;
+  *)
+    echo "[openlist-txiki] unknown argument: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ -n "${TJS_DATA_DIR:-}" ]; then
+  DATA_DIR=$TJS_DATA_DIR
+elif [ -n "${XDG_DATA_HOME:-}" ]; then
+  DATA_DIR=$XDG_DATA_HOME/openlist-txiki
+else
+  DATA_DIR=$HOME/.local/share/openlist-txiki
+fi
+mkdir -p "$DATA_DIR"
+
+rand_hex() {
+  od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# ---- 管理员口令：env > admin.pass > 首次生成 ----
+if [ -n "${TJS_ADMIN_PASS:-}" ]; then
+  PASS_SOURCE="env TJS_ADMIN_PASS"
+elif [ -r "$DATA_DIR/admin.pass" ]; then
+  TJS_ADMIN_PASS=$(cat "$DATA_DIR/admin.pass")
+  PASS_SOURCE="$DATA_DIR/admin.pass"
+else
+  TJS_ADMIN_PASS=$(rand_hex 8)
+  (umask 077; printf '%s\n' "$TJS_ADMIN_PASS" > "$DATA_DIR/admin.pass")
+  PASS_SOURCE="generated, saved to $DATA_DIR/admin.pass"
+fi
+chmod 600 "$DATA_DIR/admin.pass" 2>/dev/null || true
+export TJS_ADMIN_PASS
+
+# ---- JWT 密钥：持久化，避免重启后旧 token 全失效 ----
+if [ -z "${TJS_JWT_SECRET:-}" ]; then
+  if [ -r "$DATA_DIR/jwt.secret" ]; then
+    TJS_JWT_SECRET=$(cat "$DATA_DIR/jwt.secret")
+  else
+    TJS_JWT_SECRET=$(rand_hex 16)
+    (umask 077; printf '%s\n' "$TJS_JWT_SECRET" > "$DATA_DIR/jwt.secret")
+  fi
+fi
+chmod 600 "$DATA_DIR/jwt.secret" 2>/dev/null || true
+export TJS_JWT_SECRET
+
+TJS_PORT=${TJS_PORT:-15244}
+TJS_HOST=${TJS_HOST:-127.0.0.1}
+export TJS_PORT TJS_HOST
+
+echo "[openlist-txiki] data dir : $DATA_DIR"
+echo "[openlist-txiki] listen   : $TJS_HOST:$TJS_PORT"
+echo "[openlist-txiki] password : $PASS_SOURCE"
+echo "[openlist-txiki] admin pw : $TJS_ADMIN_PASS"
+if [ -n "${OPENLIST_TXIKI_READONLY:-}" ]; then
+  echo "[openlist-txiki] readonly : OPENLIST_TXIKI_READONLY=$OPENLIST_TXIKI_READONLY"
+else
+  echo "[openlist-txiki] readonly : unset (read-only by default; set OPENLIST_TXIKI_READONLY=0 to write)"
+fi
+echo "[openlist-txiki] starting..."
+
+exec "$HERE/tjs" run "$HERE/openlist-txiki.js"

@@ -7,7 +7,7 @@
  *     --bundle artifacts/p2-freeze-20261022T1540/openlist-txiki.js \
  *     --tjs artifacts/p2-freeze-20261022T1540/tjs-pss \
  *     --source-manifest work/p2-source-manifest.txt \
- *     --version 0.1.0-r1 --inputs 435 --out <输出路径>
+ *     --version <版本> --inputs 435 --out <输出路径>
  *
  * 字段与规格 §1 一致；patches 直接取源码指纹清单的 patch 记录（含应用顺序）。
  * fail-closed：bundle/tjs 缺失、清单缺 patch 记录、--version 为空都 exit 1。

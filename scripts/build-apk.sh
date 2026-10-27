@@ -9,15 +9,15 @@
 #
 # 用法（本地构建，apk-tools 3.0.x 带 mkpkg 的 Linux；默认值见下）：
 #   STAGE=/tmp/p3-build/stage SCRIPTS=/tmp/p3-build/scripts \
-#   OUT=/tmp/p3-build/openlist-txiki-0.1.0-r7.apk APK=/tmp/apkstatic/sbin/apk.static \
-#   VERSION=0.1.0-r7 sh scripts/apk/build-apk.sh
+#   OUT=/tmp/p3-build/openlist-txiki-<版本>.apk APK=/tmp/apkstatic/sbin/apk.static \
+#   VERSION=<版本> sh scripts/apk/build-apk.sh
 #
 # STAGE 是解包后的文件树（只含包内 11 个文件）；SCRIPTS 是 5 个生命周期脚本所在目录。
-# 默认 VERSION=0.1.0-r7、OUT=/tmp/p3-build/openlist-txiki-$VERSION.apk：
-# 直接重打不会再产出比线上低的 0.1.0-r1（2026-10-22 20:12 实测降级陷阱）。
+# VERSION 必须显式给出，OUT 默认 /tmp/p3-build/openlist-txiki-$VERSION.apk：
+# 直接重打不会再产出比线上低的包（2026-10-22 实测降级陷阱）。
 set -eu
 
-VERSION=${VERSION:-0.1.0-r7}
+VERSION=${VERSION:?必须显式给出 VERSION（0.1.0 加 -r 序号）}
 STAGE=${STAGE:-/tmp/p3-build/stage}
 SCRIPTS=${SCRIPTS:-/tmp/p3-build/scripts}
 OUT=${OUT:-/tmp/p3-build/openlist-txiki-$VERSION.apk}
@@ -30,7 +30,7 @@ for s in pre-deinstall post-install pre-upgrade post-upgrade post-deinstall; do
 done
 
 # S4 fail-closed：manifest 里的 package_version 必须等于本次包的 $VERSION，不等就中止。
-# 现状 r6 的 manifest 仍写 0.1.0-r5（r5→r6 只改了 arch），不拦就会带着旧版本号出门。
+# 历史事故：manifest 与 VERSION 不同步（只改 arch 没跟版本号），不拦就会带着旧版本号出门。
 MANIFEST=$STAGE/usr/share/openlist-txiki/build-manifest.json
 [ -f "$MANIFEST" ] || { echo "FAIL: 缺 $MANIFEST" >&2; exit 1; }
 manifest_version=$(sed -n 's/.*"package_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1)

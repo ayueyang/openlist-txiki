@@ -1,0 +1,108 @@
+@echo off
+setlocal EnableExtensions
+rem openlist-txiki @VERSION@ Windows launcher.
+rem Usage: run.cmd start        start the server
+rem        run.cmd --help       show this help
+rem Default data dir: %LOCALAPPDATA%\openlist-txiki (falls back to the current dir).
+rem TJS_DATA_DIR overrides it (same directory the app itself uses).
+rem No admin rights needed. Listens on loopback by default.
+rem ASCII-only on purpose: cmd.exe re-reads batch files in the console codepage,
+rem and non-ASCII text can break line parsing after a codepage switch.
+set "HERE=%~dp0"
+
+if "%~1"=="" goto :usage
+if /i "%~1"=="start" goto :start
+if /i "%~1"=="--help" goto :usage
+if /i "%~1"=="-h" goto :usage
+if /i "%~1"=="/?" goto :usage
+echo [openlist-txiki] unknown argument: %~1
+echo.
+goto :usage_err
+
+:usage
+echo Usage: run.cmd start
+echo.
+echo   start    start openlist-txiki on 127.0.0.1:15244
+echo            first run generates the admin password and the JWT secret under
+echo            %%LOCALAPPDATA%%\openlist-txiki and prints the password once;
+echo            later runs reuse the files in that directory
+echo   --help   show this help
+echo.
+echo Env (all optional): TJS_PORT TJS_HOST TJS_DATA_DIR TJS_ADMIN_PASS
+echo                     TJS_JWT_SECRET OPENLIST_TXIKI_READONLY
+exit /b 0
+
+:usage_err
+echo Usage: run.cmd start   (see run.cmd --help)
+exit /b 2
+
+:start
+if defined TJS_DATA_DIR goto :dir_custom
+if "%LOCALAPPDATA%"=="" goto :dir_cwd
+set "DATA_DIR=%LOCALAPPDATA%\openlist-txiki"
+goto :dir_ready
+:dir_cwd
+set "DATA_DIR=%CD%"
+goto :dir_ready
+:dir_custom
+set "DATA_DIR=%TJS_DATA_DIR%"
+:dir_ready
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%" >nul 2>nul
+set "DP=%DATA_DIR:/=\%"
+
+rem ---- admin password: env > admin.pass > generated on first run ----
+set "PASS_SOURCE=none"
+if defined TJS_ADMIN_PASS set "PASS_SOURCE=env TJS_ADMIN_PASS"
+if defined TJS_ADMIN_PASS goto :pass_ready
+if not exist "%DATA_DIR%\admin.pass" goto :pass_gen
+set /p TJS_ADMIN_PASS=<"%DATA_DIR%\admin.pass"
+if not defined TJS_ADMIN_PASS goto :pass_gen
+set "PASS_SOURCE=%DATA_DIR%\admin.pass"
+goto :pass_ready
+:pass_gen
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "[guid]::NewGuid().ToString('N').Substring(0,16)"`) do set "TJS_ADMIN_PASS=%%P"
+if not defined TJS_ADMIN_PASS (
+  echo [openlist-txiki] cannot generate admin password: set TJS_ADMIN_PASS and retry.
+  exit /b 1
+)
+>"%DATA_DIR%\admin.pass" echo %TJS_ADMIN_PASS%
+set "PASS_SOURCE=generated, saved to %DATA_DIR%\admin.pass"
+:pass_ready
+
+rem ---- JWT secret: persisted so restarts do not invalidate old tokens ----
+if defined TJS_JWT_SECRET goto :jwt_done
+if not exist "%DATA_DIR%\jwt.secret" goto :jwt_gen
+set /p TJS_JWT_SECRET=<"%DATA_DIR%\jwt.secret"
+if defined TJS_JWT_SECRET goto :jwt_done
+:jwt_gen
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')"`) do set "TJS_JWT_SECRET=%%P"
+if not defined TJS_JWT_SECRET (
+  echo [openlist-txiki] cannot generate JWT secret: set TJS_JWT_SECRET and retry.
+  exit /b 1
+)
+>"%DATA_DIR%\jwt.secret" echo %TJS_JWT_SECRET%
+:jwt_done
+
+rem ---- current user only (there is no chmod 600 on Windows; narrow the ACL) ----
+icacls "%DP%\admin.pass" /inheritance:r /grant:r "%USERNAME%:F" >nul 2>nul
+icacls "%DP%\jwt.secret" /inheritance:r /grant:r "%USERNAME%:F" >nul 2>nul
+
+if defined TJS_PORT goto :port_ready
+set "TJS_PORT=15244"
+:port_ready
+if defined TJS_HOST goto :host_ready
+set "TJS_HOST=127.0.0.1"
+:host_ready
+
+echo [openlist-txiki] data dir: %DATA_DIR%
+echo [openlist-txiki] listen  : %TJS_HOST%:%TJS_PORT%
+echo [openlist-txiki] password: %PASS_SOURCE%
+echo [openlist-txiki] admin pw: %TJS_ADMIN_PASS%
+if defined OPENLIST_TXIKI_READONLY echo [openlist-txiki] readonly: OPENLIST_TXIKI_READONLY=%OPENLIST_TXIKI_READONLY%
+if not defined OPENLIST_TXIKI_READONLY echo [openlist-txiki] readonly: unset (read-only by default; set OPENLIST_TXIKI_READONLY=0 to write)
+echo [openlist-txiki] starting...
+
+"%HERE%tjs.exe" run "%HERE%openlist-txiki.js"
+set "RC=%ERRORLEVEL%"
+echo [openlist-txiki] exited with code %RC%
+exit /b %RC%
