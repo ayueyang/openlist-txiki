@@ -6,7 +6,11 @@
   固定基线 commit：`5f53f58dd0f5e5d03eb6079da7f637fa151d8dca`
   应用补丁：21 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）
 - 运行时：**qwtel/txiki-js** fork（txiki.js 26.9.0），许可证 MIT
-  tjs 侧补丁：6 个，见 `patches/txiki/`
+  tjs 侧补丁：7 个，见 `patches/txiki/`，逐个如下（前 6 个用于本版发布的三目标
+  aarch64-linux-musl / x86_64-linux-musl / x86_64-windows，第 7 个只用于 aarch64-windows）：
+  `p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`、`mbedtls-tls12-pss.patch`、
+  `lws-mbedtls-client-alpn-uaf.patch`、`mbedtls-quic.patch`、`wamr-zig.patch`、
+  `libffi-aarch64-windows.patch`（仅 aarch64-windows，本版三目标不发它）
 
 ## 许可证归属
 

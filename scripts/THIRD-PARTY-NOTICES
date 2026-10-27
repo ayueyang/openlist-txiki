@@ -34,5 +34,3 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    LICENSE.MIT         MIT 原文（txiki.js、libwebsockets、QuickJS、libuv、libffi、mimalloc）
    sqlite3 与 tweetnacl 为 Public Domain，不要求附许可证全文。
 
-5. 对外分发前仍需（SOURCE-OFFER 档二）
-   公开源码地址与发布位置；补齐后按 SOURCE-OFFER 第二节写生效行，再重新出包。

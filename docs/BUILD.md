@@ -49,7 +49,15 @@ node build/build-txiki.mjs
 
 ## 4. 编 tjs
 
-tjs 来自 `qwtel/txiki-js` fork（26.9.0），需要打 `patches/txiki/` 下的 6 个补丁（TLS 1.2 PSS、LWS 客户端 ALPN、mbedtls QUIC、WAMR、流式请求体、异常中断补全）。
+tjs 来自 `qwtel/txiki-js` fork（26.9.0）。`patches/txiki/` 下共 7 个补丁文件：
+
+- 本版发布的三目标（aarch64-linux-musl、x86_64-linux-musl、x86_64-windows）打这 6 个：
+  `p6-stream-body.patch`（Content-Length 请求体流式化）、
+  `p6b-abort-incomplete-body.patch`（断连补全）、
+  `mbedtls-tls12-pss.patch`（TLS 1.2 PSS）、
+  `lws-mbedtls-client-alpn-uaf.patch`（LWS 客户端 ALPN）、
+  `mbedtls-quic.patch`（mbedtls QUIC）、`wamr-zig.patch`（WAMR）；
+- 第 7 个 `libffi-aarch64-windows.patch` 仅 aarch64-windows 目标需要，本版三目标不发它。
 
 ```sh
 bash build/build-merged.sh
