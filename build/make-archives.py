@@ -14,12 +14,18 @@ fail-closed（任一成立即 rc=1，且不留下 zip/tar）：
   T3 渲染后的 assets 里出现 '0.1.0-rN' 且不等于 --version
   T4 打出来的归档里任一条目出现 '0.1.0-rN' 且不等于 --version
   T5 归档条目字节与渲染源不一致，或缺条目
+  T6 --license-dir 下缺 LICENSE_FILES 里的任一份全文
+
+四份许可证全文（LICENSE_FILES）各打两份：归档根目录一份，LICENSE_SUBDIR 下再一份。
+包内 THIRD-PARTY-NOTICES 同时写了「见 LICENSE.AGPL-3.0」与「包内 /usr/share/openlist-txiki/」，
+两个声明都要在同一件归档内成立。
 
 用法：
   python3 build/make-archives.py --version 0.1.0-r18 \\
       --release-dir artifacts/release-r18-HHMM \\
       --bin-dir artifacts/release-r18-HHMM/bin \\
-      --legal-dir scripts/apk
+      --legal-dir scripts/apk \\
+      --license-dir <含四份 LICENSE.* 全文的目录，默认同 --legal-dir>
   --template-dir 可覆盖模板目录（负向实测用）；--render-only 只渲染不打包。
 """
 import argparse
@@ -40,7 +46,15 @@ FILE_MODES = {
     "README-Windows.md": 0o644,
     "run.cmd": 0o644,
     "run.sh": 0o755,
+    "tjs": 0o755,
 }
+LICENSE_FILES = (
+    "LICENSE.AGPL-3.0",
+    "LICENSE.LGPL-3.0",
+    "LICENSE.Apache-2.0",
+    "LICENSE.MIT",
+)
+LICENSE_SUBDIR = "usr/share/openlist-txiki"
 
 
 def sha256_bytes(b):
@@ -138,6 +152,7 @@ def main():
     ap.add_argument("--release-dir", required=True)
     ap.add_argument("--bin-dir", default=None)
     ap.add_argument("--legal-dir", default=None)
+    ap.add_argument("--license-dir", default=None)
     ap.add_argument("--template-dir", default=None)
     ap.add_argument("--render-only", action="store_true")
     a = ap.parse_args()
@@ -147,6 +162,7 @@ def main():
     tpl_dir = a.template_dir or os.path.join(here, "assets")
     bin_dir = a.bin_dir or os.path.join(a.release_dir, "bin")
     legal_dir = a.legal_dir or os.path.join(pub, "scripts")
+    lic_dir = a.license_dir or legal_dir
     rel = a.release_dir
     assets_dir = os.path.join(rel, "assets")
 
@@ -168,6 +184,13 @@ def main():
             if bad:
                 raise RuntimeError("T3 STALE_VERSION legal %s: %s" % (n, ",".join(bad)))
 
+        licenses = {}
+        for n in LICENSE_FILES:
+            p = os.path.join(lic_dir, n)
+            if not os.path.isfile(p):
+                raise RuntimeError("T6 LICENSE_MISSING %s" % p)
+            licenses[n] = read_bytes(p)
+
         sub = lambda *p: os.path.join(*p)
         win_entries = [
             ("tjs.exe", read_bytes(sub(bin_dir, "tjs-x86_64-windows.exe"))),
@@ -184,6 +207,12 @@ def main():
             ("SOURCE-OFFER", legal["SOURCE-OFFER"]),
             ("THIRD-PARTY-NOTICES", legal["THIRD-PARTY-NOTICES"]),
         ]
+        for name, data in licenses.items():
+            win_entries.append((name, data))
+            lnx_entries.append((name, data))
+        for name, data in licenses.items():
+            win_entries.append((LICENSE_SUBDIR + "/" + name, data))
+            lnx_entries.append((LICENSE_SUBDIR + "/" + name, data))
         sums = lambda entries: ("SHA256SUMS", "\n".join(
             "%s  %s" % (sha256_bytes(d), n) for n, d in entries).encode() + b"\n")
         win_entries.append(sums(win_entries))
