@@ -1,0 +1,24 @@
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -1526,7 +1526,20 @@
+       return c.json({ code: 200, message: "success", data: null })
+     }
+ 
+-    const chunkSize = clampChunkSize(rawChunk)
++    // C3：默认分片只对 Local 收紧到 5MB——客户端不带 X-Chunk-Size 时把 100MB
++    // 上传的进程峰值增量压进 32MB 门。全局 CHUNK_DEFAULT 保持 10MB：189 驱动
++    // 自带 10MB partCount 校验（189/driver.ts:478、527-529），全局降到 5MB 会
++    // 让片号越界，属硬冲突；123pan/weiyun 的自带 chunkSize 也会被放大错位。
++    // 客户端显式指定（rawChunk>0）走原分支，行为不变。
++    // 注意：storage.driver 存的是配置里的原始写法（"Local"/"S3"），不是注册表
++    // 的小写键，这里按 getDriver 同一规则归一化后再比（storage.ts:1254-1256）。
++    const isLocalDriver =
++      String(resolved.storage!.driver || "")
++        .toLowerCase()
++        .replace(/[^a-z0-9]/g, "") === "local"
++    const chunkSize = clampChunkSize(
++      rawChunk > 0 ? rawChunk : isLocalDriver ? 5 * 1024 * 1024 : 0,
++    )
+     const totalChunks = Math.max(1, Math.ceil(size / chunkSize))
+ 
+     // 断点续传：同 owner + path+size 的未完成会话直接复用（按用户隔离）

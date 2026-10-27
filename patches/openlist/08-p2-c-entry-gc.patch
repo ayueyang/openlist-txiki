@@ -1,0 +1,24 @@
+diff --git a/src/backend/txiki/entry.ts b/src/backend/txiki/entry.ts
+index 95e7f38..952ad40 100644
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -173,7 +173,18 @@ function apiReadonlyGate(req: Request, readonly: boolean): Response | null {
+ async function handle(req: Request): Promise<Response> {
+   const blocked = davGate(req, cfg.readonly) || apiReadonlyGate(req, cfg.readonly)
+   if (blocked) return blocked
+-  return app.fetch(req, env, ctx as any)
++  // txiki 26.9 + Hono：请求体读完后的 ArrayBuffer 不计入 QuickJS 的 GC 触发阈值
++  // （Hono 的 Context/HonoRequest 引用环），实测 10MB 上传每次请求 RSS 涨约 10MB，
++  // 第 3 次就被 OOM 杀掉（见 progress.md 2026-10-21 C 段）。app.fetch 返回后对
++  // 大 body 请求显式跑一次 GC，把已结束请求的 body 收掉；小请求不跑，避免无谓开销。
++  const bodyLen = Number(req.headers.get("content-length") || 0)
++  const res = await app.fetch(req, env, ctx as any)
++  if (bodyLen >= 1024 * 1024) {
++    try {
++      ;(tjs as any).engine?.gc?.run?.()
++    } catch {}
++  }
++  return res
+ }
+ 
+ console.log(

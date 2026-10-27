@@ -1,0 +1,207 @@
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index c52ac0a..7da5b90 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -90,10 +90,13 @@ async function webdavAuth(
+         (u: any) => u.username === username && !u.disabled,
+       )
+       if (!user) return null
+-      // 空密码用户（guest）：Basic Auth 下若未提供密码则允许（与 AList 一致）
++      // 空密码用户：只有 guest 允许 Basic 空密码（与 AList 一致）。
++      // 非 guest 的空密码必须拒绝：Go 库的 admin 行是 password=''、pwd_hash 有值，
++      // 一旦按空密码放行，`curl -u admin:` 就是 role=2 的免密入口。
+       if (!user.password) {
++        if (!isGuest(user)) return null
+         if (password !== "") return null
+-        return { user, metaPassword: isGuest(user) ? password : "" }
++        return { user, metaPassword: password }
+       }
+       if (await verifyUserPassword(user, password)) {
+         return { user, metaPassword: isGuest(user) ? password : "" }
+diff --git a/src/backend/txiki/config.ts b/src/backend/txiki/config.ts
+new file mode 100644
+index 0000000..37066a6
+--- /dev/null
++++ b/src/backend/txiki/config.ts
+@@ -0,0 +1,71 @@
++/**
++ * txiki 运行时配置。
++ *
++ * 优先级：环境变量 > config.json > 默认值。
++ * P1 只认这几个键，不引入额外配置项。
++ */
++export interface TxikiConfig {
++  port: number
++  hostname: string
++  dbPath: string
++  jwtSecret: string
++  adminPass: string
++  dbCipher: string
++  dataDir: string
++}
++
++const DEFAULTS = {
++  port: 15244,
++  // P1 默认只绑回环：WebDAV Basic 是明文，且没有前端时要避免 LAN 暴露。
++  hostname: "127.0.0.1",
++  dbPath: "",
++  jwtSecret: "",
++  adminPass: "",
++  dbCipher: "none",
++  // OpenWrt 的 /tmp 是 tmpfs，进程重启不丢、整机重启就丢。默认放持久分区，
++  // 测试要临时目录必须显式设 TJS_DATA_DIR。
++  dataDir: "/etc/openlist-txiki",
++}
++
++export function loadConfig(): TxikiConfig {
++  const env = (tjs.env || {}) as Record<string, string>
++  let file: Record<string, any> = {}
++  const cfgPath = env.TJS_CONFIG || ""
++  if (cfgPath) {
++    try {
++      file = JSON.parse(tjs.readFile(cfgPath, "utf8") as string)
++    } catch (err) {
++      throw new Error(`failed to read TJS_CONFIG=${cfgPath}: ${(err as Error).message}`)
++    }
++  }
++
++  const pick = (key: string, envKey: string) => {
++    const v = env[envKey]
++    if (v !== undefined && v !== "") return v
++    const f = file[key]
++    return f === undefined || f === null ? "" : String(f)
++  }
++
++  const dataDir = pick("dataDir", "TJS_DATA_DIR") || DEFAULTS.dataDir
++  let dbPath = pick("dbPath", "TJS_DB") || `${dataDir}/data.db`
++  if (!dbPath.startsWith("/")) dbPath = `${dataDir}/${dbPath}`
++
++  const portRaw = pick("port", "TJS_PORT")
++  const port = portRaw ? Number(portRaw) : DEFAULTS.port
++  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
++    throw new Error(`invalid port: ${portRaw}`)
++  }
++
++  const jwtSecret = pick("jwtSecret", "TJS_JWT_SECRET") || pick("jwtSecret", "JWT_SECRET")
++  if (!jwtSecret) throw new Error("JWT_SECRET (TJS_JWT_SECRET) is required")
++
++  return {
++    port,
++    hostname: pick("hostname", "TJS_HOST") || DEFAULTS.hostname,
++    dbPath,
++    jwtSecret,
++    adminPass: pick("adminPass", "TJS_ADMIN_PASS") || pick("adminPass", "ADMIN_PASS"),
++    dbCipher: pick("dbCipher", "TJS_DB_CIPHER") || DEFAULTS.dbCipher,
++    dataDir,
++  }
++}
+diff --git a/src/backend/txiki/entry.ts b/src/backend/txiki/entry.ts
+new file mode 100644
+index 0000000..20831fe
+--- /dev/null
++++ b/src/backend/txiki/entry.ts
+@@ -0,0 +1,104 @@
++/**
++ * txiki.js 入口：tjs.serve + Hono app.fetch。
++ *
++ * 只做四件事：读配置、开库、构造 env、起服务。业务逻辑全在 ../index。
++ */
++import app from "../index"
++import { loadConfig } from "./config"
++import { openDatabase } from "./sqlite-d1"
++
++// txiki 的 Headers 没有 getSetCookie（Node 18+/undici 才有）。Hono 在
++// 已有响应的 set-cookie 头上会调用它，缺了会让登录等所有设 cookie 的接口 500。
++// P1 只发一个 cookie，用 get() 拆一条足够；多 cookie 的逗号合并有歧义，记为已知限制。
++{
++  const hp = Headers.prototype as any
++  if (typeof hp.getSetCookie !== "function") {
++    hp.getSetCookie = function (this: Headers) {
++      const v = this.get("set-cookie")
++      return v ? v.split(/,(?=[^;,]+=)/) : []
++    }
++  }
++}
++
++const cfg = loadConfig()
++
++// 数据目录可能不存在：先建（tjs.makeDir 是 async，必须 await；递归模式对已存在目录不抛错）。
++// 不 await 会让下面的同步 openDatabase 先跑，日志报 "Error at open (native)"，看起来像路径不存在。
++try {
++  await tjs.makeDir(cfg.dataDir, { recursive: true } as any)
++} catch (err) {
++  console.error(`[txiki] failed to create dataDir ${cfg.dataDir}: ${(err as Error).message}`)
++}
++
++const { db, pragmas } = await openDatabase(cfg.dbPath)
++
++const env: Record<string, any> = {
++  DB: db,
++  OPENLIST_DB: db,
++  DB_DRIVER: "d1",
++  DB_FORMAT: "sql",
++  DB_CIPHER: cfg.dbCipher,
++  JWT_SECRET: cfg.jwtSecret,
++  ADMIN_PASS: cfg.adminPass,
++  TZ: (tjs.env || {}).TZ || "UTC",
++}
++
++const ctx = {
++  waitUntil(_p: Promise<any>) {},
++  passThroughOnException() {},
++}
++
++/**
++ * P1 的 /dav 只读门。
++ *
++ * 上游 server/webdav.ts 的 OPTIONS 宣告 DAV 1,2 并实现了 PUT/MKCOL/DELETE/
++ * MOVE/COPY；现在只是 libwebsockets 不认这些方法才 403。一旦方法表被补丁
++ * 打开，写方法立刻可用。P1 不做写，所以这里按方法白名单拦掉，不依赖运行时
++ * 是否支持；OPTIONS 也只宣告 DAV:1。
++ */
++const DAV_READONLY = new Set(["OPTIONS", "PROPFIND", "GET", "HEAD"])
++const DAV_ALLOW = "OPTIONS, PROPFIND, GET, HEAD"
++
++function davGate(req: Request): Response | null {
++  let pathname = ""
++  try {
++    pathname = new URL(req.url).pathname
++  } catch {
++    return null
++  }
++  if (pathname !== "/dav" && !pathname.startsWith("/dav/")) return null
++  if (req.method === "OPTIONS") {
++    return new Response(null, {
++      status: 200,
++      headers: { DAV: "1", Allow: DAV_ALLOW, "Content-Length": "0" },
++    })
++  }
++  if (!DAV_READONLY.has(req.method)) {
++    return new Response("Method Not Allowed", {
++      status: 405,
++      headers: { Allow: DAV_ALLOW, "Content-Type": "text/plain" },
++    })
++  }
++  return null
++}
++
++async function handle(req: Request): Promise<Response> {
++  const blocked = davGate(req)
++  if (blocked) return blocked
++  return app.fetch(req, env, ctx as any)
++}
++
++console.log(
++  `[txiki] openlist starting: listen=${cfg.hostname}:${cfg.port} db=${cfg.dbPath} driver=d1 format=sql cipher=${cfg.dbCipher} admin=${cfg.adminPass ? "set" : "unset"}`,
++)
++console.log(
++  `[txiki] sqlite: journal=${pragmas.journal_mode} synchronous=${pragmas.synchronous} busy_timeout=${pragmas.busy_timeout}`,
++)
++
++tjs.serve({
++  port: cfg.port,
++  listenIp: cfg.hostname,
++  fetch: handle,
++})
++
++console.log(`[txiki] listening on ${cfg.hostname}:${cfg.port}`)

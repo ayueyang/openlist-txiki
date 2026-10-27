@@ -1,0 +1,1265 @@
+diff --git a/src/backend/index.ts b/src/backend/index.ts
+index 21293bb..9621c10 100644
+--- a/src/backend/index.ts
++++ b/src/backend/index.ts
+@@ -7,9 +7,37 @@ import { s3Router } from "./server/s3"
+ import { setEnvCtx } from "./internal/model/db"
+ import { getStoreConfigErrorDetail } from "./internal/model/store/backend"
+ import { storageErrorSummary, uiStorageError } from "./server/storage-error"
++import { isPathRejected, pathRejectedResponse } from "./pkg/canonical-path"
+ 
+ const app = new Hono()
+ 
++/**
++ * P1-18：路径拒绝的全局兜底。
++ *
++ * getActualPath / isWithinUserRoot / resolvePath 现在是"拒绝"语义（抛
++ * PathRejectedError），而多数 handler 的 getActualPath 调用在 try 之外
++ * （如 fs.ts 的 /fs/list、/fs/get）。逐个调用点判 null 会把 diff 从 8 个文件
++ * 涨到 20+，且以后上游新增路由一定漏；因此在这里挂一次，把 PathRejectedError
++ * 统一转成与 Go 一致的 403 {"code":403,"message":"relative path"}。
++ * 其余异常保持默认语义。
++ *
++ * P1-18 复验（23:21 设备实测）：原来挂的是 app.use("*") 里的 try { await next() }
++ * catch —— 在 Hono v4 里看不到下游异常：compose 在**抛出点**就 catch 并调 onError
++ * （hono/dist/compose.js），所以 fs/list、fs/get、fs/put、fs/mkdir 的越界路径回
++ * 500 纯文本，只有自带 catch 的 rename/remove/move/copy 才是 403。改用 onError，
++ * 任何 handler 漏出的 PathRejectedError 都统一 403 JSON。
++ */
++app.onError((err, c) => {
++  if (isPathRejected(err)) return pathRejectedResponse(c, err)
++  // 其余异常保持 Hono 默认行为（抄 hono-base.js 的 errorHandler），不改变既有语义
++  if ("getResponse" in (err as any)) {
++    const res = (err as any).getResponse()
++    return c.newResponse(res.body, res)
++  }
++  console.error(err)
++  return c.text("Internal Server Error", 500)
++})
++
+ /**
+  * 静态资源 / SPA 壳路径：这些请求不应被存储配置错误拦截，
+  * 否则前端连提示页面都加载不出来。
+diff --git a/src/backend/internal/model/db.ts b/src/backend/internal/model/db.ts
+index 5f8e80f..283acba 100644
+--- a/src/backend/internal/model/db.ts
++++ b/src/backend/internal/model/db.ts
+@@ -13,6 +13,7 @@ import {
+   writePersistedSecret,
+ } from "./store/json"
+ import { getStoreBackend, readCipher } from "./store/backend"
++import { canonicalizePath, PathRejectedError } from "../../pkg/canonical-path"
+ 
+ // 保持外部（middlewares.ts / router.ts / admin.ts）对 getKvBinding / getKvStatus
+ // 的既有引用不变，从 json 后端 re-export。
+@@ -2163,74 +2164,16 @@ export const saveDb = async (
+ export async function resolvePath(virtualPath: string, envCtx?: any) {
+   const db = await getDb(envCtx)
+ 
+-  // ============ 路径遍历防护增强 (2026-09-08) ============
+-  // 1. URL 解码（防止 %2e%2e 等编码绕过）
+-  let path = virtualPath
+-  try {
+-    path = decodeURIComponent(String(path || ""))
+-  } catch {
+-    // 解码失败，使用原始值
+-  }
+-
+-  // 2. 多重解码检测（防止双重编码绕过）
+-  let prevPath = ""
+-  let decodeAttempts = 0
+-  while (path !== prevPath && decodeAttempts < 3) {
+-    prevPath = path
+-    try {
+-      const decoded = decodeURIComponent(path)
+-      if (decoded === path) break // 没有更多编码
+-      path = decoded
+-      decodeAttempts++
+-    } catch {
+-      break
+-    }
+-  }
+-
+-  // 3. 规范化路径分隔符和特殊字符
+-  path = path
+-    .replace(/\\/g, "/") // 反斜杠 -> 正斜杠
+-    .replace(/%5c/gi, "/") // URL 编码的反斜杠
+-    .replace(/%2f/gi, "/") // URL 编码的正斜杠
+-    .replace(/\.{3,}/g, "..") // 多个点规范化为 ..
+-    .replace(/\/+/g, "/") // 多个斜杠合并为一个
+-
+-  // 4. 检测非法字符
+-  const illegalChars = ["\0", "\r", "\n", "\t"]
+-  for (const ch of illegalChars) {
+-    if (path.includes(ch)) {
+-      throw new Error(
+-        `invalid path: illegal character detected (0x${ch.charCodeAt(0).toString(16)})`,
+-      )
+-    }
+-  }
+-
+-  // 5. Windows 绝对路径检测
+-  if (/^[A-Za-z]:/.test(path)) {
+-    throw new Error("invalid path: absolute Windows path not allowed")
+-  }
+-
+-  // 6. UNC 路径检测
+-  if (path.startsWith("//") || path.startsWith("\\\\")) {
+-    throw new Error("invalid path: UNC path not allowed")
+-  }
+-
+-  // Normalize ".." / "." segments so callers cannot escape the storage
+-  // mount root (path traversal). A leading ".." that pops an empty stack
+-  // is clamped to the root instead of escaping upward.
+-  const stack: string[] = []
+-  for (const seg of path.split("/")) {
+-    if (seg === "" || seg === ".") continue
+-    if (seg === "..") {
+-      stack.pop()
+-      continue
+-    }
+-    stack.push(seg)
+-  }
+-  let cleanPath = "/" + stack.join("/")
+-  if (cleanPath === "") {
+-    cleanPath = "/"
+-  }
++  // P1-18：规范化收口到 pkg/canonical-path。
++  // 解码只发生在传输边界（fs.ts 的 File-Path、raw.ts 的下载路径、webdav.ts 的
++  // URL/Destination、s3.ts 的 key），本函数**不再解码**；也不再把 "...." 折成
++  // ".."、把 "%2f" 换成 "/" —— 那正是检查侧（getActualPath）与解析侧对同一
++  // 字符串给出不同答案、从而越界的根因。
++  // 拒绝语义：含 ".." 或二次编码残留一律抛 PathRejectedError（403），不再
++  // 钳制到根（钳制会得到 200 空表，过不了「越界请求必须非 200」的验收）。
++  const canon = canonicalizePath(String(virtualPath || ""))
++  if (!canon.ok) throw new PathRejectedError(canon.reason)
++  const cleanPath = canon.path
+ 
+   const activeStorages = (db.storages || []).filter(
+     (s: any) =>
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 9c7ea38..74c9945 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -1,5 +1,6 @@
+ import { resolvePath, getDb, getSettings, saveDb } from "../model/db"
+ import { encodeDownloadPath } from "../../pkg/path"
++import { assertCanonicalPath } from "../../pkg/canonical-path"
+ import { singleflight } from "../../pkg/singleflight"
+ import { canUseProxyEndpoint, normalizeExtList } from "../driver/proxy"
+ import { FileItem, StorageDriver, calcFileType } from "../driver/base"
+@@ -1629,7 +1630,7 @@ async function getItemResolved(
+         raw_url: "",
+       },
+       provider: resolved.storage.driver,
+-      rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(virtualPath)}`,
++      rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(assertCanonicalPath(virtualPath))}`,
+     }
+   }
+ 
+@@ -1664,7 +1665,7 @@ async function getItemResolved(
+     // （对齐 Go utils.EncodePath(path, true)）：raw_url 会被前端直接当 href/src
+     // 使用，未编码的 `?`/`#` 会被截断、裸 `%` 会让服务端 decodeURIComponent 抛错
+     // （见 pkg/path.encodeDownloadPath 注释）。
+-    rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(virtualPath)}`,
++    rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(assertCanonicalPath(virtualPath))}`,
+   }
+ }
+ 
+diff --git a/src/backend/pkg/canonical-path.ts b/src/backend/pkg/canonical-path.ts
+new file mode 100644
+index 0000000..f370536
+--- /dev/null
++++ b/src/backend/pkg/canonical-path.ts
+@@ -0,0 +1,110 @@
++/**
++ * 唯一路径规范化函数（P1-18）。
++ *
++ * 安全不变量：**范围检查**（pkg/permission.getActualPath / isWithinUserRoot）与
++ * **实际解析**（internal/model/db.resolvePath）必须对同一个字符串给出同一个答案，
++ * 因此两边都只调用本文件的 canonicalizePath()，且本函数不解码。
++ *
++ * 历史缺陷：检查侧 normalizeSegments() 不解码、只折字面 ".."；解析侧 resolvePath()
++ * 最多解 4 次码、把 "%2f" 换成 "/"、把连续 3 个以上点折成 ".."。两套流水线
++ * 对 "/%252e%252e/x" 这类写法的答案不同，于是「检查放行、解析越界」。
++ *
++ * 设计取舍（详见 SPEC-P118）：
++ *  - 解码只发生在传输边界，各恰好一次（decodeWirePath）。JSON body 里的路径
++ *    本来就是解码后的形态，不能再解；
++ *  - 路径里出现「整段全是点且长度 >=2」的段（.. / ... / ....）一律拒绝
++ *    （不折叠、不钳制）。钳制会得到 200 空表，过不了「越界请求必须非 200」的
++ *    验收；"a..b.txt"、"..a.txt"、"a.." 是合法文件名，按段判而不是子串判；
++ *  - 二次编码残留（%2e/%2f/%5c，以及 %252e/%252f/%255c）一律拒绝：这是
++ *    「再解一次就会改变段结构」的集合；裸 %25 不再当残留（解码只在传输边界做
++ *    一次，字面 % 就是文件名字符，REG-NAME L5/L6）；只改字符不改结构的
++ *    %20、%41 放行。
++ */
++
++export type PathRejectReason =
++  | "illegal-char"
++  | "windows-abs"
++  | "unc"
++  | "relative-path"
++  | "encoded-residue"
++
++export class PathRejectedError extends Error {
++  readonly reason: PathRejectReason
++  readonly status: 400 | 403
++
++  constructor(reason: PathRejectReason) {
++    super(
++      reason === "relative-path" || reason === "encoded-residue"
++        ? "relative path"
++        : "invalid path",
++    )
++    this.name = "PathRejectedError"
++    this.reason = reason
++    this.status = reason === "relative-path" || reason === "encoded-residue" ? 403 : 400
++  }
++}
++
++/** 传输边界上恰好解码一次。非法百分号序列 / 孤立代理项返回 ok:false。 */
++export function decodeWirePath(
++  raw: string,
++): { ok: true; path: string } | { ok: false } {
++  try {
++    return { ok: true, path: decodeURIComponent(String(raw ?? "")) }
++  } catch {
++    return { ok: false }
++  }
++}
++
++/** 唯一规范化函数：不解码、不抛错。 */
++export function canonicalizePath(
++  input: string,
++): { ok: true; path: string } | { ok: false; reason: PathRejectReason } {
++  const s = String(input ?? "").replace(/\\/g, "/")
++  if (/[\0\r\n\t]/.test(s)) return { ok: false, reason: "illegal-char" }
++  if (/^[A-Za-z]:/.test(s)) return { ok: false, reason: "windows-abs" }
++  if (/^\/\/[^/]/.test(s)) return { ok: false, reason: "unc" }
++  // 按段判：只有「整段全是点且长度 >=2」（.. / ... / ....）才是越界写法。
++  // "a..b.txt"、"..a.txt"、"a.." 是合法文件名（Go 的 path.Clean 也只特判整段
++  // 等于 "." / ".."）；子串判会把合法名字一起挡掉（REG-NAME L1-L3 回归）。
++  const segs = s.split("/")
++  for (const seg of segs) {
++    if (/^\.{2,}$/.test(seg)) return { ok: false, reason: "relative-path" }
++  }
++  // 二次编码残留：只拒「再解一次就会改变段结构」的 %2e/%2f/%5c 与
++  // %252e/%252f/%255c。裸 %25 不再拒：解码只在传输边界做一次，字面 "%" 是
++  // 合法文件名字符（L5/L6）；但 %25 后面紧跟 2e/2f/5c 仍拒，否则 API body 里
++  // 的 /%252e%252e/x 会被当成普通文件名放行（82 条里 W/R/E 组要求非 2xx）。
++  if (/%(?:2e|2f|5c|25(?:2e|2f|5c))/i.test(s)) return { ok: false, reason: "encoded-residue" }
++  const stack: string[] = []
++  for (const seg of segs) {
++    if (!seg || seg === ".") continue
++    stack.push(seg)
++  }
++  return { ok: true, path: "/" + stack.join("/") }
++}
++
++/** 已规范路径的父目录（"/a" -> "/"，"/a/b" -> "/a"，"/" -> "/"）。 */
++export function parentPath(p: string): string {
++  const i = p.lastIndexOf("/")
++  return i <= 0 ? "/" : p.slice(0, i)
++}
++
++/**
++ * 规范化后必须与输入逐字节相同，否则抛 PathRejectedError。
++ * 给 raw_url 生成侧用：链接里不允许出现「再解一次就会改变段结构」的形态。
++ */
++export function assertCanonicalPath(p: string): string {
++  const c = canonicalizePath(p)
++  if (!c.ok) throw new PathRejectedError(c.reason)
++  if (c.path !== p) throw new PathRejectedError("relative-path")
++  return c.path
++}
++
++export function isPathRejected(e: unknown): e is PathRejectedError {
++  return e instanceof PathRejectedError
++}
++
++/** 统一响应：403 用 Go 的 "relative path" 文案，400 用 "invalid path"。 */
++export function pathRejectedResponse(c: any, e: PathRejectedError) {
++  return c.json({ code: e.status, message: e.message, data: null }, e.status)
++}
+diff --git a/src/backend/pkg/permission.ts b/src/backend/pkg/permission.ts
+index a460b4e..146d234 100644
+--- a/src/backend/pkg/permission.ts
++++ b/src/backend/pkg/permission.ts
+@@ -1,3 +1,5 @@
++import { canonicalizePath, PathRejectedError } from "./canonical-path"
++
+ export enum UserRole {
+   GENERAL = 0,
+   GUEST = 1,
+@@ -79,63 +81,50 @@ export function canRemove(user?: UserPermissionObj | null): boolean {
+   return can(user, PermissionBit.DELETE)
+ }
+ 
+-/**
+- * 规范化路径段：合并重复斜杠、丢弃 "."，并用栈折叠 ".."。
+- *
+- * 关键点：栈为空时的 ".." 会被**钳制在根**（`stack.pop()` 作用于空数组是
+- * 空操作），因此结果永远以 "/" 开头且不含 ".." 段，无法向上逃逸。
+- */
+-export function normalizeSegments(p: string): string {
+-  const stack: string[] = []
+-  for (const seg of String(p || "").split("/")) {
+-    if (!seg || seg === ".") continue
+-    if (seg === "..") {
+-      stack.pop()
+-      continue
+-    }
+-    stack.push(seg)
+-  }
+-  return "/" + stack.join("/")
+-}
+-
+ /**
+  * 计算用户请求路径对应的实际存储路径（结合用户的根目录 base_path）：
+- * 1. 忽略以 /@s 开头的分享虚拟路径
+- * 2. 若用户 base_path 为空或 "/"，直接返回规范化后的 reqPath
+- * 3. 若用户 base_path 为非空路径（如 "/photos"），将 reqPath 拼接到 base_path 之后：
+- *    - reqPath = "/" 或 "" -> "/photos"
+- *    - reqPath = "/sub" -> "/photos/sub"
+- *    - reqPath = "sub" -> "/photos/sub"
++ * 1. 先用 canonicalizePath 规范化 reqPath（不解码；解码只在传输边界做一次）；
++ * 2. 再判 /@s 分享虚拟路径（规范化之后判，防止 /@s/../x 这类写法绕过）；
++ * 3. 若用户 base_path 为空或 "/"，直接返回规范化后的 reqPath；
++ * 4. 否则拼接到 base_path 之后（reqPath = "/" -> base_path）。
+  *
+  * 安全不变量（必须长期保持）：**返回值只可能等于 base_path 或位于其下**。
+- * 历史缺陷：本函数只做字符串拼接，`..` 段留给下游 resolvePath() 折叠。于是
+- * `/photos/alice` + `/../bob/x` 会解析成 `/photos/bob/x` —— 用户根目录被越过。
+- * 因为拼接后才规范化，下游只保证「不逃出存储物理根」，并不保证「不逃出用户
+- * 根」，两者不是同一约束。这里先把 reqPath 折叠到根再拼接，从源头保证隔离。
++ * 历史缺陷：本函数只做字符串拼接，`..` 段留给下游 resolvePath() 折叠；两条
++ * 流水线对同一字符串的答案不同，于是 `/%252e%252e/x` 在检查侧是普通名字、
++ * 在解析侧被再解一次码变成 `..` —— 用户根目录被越过。
+  *
+- * 注意：不额外增加 decodeURIComponent 次数。上游按约定只解码一次，多次解码会
+- * 改变合法 `%2f`/百分号字面量的含义（与 Go 的 EncodePath 契约冲突）。
++ * 现在的语义是**拒绝**而不是钳制：路径里出现「整段全是点且长度 >=2」的段
++ * （`..`/`...`/`....`）或二次编码残留（`%2e|%2f|%5c`）一律抛 PathRejectedError，
++ * 由调用方的 catch 或 index.ts 的全局中间件转成 403 "relative path"。函数签名
++ * 不变，40 个调用点无需改动。
+  */
+ export function getActualPath(
+   user?: UserPermissionObj | null,
+   reqPath: string = "/",
+ ): string {
+   const p = reqPath || "/"
+-  if (p.startsWith("/@s")) {
+-    return p
+-  }
++  const clean = canonicalizePath(p)
++  if (!clean.ok) throw new PathRejectedError(clean.reason)
+ 
+-  const basePath = normalizeSegments((user?.base_path || "/").trim() || "/")
+-  if (basePath === "/") {
+-    return normalizeSegments(p)
++  if (clean.path.startsWith("/@s")) {
++    return clean.path
+   }
+ 
+-  const cleanReq = normalizeSegments(p)
+-  if (cleanReq === "/") {
+-    return basePath
++  const base = canonicalizePath((user?.base_path || "/").trim() || "/")
++  if (!base.ok) {
++    // base_path 是管理员配置：坏配置必须报错，不能悄悄当成 "/"（fail-closed）
++    console.error(
++      `[permission] invalid base_path for user ${user?.id ?? "?"}: ${base.reason}`,
++    )
++    throw new PathRejectedError(base.reason)
+   }
+-
+-  return `${basePath}${cleanReq}`
++  if (base.path === "/") {
++    return clean.path
++  }
++  if (clean.path === "/") {
++    return base.path
++  }
++  return `${base.path}${clean.path}`
+ }
+ 
+ /**
+@@ -144,13 +133,23 @@ export function getActualPath(
+  * 供网关类入口（S3 / WebDAV）在把请求路径交给存储层之前做二次确认使用：
+  * 这些入口直接操作「全局虚拟路径」，不走 getActualPath 的拼接语义，因此需要
+  * 一个显式的范围检查，避免受限用户越出 base_path。
++ *
++ * 两端都过同一个 canonicalizePath（与 getActualPath / resolvePath 同源）；
++ * 任一失败返回 false（fail-closed）。比较大小写敏感：存储是 Linux，`/t/PUB`
++ * 与 `/t/pub` 是两个目录，大小写不敏感会把范围放大。
+  */
+ export function isWithinUserRoot(
+   user: UserPermissionObj | null | undefined,
+   actualPath: string,
+ ): boolean {
+-  const root = getActualPath(user, "/")
+-  const target = normalizeSegments(actualPath)
++  let root: string
++  try {
++    root = getActualPath(user, "/")
++  } catch {
++    return false
++  }
++  const target = canonicalizePath(actualPath)
++  if (!target.ok) return false
+   if (root === "/") return true
+-  return target === root || target.startsWith(root + "/")
++  return target.path === root || target.path.startsWith(root + "/")
+ }
+diff --git a/src/backend/server/canonical-path.test.ts b/src/backend/server/canonical-path.test.ts
+new file mode 100644
+index 0000000..9013837
+--- /dev/null
++++ b/src/backend/server/canonical-path.test.ts
+@@ -0,0 +1,116 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++import {
++  assertCanonicalPath,
++  canonicalizePath,
++  decodeWirePath,
++  parentPath,
++  PathRejectedError,
++  isPathRejected,
++} from "../pkg/canonical-path"
++
++/**
++ * P1-18 的唯一规范化函数表驱动测试（SPEC-P118 §7.3）。
++ *
++ * 判据：输出里不存在「整段全是点」的段、空段、尾斜杠；解码只在边界发生一次；
++ * 规范输出对自己幂等。
++ */
++
++test("canonicalizePath：折叠、拒绝与边界表", () => {
++  const ok: Array<[string, string]> = [
++    ["", "/"],
++    ["/", "/"],
++    ["///", "/"],
++    ["/a///b/./c", "/a/b/c"],
++    ["a\\b", "/a/b"],
++    ["/100%.txt", "/100%.txt"],
++    ["/100%25.txt", "/100%25.txt"],
++    ["/a..b.txt", "/a..b.txt"],
++    ["/..a.txt", "/..a.txt"],
++    ["/a..", "/a.."],
++    ["/50%20off.txt", "/50%20off.txt"],
++    ["/%zz", "/%zz"],
++    ["/@s/abc", "/@s/abc"],
++  ]
++  for (const [input, want] of ok) {
++    const got = canonicalizePath(input)
++    assert.deepEqual(got, { ok: true, path: want }, `canonicalizePath(${input})`)
++  }
++
++  const bad: Array<[string, string]> = [
++    ["/a/../b", "relative-path"],
++    ["/..../x", "relative-path"],
++    ["/.../x", "relative-path"],
++    ["/a/../../b", "relative-path"],
++    ["/%2e%2e/x", "encoded-residue"],
++    ["/%2E%2e/x", "encoded-residue"],
++    ["/%252e%252e/x", "encoded-residue"],
++    ["/a%2fb", "encoded-residue"],
++    ["/a%5cb", "encoded-residue"],
++    ["/a\0b", "illegal-char"],
++    ["/a\nb", "illegal-char"],
++    ["C:/x", "windows-abs"],
++    ["//host/x", "unc"],
++  ]
++  for (const [input, reason] of bad) {
++    const got = canonicalizePath(input)
++    assert.equal(got.ok, false, `canonicalizePath(${JSON.stringify(input)}) 应拒绝`)
++    if (!got.ok) assert.equal(got.reason, reason, `canonicalizePath(${JSON.stringify(input)}) reason`)
++  }
++})
++
++test("canonicalizePath：对自身输出幂等", () => {
++  const samples = ["/", "/sub/x", "/100%.txt", "/50%20off.txt", "/a/b/c", "/%zz", "/a..b.txt", "/100%25.txt"]
++  for (const s of samples) {
++    const c = canonicalizePath(s)
++    assert.equal(c.ok, true)
++    if (!c.ok) continue
++    const again = canonicalizePath(c.path)
++    assert.equal(again.ok, true)
++    if (again.ok) assert.equal(again.path, c.path, `幂等：${s}`)
++    assert.equal(c.path.split("/").some((s) => /^\.{2,}$/.test(s)), false)
++    assert.equal(c.path.includes("//"), false)
++    assert.equal(c.path.length > 1 ? c.path.endsWith("/") : false, false)
++  }
++})
++
++test("decodeWirePath：边界上恰好解码一次", () => {
++  assert.deepEqual(decodeWirePath("/100%25.txt"), { ok: true, path: "/100%.txt" })
++  assert.deepEqual(decodeWirePath("/100%.txt"), { ok: false })
++  assert.deepEqual(decodeWirePath("/%E4%B8%AD"), { ok: true, path: "/中" })
++  assert.deepEqual(decodeWirePath("/a/%zz"), { ok: false })
++  assert.deepEqual(decodeWirePath(""), { ok: true, path: "" })
++})
++
++test("parentPath：根与一级目录", () => {
++  const table: Array<[string, string]> = [
++    ["/", "/"],
++    ["/a", "/"],
++    ["/a/b", "/a"],
++    ["/t/locked/x.txt", "/t/locked"],
++    ["/t/locked/sub", "/t/locked"],
++  ]
++  for (const [p, want] of table) assert.equal(parentPath(p), want, `parentPath(${p})`)
++})
++
++test("PathRejectedError：状态码与文案对齐 Go", () => {
++  const rel = new PathRejectedError("relative-path")
++  assert.equal(rel.status, 403)
++  assert.equal(rel.message, "relative path")
++  const residue = new PathRejectedError("encoded-residue")
++  assert.equal(residue.status, 403)
++  assert.equal(residue.message, "relative path")
++  const illegal = new PathRejectedError("illegal-char")
++  assert.equal(illegal.status, 400)
++  assert.equal(illegal.message, "invalid path")
++  assert.equal(isPathRejected(rel), true)
++  assert.equal(isPathRejected(new Error("x")), false)
++})
++
++test("assertCanonicalPath：非规范形必须抛错（raw_url 生成侧用）", () => {
++  assert.equal(assertCanonicalPath("/a/b"), "/a/b")
++  assert.equal(assertCanonicalPath("/"), "/")
++  for (const p of ["/a/", "/a//b", "/a/./b", "/a/../b", "/%2e%2e/x"]) {
++    assert.throws(() => assertCanonicalPath(p), PathRejectedError, `assertCanonicalPath(${p})`)
++  }
++})
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index cfdcf35..d0f6317 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -13,6 +13,13 @@ import {
+ } from "../internal/op/storage"
+ import { resolveShare } from "../internal/op/share"
+ import { resolvePath } from "../internal/model/db"
++import {
++  assertCanonicalPath,
++  decodeWirePath,
++  isPathRejected,
++  parentPath,
++  pathRejectedResponse,
++} from "../pkg/canonical-path"
+ import { getUserFromContext } from "./middlewares"
+ import {
+   can,
+@@ -306,6 +313,8 @@ fsRouter.post("/dirs", async (c) => {
+       }))
+     return c.json({ code: 200, message: "success", data: dirs })
+   } catch (err: any) {
++    // P1-18：getActualPath 在 try 之外抛出的 PathRejectedError 会落在这里
++    if (isPathRejected(err)) return pathRejectedResponse(c, err)
+     return c.json({ code: 500, message: safeErrorMessage(err), data: null })
+   }
+ })
+@@ -591,6 +600,8 @@ fsRouter.post("/list", async (c) => {
+       },
+     })
+   } catch (err: any) {
++    // P1-18：getActualPath 在 try 之外抛出的 PathRejectedError 会落在这里
++    if (isPathRejected(err)) return pathRejectedResponse(c, err)
+     return c.json({ code: 500, message: safeErrorMessage(err), data: null })
+   }
+ })
+@@ -707,7 +718,10 @@ fsRouter.post("/get", async (c) => {
+       sign && rawUrl && !/[?&]sign=/.test(rawUrl)
+         ? `${rawUrl}${rawUrl.includes("?") ? "&" : "?"}sign=${sign}`
+         : rawUrl
+-    const writable = canWrite(user) && canWriteMeta(user, meta, reqPath)
++    // P1-19（X2）：文件的可写性取决于它所在目录。与 put 按 parentPath 判
++    // 保持同一谓词，否则会出现「get 说 write=true、put 却被父目录白名单拒」。
++    const writable =
++      canWrite(user) && canWriteMeta(user, meta, parentPath(reqPath))
+     const writeContentBypass = canWriteContentBypassUserPerms(meta, reqPath)
+ 
+     // Related：查找同目录中文件名前缀相同的文件（字幕 .srt/.ass/.vtt、NFO 等）
+@@ -769,6 +783,8 @@ fsRouter.post("/get", async (c) => {
+       },
+     })
+   } catch (err: any) {
++    // P1-18：getActualPath 在 try 之外抛出的 PathRejectedError 会落在这里
++    if (isPathRejected(err)) return pathRejectedResponse(c, err)
+     return c.json({ code: 500, message: safeErrorMessage(err), data: null })
+   }
+ })
+@@ -806,11 +822,8 @@ function validateDirPath(p: any): string {
+  * 与 raw.ts 对同类路径的处理保持一致。
+  */
+ function decodeFilePathHeader(c: any): { ok: true; path: string } | { ok: false } {
+-  try {
+-    return { ok: true, path: decodeURIComponent(c.req.header("File-Path") || "") }
+-  } catch {
+-    return { ok: false }
+-  }
++  // P1-18：传输边界上恰好解码一次，实现统一到 pkg/canonical-path.decodeWirePath
++  return decodeWirePath(c.req.header("File-Path") || "")
+ }
+ 
+ const badFilePath = (c: any) =>
+@@ -837,6 +850,8 @@ export function isStorageNotFoundError(e: unknown): boolean {
+  * 403 会让客户端误以为有权限问题并暴露路径校验分支。
+  */
+ function writeFailure(c: any, e: any): Response {
++  // P1-18：路径被拒绝（越界 / 二次编码残留）必须回 403，不能兜成 500。
++  if (isPathRejected(e)) return pathRejectedResponse(c, e)
+   const message = safeErrorMessage(e)
+   if (isStorageNotFoundError(e)) {
+     return c.json({ code: 404, message, data: null }, 404)
+@@ -855,7 +870,8 @@ fsRouter.post("/mkdir", async (c) => {
+     return c.json({ code: 400, message: e.message, data: null }, 400)
+   }
+   const reqPath = getActualPath(user, rawPath)
+-  if (await deniedByMetaWriteAcl(c, user, [reqPath])) return permissionDenied(c)
++  if (await deniedByMetaWriteAcl(c, user, [parentPath(reqPath)]))
++    return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+   try {
+     await makeDirectory(reqPath, requestContext)
+@@ -883,12 +899,20 @@ fsRouter.post("/rename", async (c) => {
+   const requestContext = getStorageRequestContext(c)
+   try {
+     const actualOldPath = getActualPath(user, oldPath || "/")
+-    if (await deniedByMetaWriteAcl(c, user, [actualOldPath]))
++    // P1-19：写白名单按**落点所在目录**判（Go 用 parentPath 调 common.CanWrite）。
++    // rename 只改名不换目录，两个父目录恒等；两个都传是把「目标父目录」写成
++    // 显式断言，以后加跨目录改名不会漏。
++    const actualParentDir = parentPath(actualOldPath)
++    const targetPath = `${actualParentDir === "/" ? "" : actualParentDir}/${cleanName}`
++    if (
++      await deniedByMetaWriteAcl(c, user, [
++        actualParentDir,
++        parentPath(targetPath),
++      ])
++    )
+       return permissionDenied(c)
+     // P1-08：目标已存在且未显式 overwrite:true 时回 403，对齐 Go
+     // fsmanage.go:314-318 的 file [x] exists；此前会静默覆盖目标并删掉源文件。
+-    const parentPath = actualOldPath.slice(0, actualOldPath.lastIndexOf("/")) || "/"
+-    const targetPath = `${parentPath === "/" ? "" : parentPath}/${cleanName}`
+     if (overwrite !== true && targetPath !== actualOldPath) {
+       let targetExists = false
+       try {
+@@ -940,10 +964,9 @@ fsRouter.post("/remove", async (c) => {
+   const requestContext = getStorageRequestContext(c)
+   try {
+     const actualDir = getActualPath(user, dir || "/")
+-    const aclPaths = cleanNames.map((n) =>
+-      `${actualDir}/${n}`.replace(/\/{2,}/g, "/"),
+-    )
+-    if (await deniedByMetaWriteAcl(c, user, aclPaths))
++    // P1-19：names 被 validateFileName 限成单段，所有目标共用同一个 dir；
++    // 判一次 dir 等于逐个判（Go FsRemove 也按父目录）。
++    if (await deniedByMetaWriteAcl(c, user, [actualDir]))
+       return permissionDenied(c)
+     await removeItems(actualDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+@@ -979,13 +1002,9 @@ fsRouter.post("/move", async (c) => {
+   try {
+     const actualSrcDir = getActualPath(user, src_dir || "/")
+     const actualDstDir = getActualPath(user, dst_dir || "/")
+-    const aclPaths = [
+-      actualDstDir,
+-      ...cleanNames.map((n) =>
+-        `${actualSrcDir}/${n}`.replace(/\/{2,}/g, "/"),
+-      ),
+-    ]
+-    if (await deniedByMetaWriteAcl(c, user, aclPaths))
++    // P1-19：源、目标两端都判 —— 搬出（move-out）必须判源父目录，
++    // 搬入判目标父目录（Go FsMove 同样两端）
++    if (await deniedByMetaWriteAcl(c, user, [actualSrcDir, actualDstDir]))
+       return permissionDenied(c)
+     await moveItems(actualSrcDir, actualDstDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+@@ -1021,13 +1040,8 @@ fsRouter.post("/copy", async (c) => {
+   try {
+     const actualSrcDir = getActualPath(user, src_dir || "/")
+     const actualDstDir = getActualPath(user, dst_dir || "/")
+-    const aclPaths = [
+-      actualDstDir,
+-      ...cleanNames.map((n) =>
+-        `${actualDstDir}/${n}`.replace(/\/{2,}/g, "/"),
+-      ),
+-    ]
+-    if (await deniedByMetaWriteAcl(c, user, aclPaths))
++    // P1-19：源、目标两端都判（旧实现把目标目录又拼了一遍名字，源侧完全没判）
++    if (await deniedByMetaWriteAcl(c, user, [actualSrcDir, actualDstDir]))
+       return permissionDenied(c)
+     await copyItems(actualSrcDir, actualDstDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+@@ -1054,7 +1068,8 @@ fsRouter.put("/put", async (c) => {
+     return c.json({ code: 400, message: e.message, data: null }, 400)
+   }
+   const reqPath = getActualPath(user, rawPath)
+-  if (await deniedByMetaWriteAcl(c, user, [reqPath])) return permissionDenied(c)
++  if (await deniedByMetaWriteAcl(c, user, [parentPath(reqPath)]))
++    return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+   try {
+     const body = await readBodyWithinLimit(c)
+@@ -1084,7 +1099,8 @@ fsRouter.put("/form", async (c) => {
+     return c.json({ code: 400, message: e.message, data: null }, 400)
+   }
+   const reqPath = getActualPath(user, rawPath)
+-  if (await deniedByMetaWriteAcl(c, user, [reqPath])) return permissionDenied(c)
++  if (await deniedByMetaWriteAcl(c, user, [parentPath(reqPath)]))
++    return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+   try {
+     const form = await c.req.formData()
+@@ -1228,11 +1244,8 @@ fsRouter.post("/batch_rename", async (c) => {
+   const dirPath = getActualPath(user, src_dir || "/")
+   const requestContext = getStorageRequestContext(c)
+   try {
+-    const aclPaths = rename_objects
+-      .map((obj: any) => obj?.src_name)
+-      .filter((n: any) => typeof n === "string" && n)
+-      .map((n: string) => `${dirPath}/${n}`.replace(/\/{2,}/g, "/"))
+-    if (await deniedByMetaWriteAcl(c, user, aclPaths))
++    // P1-19：dirPath 是 src_dir（目录），一次判即可
++    if (await deniedByMetaWriteAcl(c, user, [dirPath]))
+       return permissionDenied(c)
+     for (const obj of rename_objects) {
+       const srcName = obj?.src_name
+@@ -1270,7 +1283,8 @@ fsRouter.post("/regex_rename", async (c) => {
+         const newName = item.name.replace(srcRegex, new_name_regex || "")
+         validateFileName(newName)
+         const fullPath = `${dirPath}/${item.name}`.replace(/\/{2,}/g, "/")
+-        if (await deniedByMetaWriteAcl(c, user, [fullPath]))
++        // P1-19：判目录（dirPath）而不是文件自身
++        if (await deniedByMetaWriteAcl(c, user, [dirPath]))
+           return permissionDenied(c)
+         await renameItem(fullPath, newName, requestContext)
+       }
+@@ -1323,12 +1337,9 @@ fsRouter.post("/recursive_move", async (c) => {
+             if (policy === "skip") continue
+           }
+           if (policy !== "overwrite") existing.add(item.name)
+-          if (
+-            await deniedByMetaWriteAcl(c, user, [
+-              dstPath,
+-              `${dir}/${item.name}`.replace(/\/{2,}/g, "/"),
+-            ])
+-          )
++          // P1-19：dir 是该文件所在目录（源父目录），dstPath 是目标目录；
++          // 搬出与搬入都要判
++          if (await deniedByMetaWriteAcl(c, user, [dir, dstPath]))
+             return permissionDenied(c)
+           await moveItems(dir, dstPath, [item.name], requestContext)
+           count++
+@@ -1423,7 +1434,9 @@ fsRouter.post("/link", async (c) => {
+       code: 200,
+       message: "success",
+       data: {
+-        url: `/api/p${encodeDownloadPath(reqPath)}?sign=${encodeURIComponent(sign)}`,
++        // P1-18：reqPath 来自 getActualPath，已是规范形；这里再断言一次，
++        // 保证链接里不出现 `%2e`/`%252e` 之类"再解一次就会改变段结构"的形态
++        url: `/api/p${encodeDownloadPath(assertCanonicalPath(reqPath))}?sign=${encodeURIComponent(sign)}`,
+       },
+     })
+   } catch (e: any) {
+@@ -1569,7 +1582,8 @@ fsRouter.post("/multipart/init", async (c) => {
+ 
+   const { dir, name } = splitUploadPath(rawPath)
+   const actualDir = getActualPath(user, dir)
+-  if (await deniedByMetaWriteAcl(c, user, [actualDir, `${actualDir}/${name}`.replace(/\/{2,}/g, "/")]))
++  // P1-19：actualDir 已是目录，去掉多余的文件路径
++  if (await deniedByMetaWriteAcl(c, user, [actualDir]))
+     return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+ 
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index ece3302..0a8fb6b 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -19,6 +19,11 @@ import {
+ } from "../pkg/sign"
+ import { safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
++import {
++  canonicalizePath,
++  decodeWirePath,
++  isPathRejected,
++} from "../pkg/canonical-path"
+ import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
+ import {
+   resolveProxyDecision,
+@@ -491,15 +496,22 @@ rawRouter.get("/*", async (c) => {
+   // 非法百分号转义（如手工拼出的 `/api/p/100%.txt`）会让 decodeURIComponent
+   // 抛 URIError。Go 侧因为 raw_url 走 EncodePath 编码过 `%`，正常流程不会出现；
+   // 但外部/手工 URL 仍可能出现，这里按 400 处理而不是冒泡成 500。
+-  let reqPath0: string
+-  try {
+-    reqPath0 = decodeURIComponent(rawPath)
+-  } catch {
++  // P1-18：解码是传输边界动作，恰好一次（decodeWirePath）
++  const decodedPath = decodeWirePath(rawPath)
++  if (!decodedPath.ok) {
+     return c.text("Bad Request: malformed path encoding", 400)
+   }
++  const reqPath0 = decodedPath.path
++  // P1-18：raw 是公开下载端点，不经过 getActualPath，规范化必须在这一层收口。
++  // 含 ".." 或二次编码残留一律 403 —— 旧实现把这类路径直接交给 resolvePath
++  // 再解一次码，`%252e%252e` 就是这样复活成 `..` 越界读到根外的。
++  const canonPath = canonicalizePath(reqPath0)
++  if (!canonPath.ok) {
++    return c.text("relative path", 403)
++  }
+ 
+   try {
+-    let reqPath = reqPath0
++    let reqPath = canonPath.path
+     // Share download: /sd/{shareId}/... — map to the real storage path
+     const isSharePath =
+       c.req.path.startsWith("/api/sd") || c.req.path.startsWith("/sd")
+@@ -529,7 +541,10 @@ rawRouter.get("/*", async (c) => {
+       if (shareRes.virtualList || !shareRes.realPath) {
+         return c.text("Cannot download share root", 400)
+       }
+-      reqPath = shareRes.realPath
++      // 分享映射出来的真实路径同样必须过同一个规范化
++      const realSharePath = canonicalizePath(shareRes.realPath)
++      if (!realSharePath.ok) return c.text("relative path", 403)
++      reqPath = realSharePath.path
+     } else {
+       // 对齐 Go server/router.go：
+       //   r.GET("/d/*path", middlewares.PathParse, middlewares.Down(sign.Verify), ...)
+@@ -805,6 +820,8 @@ rawRouter.get("/*", async (c) => {
+     const stream = createReadStream(resolved.physical)
+     return c.body(stream as any)
+   } catch (err: any) {
++    // P1-18：纵深调用里抛出的 PathRejectedError 是"不允许"，不是"不存在"
++    if (isPathRejected(err)) return c.text("relative path", 403)
+     console.error(`[rawRouter] Download 404 for '${reqPath0}':`, err.message)
+     return c.text(`Not found: ${safeErrorMessage(err, "file not found")}`, 404)
+   }
+diff --git a/src/backend/server/s3.ts b/src/backend/server/s3.ts
+index a95574c..5b8cd33 100644
+--- a/src/backend/server/s3.ts
++++ b/src/backend/server/s3.ts
+@@ -22,6 +22,7 @@ import {
+   getNearestMeta,
+ } from "../pkg/meta"
+ import type { Meta } from "../pkg/meta"
++import { canonicalizePath, decodeWirePath } from "../pkg/canonical-path"
+ 
+ /**
+  * S3 网关（简化版，挂载于 /s3/*）。
+@@ -67,13 +68,16 @@ function s3Error(code: string, message: string, status: number) {
+ }
+ 
+ /** 从 pathname 剥离 /s3 前缀，解析 { bucket, key } */
+-function parseS3Path(c: any): { bucket: string; key: string } {
++function parseS3Path(c: any): { bucket: string; key: string } | null {
+   const pathname = new URL(c.req.url).pathname
+   const p = pathname.replace(/^\/s3\/?/, "")
+   const parts = p.split("/").filter(Boolean)
+   const bucket = parts[0] || ""
+-  const key = parts.slice(1).map(decodeURIComponent).join("/")
+-  return { bucket, key }
++  // P1-18：key 整体解码恰好一次（原来逐段 map(decodeURIComponent)，非法转义
++  // 会直接抛；现在返回 null，由调用方回 400）
++  const decodedKey = decodeWirePath(parts.slice(1).join("/"))
++  if (!decodedKey.ok) return null
++  return { bucket, key: decodedKey.path }
+ }
+ 
+ /**
+@@ -96,11 +100,16 @@ function isValidS3Bucket(bucket: string): boolean {
+  * base_path 受限的用户：`bucket/key` -> `<base_path>/bucket/key`，把 S3 的
+  * 「bucket」解释为该用户自己的顶层目录，从而与 /api/fs 的视图保持一致。
+  */
+-function s3VirtualPath(user: any, bucket: string, key: string): string {
++function s3VirtualPath(user: any, bucket: string, key: string): string | null {
+   const root = getActualPath(user, "/")
+   const segments = [root, bucket, key].filter(Boolean).join("/")
+   const normalized = ("/" + segments).replace(/\/{2,}/g, "/")
+-  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized
++  const trimmed =
++    normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized
++  // P1-18：收口到同一个 canonicalizePath；含 ".." / 二次编码残留返回 null（403）
++  const canon = canonicalizePath(trimmed)
++  if (!canon.ok) return null
++  return canon.path
+ }
+ 
+ /** 统一的越界拒绝响应（403，避免暴露目标路径是否存在） */
+@@ -207,12 +216,16 @@ ${buckets}
+ s3Router.get("/*", async (c) => {
+   const user = await authUser(c)
+   if (!user) return s3Error("AccessDenied", "Authentication required", 403)
+-  const { bucket, key } = parseS3Path(c)
++  const parsedPath = parseS3Path(c)
++  if (!parsedPath) {
++    return s3Error("InvalidArgument", "Invalid key encoding", 400)
++  }
++  const { bucket, key } = parsedPath
+   if (!isValidS3Bucket(bucket) || !key) {
+     return s3Error("NoSuchKey", "NoSuchKey", 404)
+   }
+   const virtualPath = s3VirtualPath(user, bucket, key)
+-  if (!isWithinUserRoot(user, virtualPath)) return outOfScope(c)
++  if (!virtualPath || !isWithinUserRoot(user, virtualPath)) return outOfScope(c)
+   if (await metaReadDenied(c, user, virtualPath)) {
+     return s3Error("AccessDenied", "Password required for this path", 403)
+   }
+@@ -233,12 +246,16 @@ s3Router.get("/*", async (c) => {
+ s3Router.on("HEAD", "/*", async (c) => {
+   const user = await authUser(c)
+   if (!user) return s3Error("AccessDenied", "Authentication required", 403)
+-  const { bucket, key } = parseS3Path(c)
++  const parsedPath = parseS3Path(c)
++  if (!parsedPath) {
++    return s3Error("InvalidArgument", "Invalid key encoding", 400)
++  }
++  const { bucket, key } = parsedPath
+   if (!isValidS3Bucket(bucket) || !key) {
+     return s3Error("NoSuchKey", "NoSuchKey", 404)
+   }
+   const virtualPath = s3VirtualPath(user, bucket, key)
+-  if (!isWithinUserRoot(user, virtualPath)) return outOfScope(c)
++  if (!virtualPath || !isWithinUserRoot(user, virtualPath)) return outOfScope(c)
+   if (await metaReadDenied(c, user, virtualPath)) {
+     return s3Error("AccessDenied", "Password required for this path", 403)
+   }
+@@ -265,12 +282,16 @@ s3Router.put("/*", async (c) => {
+   if (!canWrite(user)) {
+     return s3Error("AccessDenied", "Write permission required", 403)
+   }
+-  const { bucket, key } = parseS3Path(c)
++  const parsedPath = parseS3Path(c)
++  if (!parsedPath) {
++    return s3Error("InvalidArgument", "Invalid key encoding", 400)
++  }
++  const { bucket, key } = parsedPath
+   if (!isValidS3Bucket(bucket) || !key) {
+     return s3Error("InvalidArgument", "Invalid bucket/key", 400)
+   }
+   const virtualPath = s3VirtualPath(user, bucket, key)
+-  if (!isWithinUserRoot(user, virtualPath)) return outOfScope(c)
++  if (!virtualPath || !isWithinUserRoot(user, virtualPath)) return outOfScope(c)
+   // 目录级写判定（对齐 /api/fs/put 的 meta.write_users 与 write_content_bypass）
+   const parentDir =
+     virtualPath.lastIndexOf("/") > 0
+@@ -314,12 +335,16 @@ s3Router.delete("/*", async (c) => {
+   if (!canRemove(user)) {
+     return s3Error("AccessDenied", "Delete permission required", 403)
+   }
+-  const { bucket, key } = parseS3Path(c)
++  const parsedPath = parseS3Path(c)
++  if (!parsedPath) {
++    return s3Error("InvalidArgument", "Invalid key encoding", 400)
++  }
++  const { bucket, key } = parsedPath
+   if (!isValidS3Bucket(bucket) || !key) {
+     return s3Error("InvalidArgument", "Invalid bucket/key", 400)
+   }
+   const virtualPath = s3VirtualPath(user, bucket, key)
+-  if (!isWithinUserRoot(user, virtualPath)) return outOfScope(c)
++  if (!virtualPath || !isWithinUserRoot(user, virtualPath)) return outOfScope(c)
+   // 目录级写判定（对齐 /api/fs/remove 的 meta.write_users）
+   if (await metaWriteDenied(c, user, virtualPath)) {
+     return s3Error("AccessDenied", "Write permission denied for this path", 403)
+diff --git a/src/backend/server/security_hardening.test.ts b/src/backend/server/security_hardening.test.ts
+index fb82d23..9c3f160 100644
+--- a/src/backend/server/security_hardening.test.ts
++++ b/src/backend/server/security_hardening.test.ts
+@@ -5,11 +5,8 @@ import { sign } from "hono/jwt"
+ import { getDb, saveDb } from "../internal/model/db"
+ import { meHandler } from "./auth"
+ import { passwordStampOf, setUserPassword } from "../pkg/password"
+-import {
+-  getActualPath,
+-  isWithinUserRoot,
+-  normalizeSegments,
+-} from "../pkg/permission"
++import { getActualPath, isWithinUserRoot } from "../pkg/permission"
++import { PathRejectedError } from "../pkg/canonical-path"
+ import { readBodyWithinLimit } from "../pkg/upload-limit"
+ import { userRouter } from "./user"
+ import { webdavRouter } from "./webdav"
+@@ -253,20 +250,23 @@ test("password change invalidates previously issued tokens (Go PwdTS parity)", a
+   assert.equal(fresh.status, 200, "a fresh token must work")
+ })
+ 
+-test("normalizeSegments / getActualPath / isWithinUserRoot 钳制越根遍历", () => {
+-  // 显式锁定越根钳制语义（评审建议补的用例）
+-  assert.equal(normalizeSegments("/a/../../b"), "/b")
+-  assert.equal(normalizeSegments("/a/b/../c"), "/a/c")
+-  assert.equal(normalizeSegments("../../etc/passwd"), "/etc/passwd")
+-  assert.equal(normalizeSegments("//a///b/./c"), "/a/b/c")
+-  assert.equal(normalizeSegments(""), "/")
++test("getActualPath / isWithinUserRoot：越根遍历一律拒绝（P1-18）", () => {
++  // 语义从「钳制到根」改成「拒绝」：任何含 ".." 的路径都抛 PathRejectedError，
++  // 由 index.ts 的全局中间件转 403 "relative path"。钳制会得到 200 空表，
++  // 过不了「越界请求必须非 200」的验收。
++  assert.throws(() => getActualPath({ id: 9, role: 0, permission: 0, base_path: "/photos/alice" }, "/../bob/x"), PathRejectedError)
++  assert.throws(() => getActualPath({ id: 9, role: 0, permission: 0, base_path: "/photos/alice" }, "/a/../../b"), PathRejectedError)
+ 
+-  // base_path 受限：先折叠 reqPath 再拼接，`..` 不得越过用户根
++  // base_path 受限：合法路径仍按原样拼接
+   const user = { id: 9, role: 0, permission: 0, base_path: "/photos/alice" }
+   assert.equal(getActualPath(user, "/"), "/photos/alice")
+   assert.equal(getActualPath(user, "/sub/x"), "/photos/alice/sub/x")
+-  assert.equal(getActualPath(user, "/../bob/x"), "/photos/alice/bob/x")
+-  assert.equal(getActualPath(user, "/sub/../../bob"), "/photos/alice/bob")
++  // 规范化：空段与 "." 丢弃（与旧 normalizeSegments 对合法输入的结论一致）
++  assert.equal(getActualPath(user, "sub/x"), "/photos/alice/sub/x")
++  assert.equal(getActualPath(user, "/sub//x/./y"), "/photos/alice/sub/x/y")
++  // 二次编码残留同样拒绝（P1-18 的实际攻击形态）
++  assert.throws(() => getActualPath(user, "/%252e%252e/bob"), PathRejectedError)
++  assert.throws(() => getActualPath(user, "/%2e%2e/bob"), PathRejectedError)
+ 
+   // 范围复核：等于根本身或位于其下为真，越过为假
+   assert.equal(isWithinUserRoot(user, "/photos/alice"), true)
+@@ -386,3 +386,57 @@ test("WebDAV: 受 meta 保护的路径返回带指引的 403（而不是裸 403
+   assert.match(body, /meta password/)
+   assert.match(body, /web UI|api\/fs/)
+ })
++
++test("WebDAV: 编码点段与带点段的 Destination 一律 403（P1-18）", async () => {
++  const env: any = { JWT_SECRET: "test-only-jwt-secret-for-hardening" }
++  const davUser: any = {
++    id: 12,
++    username: "dav-w",
++    role: 0,
++    // WEBDAV_READ | WEBDAV_MANAGE
++    permission: (1 << 8) | (1 << 9),
++    base_path: "/t/pub",
++    disabled: false,
++    pwd_update_at: new Date().toISOString(),
++  }
++  await setUserPassword(davUser, "dav-pass")
++  await saveDb(
++    { settings: [], users: [davUser], storages: [], shares: [], metas: [] } as any,
++    env,
++    { force: true },
++  )
++  const app = new Hono()
++  app.route("/dav", webdavRouter)
++  const basic = "Basic " + Buffer.from("dav-w:dav-pass").toString("base64")
++
++  // 请求 URL 里的编码点段：%252e%252e（解一次后是残留）与 ....（字面多点）
++  const cases = [
++    { method: "PUT", path: "/dav/%252e%252e/victim/x.txt" },
++    { method: "PUT", path: "/dav/..../victim/x.txt" },
++    { method: "MKCOL", path: "/dav/%252e%252e/victim/d" },
++    { method: "PROPFIND", path: "/dav/..../victim/" },
++  ]
++  for (const cse of cases) {
++    const res = await app.request(
++      cse.path,
++      { method: cse.method, headers: { Authorization: basic, Depth: "1" } },
++      env,
++    )
++    assert.equal(res.status, 403, `${cse.method} ${cse.path}`)
++  }
++
++  // Destination 带点段：URL 解析会先把 %2e%2e 折叠成 ..，必须在折叠之前拒绝
++  for (const dest of [
++    "http://example.test/dav/%2e%2e/victim/a.txt",
++    "http://example.test/dav/%2E%2E/victim/b.txt",
++    "http://example.test/dav/../victim/c.txt",
++    "http://example.test/dav/.%2e/victim/d.txt",
++  ]) {
++    const res = await app.request(
++      "/dav/ok.txt",
++      { method: "MOVE", headers: { Authorization: basic, Destination: dest } },
++      env,
++    )
++    assert.equal(res.status, 403, `MOVE Destination ${dest}`)
++  }
++})
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index 207a766..5a6eb8d 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -19,6 +19,11 @@ import {
+   isWithinUserRoot,
+   PermissionBit,
+ } from "../pkg/permission"
++import {
++  canonicalizePath,
++  decodeWirePath,
++  isPathRejected,
++} from "../pkg/canonical-path"
+ import {
+   canAccess,
+   canRead as canReadMeta,
+@@ -127,11 +132,34 @@ const DAV_MOUNT = "/dav"
+  * （/list/dav）时也自动正确，且不回显 Host 头。
+  */
+ function davRequestPath(c: any): string {
+-  return new URL(c.req.url).pathname
++  // P1-18 复验 D1/D2/D3/D6：必须用**字符串切片**取原始 pathname，不能走
++  // `new URL(c.req.url).pathname`。WHATWG 解析会把 `%2e%2e` 当成 ".." 折叠掉
++  // 整个前一段（实测 `/dav/%2e%2e/victim/x` 的 pathname 是 `/victim/x`），
++  // 于是 DAV 挂载前缀被吃掉，路径变成「用户根内的合法路径」，PUT/MKCOL/
++  // DELETE/PROPFIND 全被 2xx 接受——钳制后成功，正是裁定 D 不接受的那一类。
++  // 这里与 Hono 路由取 path 的方式（字符串切片，不规范化）保持一致，
++  // 由下游 canonicalizePath 统一判拒绝（应用侧不解码，见 davPathOf）。
++  const url = String(c.req.url || "")
++  const start = url.indexOf("/", url.indexOf(":") + 4)
++  if (start < 0) return "/"
++  let end = url.length
++  const q = url.indexOf("?", start)
++  if (q >= 0) end = q
++  const h = url.indexOf("#", start)
++  if (h >= 0 && h < end) end = h
++  return url.slice(start, end) || "/"
+ }
+ 
+-/** 从 URL pathname 中剥离挂载前缀，得到虚拟文件路径（仅用于存储层寻址） */
+-function davPathOf(c: any): string {
++/**
++ * 从 URL pathname 中剥离挂载前缀，得到虚拟文件路径（仅用于存储层寻址）。
++ *
++ * P1-18 复验 L5/L6：这里**不再解码**。tjs 的 HTTP 层在进 fetch 之前已经解过一次
++ * （实测请求 `%252e%252e` 到应用是 `%2e%2e`、`%25` 到应用是 `%`），应用侧再
++ * decodeURIComponent 一次会抛 URIError，把合法文件名 `100%.txt` 判成 400
++ * （"malformed path encoding"）。单次解码对齐后，`%25` 到这里就是字面 `%`，
++ * 由 canonicalizePath 决定取舍：`%2e/%2f/%5c` 残留仍按 encoded-residue 回 403。
++ */
++function davPathOf(c: any): string | null {
+   const pathname = davRequestPath(c)
+   let p = pathname
+   // 只在前缀真正匹配时才剥离：不能像 slice(DAV_MOUNT.length) 那样无条件截断，
+@@ -141,11 +169,7 @@ function davPathOf(c: any): string {
+   }
+   if (!p) p = "/"
+   if (!p.startsWith("/")) p = "/" + p
+-  try {
+-    return decodeURIComponent(p)
+-  } catch {
+-    return p
+-  }
++  return p
+ }
+ 
+ /** 拆分虚拟路径为 { dir, name } */
+@@ -169,28 +193,67 @@ function splitPath(p: string): { dir: string; name: string } {
+  * base_path，也未做用户范围校验——实测「只有 WEBDAV_READ 权限、base_path 受限」
+  * 的用户可以 PROPFIND 其他用户的目录。
+  */
+-function scopedDavPath(user: any, davPath: string): string {
++function scopedDavPath(user: any, davPath: string): string | null {
++  // P1-18：与 /api/fs/* 共用同一个 canonicalizePath；含 ".." 或二次编码残留
++  // 直接返回 null，由路由层回 403（不再把原字符串拼进用户根继续走）。
++  const canon = canonicalizePath(davPath)
++  if (!canon.ok) return null
+   const root = getActualPath(user, "/")
+-  if (root === "/") return davPath
+-  const rel = davPath === "/" ? "" : davPath.replace(/^\/+/, "")
+-  return rel ? `${root}/${rel}` : root
++  if (root === "/") return canon.path
++  return canon.path === "/" ? root : `${root}${canon.path}`
++}
++
++/**
++ * Destination 头里是否含「点段」（`.` / `..`，含 %2e 编码形态）。
++ *
++ * 必须在 WHATWG URL 解析**之前**判：URL 会把 `%2e%2e` 当成 `..` 直接折叠掉，
++ * 折叠后再看已经看不出客户端发过编码点段（P1-18 验收 D4 要求这类请求非 2xx，
++ * 不能「规范化到根内并成功」）。只看 path 部分，逐段单次解码后比对。
++ */
++function rawDestinationHasDotSegment(rawDest: string): boolean {
++  let p = rawDest
++  const abs = /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^/]*(\/.*)?$/.exec(rawDest)
++  if (abs) p = abs[1] || "/"
++  p = p.split("?")[0].split("#")[0]
++  // 只比对 WHATWG URL 定义的点段六种写法，不做解码：
++  // 单点 "." / "%2e"；双点 ".." / ".%2e" / "%2e." / "%2e%2e"。
++  for (const seg of p.split("/")) {
++    const s = seg.toLowerCase()
++    if (
++      s === "." ||
++      s === ".." ||
++      s === "%2e" ||
++      s === ".%2e" ||
++      s === "%2e." ||
++      s === "%2e%2e"
++    ) {
++      return true
++    }
++  }
++  return false
+ }
+ 
+ /** 解析 MOVE / COPY 的 Destination 头并映射到用户根之下 */
+ function destinationPath(c: any, user: any): string | null {
+   const destRaw = c.req.header("Destination") || ""
+   if (!destRaw) return null
+-  let dest = destRaw
++  // P1-18：编码/字面点段一律拒绝（403），不给 URL 层折叠成「根内合法路径」的机会
++  if (rawDestinationHasDotSegment(destRaw)) return null
++  let pathname: string
+   try {
+-    dest = decodeURIComponent(new URL(destRaw, c.req.url).pathname)
+-    // 与 davPathOf 同样的前缀守卫：Destination 未挂在 DAV_MOUNT 下时原样保留，
+-    // 不做无意义的前缀改写（否则挂在子路径下的部署会被截错）
+-    if (dest === DAV_MOUNT || dest.startsWith(DAV_MOUNT + "/")) {
+-      dest = dest.slice(DAV_MOUNT.length) || "/"
+-    }
++    pathname = new URL(destRaw, c.req.url).pathname
+   } catch {
+     return null
+   }
++  // P1-18：与 davPathOf 同一条边界解码路径（恰好一次）
++  const decoded = decodeWirePath(pathname)
++  if (!decoded.ok) return null
++  let dest = decoded.path
++  // 与 davPathOf 同样的前缀守卫：Destination 未挂在 DAV_MOUNT 下时原样保留，
++  // 不做无意义的前缀改写（否则挂在子路径下的部署会被截错）
++  if (dest === DAV_MOUNT || dest.startsWith(DAV_MOUNT + "/")) {
++    dest = dest.slice(DAV_MOUNT.length) || "/"
++  }
+   if (!dest) dest = "/"
+   return scopedDavPath(user, dest.startsWith("/") ? dest : `/${dest}`)
+ }
+@@ -372,8 +435,15 @@ webdavRouter.all("/*", async (c) => {
+   // davPath 是**客户端可见**路径（用于 href，不能把实际存储路径回显给客户端）；
+   // actualPath 才是交给存储层的路径（已套用该用户的根目录）。
+   const davPath = davPathOf(c)
++  if (davPath === null) {
++    return c.text("Bad Request: malformed path encoding", 400)
++  }
+   const actualPath = scopedDavPath(user, davPath)
+-  if (!isWithinUserRoot(user, actualPath)) return c.text("Forbidden", 403)
++  // P1-18：路径被 canonicalizePath 拒绝（含 ".." / 二次编码残留）或越出用户根
++  // 一律 403；DAV 侧不再有任何"原样放行"的分支。
++  if (!actualPath || !isWithinUserRoot(user, actualPath)) {
++    return c.text("Forbidden", 403)
++  }
+   const ctx = getStorageRequestContext(c)
+ 
+   try {
+@@ -464,8 +534,10 @@ webdavRouter.all("/*", async (c) => {
+ 
+       case "DELETE": {
+         if (!canManage) return c.text("Forbidden", 403)
+-        // 对齐 Go webdav.go handleDelete：目标自身的 meta.write_users 白名单
+-        if (await deniedByMetaWrite(c, user, actualPath, false)) {
++        // 对齐 Go webdav.go handleDelete：判**目标所在目录**的 meta.write_users
++        // 白名单（P1-19/X1：旧实现判目标自身，sub=false 的白名单对
++        // DELETE /dav/t/locked/x.txt 完全不起作用，实测 204 且真删）
++        if (await deniedByMetaWrite(c, user, splitPath(actualPath).dir, false)) {
+           return metaForbidden(c)
+         }
+         const { dir, name } = splitPath(actualPath)
+@@ -590,6 +662,8 @@ webdavRouter.all("/*", async (c) => {
+     // C8：404 只能从 sourceStep（首次驱动调用判定源不存在）出来；深层 IO 的
+     // ENOENT/ENOTDIR 与 "... not found" 文案一律按原样回 500，报文仍经
+     // safeErrorMessage 输出。A10 四形态走 fs.ts 的 writeFailure，不经这里。
++    // P1-18：路径被拒绝（纵深调用里抛出的 PathRejectedError）一律 403。
++    if (isPathRejected(e)) return c.text("Forbidden", 403)
+     if (e instanceof SourceMissingError) return c.text("Not Found", 404)
+     return c.text(safeErrorMessage(e), 500)
+   }

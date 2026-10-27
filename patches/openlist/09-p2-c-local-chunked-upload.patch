@@ -1,0 +1,170 @@
+diff --git a/src/backend/drivers/local.ts b/src/backend/drivers/local.ts
+index 255d37f..909da1e 100644
+--- a/src/backend/drivers/local.ts
++++ b/src/backend/drivers/local.ts
+@@ -16,6 +16,14 @@ async function initNodeModules() {
+   }
+ }
+ 
++/**
++ * 分片临时目录的前缀：放在目标文件所在目录（同一个文件系统），收尾时把第一个
++ * 分片原地拼成目标文件再 rename，磁盘峰值只有一份文件，不是分片加成品两份。
++ * 列目录时过滤掉这个前缀，上传中的临时目录不暴露给用户；失败残留也只占隐藏
++ * 目录，不会变成用户可见的半成品文件。
++ */
++const UPLOAD_TMP_PREFIX = ".openlist-upload-"
++
+ export class LocalDriver implements StorageDriver {
+   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+     await initNodeModules()
+@@ -24,6 +32,8 @@ export class LocalDriver implements StorageDriver {
+     let files: any[] = []
+     try {
+       files = await fs.readdir(physicalPath, { withFileTypes: true })
++      // 分片上传的临时目录不当成用户文件列出来（见 UPLOAD_TMP_PREFIX）
++      files = files.filter((f: any) => !String(f.name).startsWith(UPLOAD_TMP_PREFIX))
+     } catch (e) {
+       return []
+     }
+@@ -149,4 +159,101 @@ export class LocalDriver implements StorageDriver {
+     await fs.mkdir(path.dirname(physicalPath), { recursive: true })
+     await fs.writeFile(physicalPath, content)
+   }
++
++  // ---- P2 C：分片上传 ----
++  //
++  // fs.ts 的 /api/fs/multipart/* 只在驱动实现 createUploadSession 时才走分片，
++  // 否则客户端回退到整文件上传（body 全进内存，100MB 上传会顶到 100MB+）。
++  // 这里把分片落到 TMPDIR 的临时目录，complete 时按分片号顺序流式拼接，
++  // 峰值内存 = 64KB（拼接）+ 单分片（fs.ts 侧读取），不随文件大小增长。
++  // 覆盖语义与 put 一致：目标已存在则整文件替换。
++  async createUploadSession(
++    _virtualDir: string,
++    physicalDir: string,
++    fileName: string,
++    size: number,
++    _md5: string,
++  ): Promise<{
++    reuse: boolean
++    partCount: number
++    chunkSize: number
++    session: string
++  }> {
++    await initNodeModules()
++    if (!fs || !path)
++      throw new Error("LocalDriver is not supported in Edge Runtime")
++    await fs.mkdir(physicalDir, { recursive: true })
++    const id =
++      Math.random().toString(36).slice(2) + Date.now().toString(36)
++    const dir = path.join(physicalDir, UPLOAD_TMP_PREFIX + id)
++    await fs.mkdir(dir, { recursive: true })
++    const chunkSize = 10 * 1024 * 1024
++    return {
++      reuse: false,
++      partCount: Math.max(1, Math.ceil(size / chunkSize)),
++      chunkSize,
++      session: JSON.stringify({
++        dir,
++        target: path.join(physicalDir, fileName),
++        size,
++      }),
++    }
++  }
++
++  async uploadPart(
++    session: string,
++    partNumber: number,
++    content: Buffer,
++  ): Promise<void> {
++    await initNodeModules()
++    if (!fs || !path)
++      throw new Error("LocalDriver is not supported in Edge Runtime")
++    const s = JSON.parse(session)
++    await fs.writeFile(path.join(s.dir, String(partNumber)), content)
++  }
++
++  async completeUploadSession(session: string): Promise<void> {
++    await initNodeModules()
++    if (!fs || !path)
++      throw new Error("LocalDriver is not supported in Edge Runtime")
++    const s = JSON.parse(session)
++    const names: string[] = (await fs.readdir(s.dir)).filter((n: string) =>
++      /^\d+$/.test(n),
++    )
++    if (names.length === 0) throw new Error("LocalDriver: no uploaded parts")
++    names.sort((a: string, b: string) => Number(a) - Number(b))
++    const parts = names.map((n: string) => path.join(s.dir, n))
++    // 完整性校验：分片没齐就 complete 时必须失败，不能把截断的文件当成功交付。
++    // 逐片 stat 求和（不读内容，峰值内存不变）。
++    let total = 0
++    for (const p of parts) total += (await fs.stat(p)).size
++    if (total !== Number(s.size)) {
++      try {
++        await fs.rm(s.dir, { recursive: true, force: true })
++      } catch {}
++      throw new Error(
++        `LocalDriver: incomplete upload (${total} of ${s.size} bytes)`,
++      )
++    }
++    const first = parts[0]
++    const rest = parts.slice(1)
++    try {
++      if (typeof (fs as any).appendFromFiles === "function") {
++        // txiki shim：把 rest 顺序追加到第一个分片里（64KB 一块），再 rename。
++        // 原地拼接的峰值磁盘 = 一份文件，不是「分片 + 成品」两份。
++        await (fs as any).appendFromFiles(first, rest)
++      } else {
++        // Node 回退：逐片读入再追加（单片量级，不涉及总文件大小）
++        for (const p of rest) await fs.appendFile(first, await fs.readFile(p))
++      }
++      await fs.rename(first, s.target)
++    } catch (e) {
++      // 失败无残留：拼接或 rename 失败时清掉分片目录，存储根里不留半成品
++      try {
++        await fs.rm(s.dir, { recursive: true, force: true })
++      } catch {}
++      throw e
++    }
++    await fs.rm(s.dir, { recursive: true, force: true })
++  }
+ }
+diff --git a/src/backend/txiki/shims/fs-promises.ts b/src/backend/txiki/shims/fs-promises.ts
+index 66c103e..7d3f880 100644
+--- a/src/backend/txiki/shims/fs-promises.ts
++++ b/src/backend/txiki/shims/fs-promises.ts
+@@ -184,3 +184,35 @@ export async function appendFile(p: string, data: any): Promise<void> {
+     await f.close()
+   }
+ }
++
++/**
++ * P2 C：分片上传收尾，把 parts 顺序追加到 dst（dst 是第一个分片，已存在）。
++ *
++ * 单独放 shim 的原因：26.9 的 FileHandle.write(buf, pos) 第二参数是文件内偏移，
++ * 而 Node 的 FileHandle 签名不同；这里只写 txiki 版本，调用方在 Node 下走
++ * readFile + appendFile 回退（单片 10MB 级别，Node 端不在意）。
++ * 峰值内存固定 64KB 一块，与文件总大小无关。
++ */
++export async function appendFromFiles(dst: string, parts: string[]): Promise<void> {
++  const CHUNK = 64 * 1024
++  const out = await tjs.open(dst, "a")
++  try {
++    for (const p of parts) {
++      const fh = await tjs.open(p, "r")
++      try {
++        let off = 0
++        for (;;) {
++          const buf = new Uint8Array(CHUNK)
++          const n = await fh.read(buf, off)
++          if (n === null || n === undefined || n === 0) break
++          await out.write(n === buf.length ? buf : buf.subarray(0, n))
++          off += n
++        }
++      } finally {
++        await fh.close()
++      }
++    }
++  } finally {
++    await out.close()
++  }
++}

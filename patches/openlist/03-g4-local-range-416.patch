@@ -1,0 +1,299 @@
+diff --git a/src/backend/internal/stream/stream.ts b/src/backend/internal/stream/stream.ts
+index 2cd7c03..9e6827c 100644
+--- a/src/backend/internal/stream/stream.ts
++++ b/src/backend/internal/stream/stream.ts
+@@ -6,16 +6,75 @@ export interface RangeParams {
+   chunksize: number
+ }
+ 
+-// Parses the standard Range header
++/** 单次响应最多接受的分段数；超过则按 RFC 9110 忽略 Range，回整份。 */
++const MAX_RANGE_PARTS = 16
++
++/**
++ * 把 Range 头解析成可满足的字节区间列表。
++ *
++ * 返回值：
++ *   - null：区间非法或不可满足，调用方必须回 416
++ *     （并带 `Content-Range: bytes *\/fileSize`）；
++ *   - []：按 RFC 9110 忽略该头（未知 range unit、分段过多），调用方回整份 200；
++ *   - 其余：一个或多个区间，均已按文件大小裁剪。
++ *
++ * 此前实现只做 `split("-") + parseInt`：suffix（`-500`）得 start=NaN，
++ * 畸形（`abc-def`）得 NaN-NaN，越界（`99999999-`）得 chunksize<0，
++ * 调用方仍无条件回 206，导致设备验收 G4-23/24/25 三条真实缺陷。
++ */
++export function parseRangeHeaderList(
++  rangeHeader: string,
++  fileSize: number,
++): RangeParams[] | null {
++  const header = (rangeHeader || "").trim()
++  const match = /^([a-z]+)=(.*)$/i.exec(header)
++  if (!match) return [] // 没有 range unit：忽略
++  if (match[1].toLowerCase() !== "bytes") return [] // 不认识的 unit：忽略
++
++  const specs = match[2].split(",").map((s) => s.trim())
++  if (specs.length > MAX_RANGE_PARTS) return []
++
++  const ranges: RangeParams[] = []
++  for (const spec of specs) {
++    const m = /^(\d*)-(\d*)$/.exec(spec)
++    if (!m) return null
++    const startRaw = m[1]
++    const endRaw = m[2]
++    if (!startRaw && !endRaw) return null // 单独的 "-" 不是合法区间
++
++    let start: number
++    let end: number
++    if (!startRaw) {
++      // suffix-byte-range-spec：最后 N 字节
++      const suffix = parseInt(endRaw, 10)
++      if (!Number.isFinite(suffix) || suffix <= 0) return null
++      start = Math.max(fileSize - suffix, 0)
++      end = fileSize - 1
++    } else {
++      start = parseInt(startRaw, 10)
++      if (!Number.isFinite(start) || start >= fileSize) return null
++      if (endRaw) {
++        end = parseInt(endRaw, 10)
++        if (!Number.isFinite(end) || end < start) return null
++        if (end >= fileSize) end = fileSize - 1
++      } else {
++        end = fileSize - 1
++      }
++    }
++    if (start < 0 || end < 0 || start > end) return null
++    ranges.push({ start, end, chunksize: end - start + 1 })
++  }
++  return ranges
++}
++
++// Parses the standard Range header（单区间视图；多段请用 parseRangeHeaderList）
+ export function parseRangeHeader(
+   rangeHeader: string,
+   fileSize: number,
+-): RangeParams {
+-  const parts = rangeHeader.replace(/bytes=/, "").split("-")
+-  const start = parseInt(parts[0], 10)
+-  const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+-  const chunksize = end - start + 1
+-  return { start, end, chunksize }
++): RangeParams | null {
++  const ranges = parseRangeHeaderList(rangeHeader, fileSize)
++  if (!ranges || ranges.length === 0) return null
++  return ranges[0]
+ }
+ 
+ let fs: any = null
+diff --git a/src/backend/server/proxy_request.ts b/src/backend/server/proxy_request.ts
+index 3de7173..51e7996 100644
+--- a/src/backend/server/proxy_request.ts
++++ b/src/backend/server/proxy_request.ts
+@@ -6,7 +6,7 @@
+  * 覆盖「Range 透传 + 签名 + 上游不支持 Range」的交互边界。
+  */
+ 
+-import { parseRangeHeader } from "../internal/stream/stream"
++import { parseRangeHeaderList } from "../internal/stream/stream"
+ import { driverMustProxyForStorage } from "../internal/driver/proxy"
+ 
+ export const PROXY_USER_AGENT =
+@@ -225,7 +225,10 @@ export function exceedsProxyPayloadLimit(
+   if (!Number.isFinite(size) || size <= 0) return false
+   if (range) {
+     try {
+-      return parseRangeHeader(range, size).chunksize > limit
++      const ranges = parseRangeHeaderList(range, size)
++      if (ranges === null) return false // 不可满足，回 416 错误头而不是 body
++      if (ranges.length === 0) return size > limit // Range 被忽略，回整份
++      return ranges.reduce((sum, r) => sum + r.chunksize, 0) > limit
+     } catch {
+       return false
+     }
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index a3d4fbb..4f114fd 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -1,6 +1,9 @@
+ import { Hono } from "hono"
+ import { getSettings, resolvePath } from "../internal/model/db"
+-import { parseRangeHeader } from "../internal/stream/stream"
++import {
++  parseRangeHeaderList,
++  type RangeParams,
++} from "../internal/stream/stream"
+ import { flushPendingDriverState, getDriver } from "../internal/op/storage"
+ import { resolveShare } from "../internal/op/share"
+ import {
+@@ -37,6 +40,105 @@ import {
+   upstreamBodySize,
+ } from "./proxy_request"
+ 
++type RangeOpen = (range?: { start: number; end: number }) => any
++
++const CRLF = String.fromCharCode(13, 10)
++
++const rangeBoundary = () =>
++  `openlist-${Date.now().toString(16)}${Math.floor(
++    Math.random() * 0x100000000,
++  ).toString(16)}`
++
++/** 多段 Range 的 multipart/byteranges 流：按序从驱动取每一段，段间补分隔符。 */
++function multipartRanges(
++  open: RangeOpen,
++  size: number,
++  ranges: RangeParams[],
++  boundary: string,
++): ReadableStream<Uint8Array> {
++  const enc = new TextEncoder()
++  const head = (r: RangeParams) =>
++    `--${boundary}${CRLF}Content-Type: application/octet-stream${CRLF}` +
++    `Content-Range: bytes ${r.start}-${r.end}/${size}${CRLF}${CRLF}`
++  let index = 0
++  let reader: any = null
++  return new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      for (;;) {
++        if (reader) {
++          const { done, value } = await reader.read()
++          if (!done) {
++            if (value && value.length) controller.enqueue(value)
++            return
++          }
++          reader.releaseLock()
++          reader = null
++          if (index >= ranges.length) {
++            controller.enqueue(enc.encode(`${CRLF}--${boundary}--${CRLF}`))
++            controller.close()
++            return
++          }
++          const next = ranges[index++]
++          controller.enqueue(enc.encode(`${CRLF}${head(next)}`))
++          reader = (await open({ start: next.start, end: next.end })).getReader()
++          return
++        }
++        if (index >= ranges.length) {
++          controller.enqueue(enc.encode(`--${boundary}--${CRLF}`))
++          controller.close()
++          return
++        }
++        const first = ranges[index++]
++        controller.enqueue(enc.encode(head(first)))
++        reader = (await open({ start: first.start, end: first.end })).getReader()
++        return
++      }
++    },
++    cancel(reason) {
++      try {
++        reader?.cancel(reason)
++      } catch {}
++    },
++  })
++}
++
++/**
++ * 无 raw_url 的服务端回传路径（驱动 createReadStream / 本地 fs）的 Range 响应。
++ * 行为对齐有 raw_url 时透传给上游的主路径：单段 206、多段 multipart/byteranges、
++ * 不可满足时 416 + `Content-Range: bytes *\/size`。
++ */
++async function rangeBody(
++  c: any,
++  size: number,
++  rangeHeader: string,
++  open: RangeOpen,
++) {
++  const ranges = parseRangeHeaderList(rangeHeader, size)
++  if (ranges === null) {
++    c.header("Accept-Ranges", "bytes")
++    c.header("Content-Range", `bytes */${size}`)
++    return c.body(null, 416)
++  }
++  if (ranges.length === 0) {
++    c.header("Accept-Ranges", "bytes")
++    c.header("Content-Length", size.toString())
++    c.header("Content-Type", "application/octet-stream")
++    return c.body(await open(), 200)
++  }
++  if (ranges.length === 1) {
++    const { start, end, chunksize } = ranges[0]
++    c.header("Content-Range", `bytes ${start}-${end}/${size}`)
++    c.header("Accept-Ranges", "bytes")
++    c.header("Content-Length", chunksize.toString())
++    c.header("Content-Type", "application/octet-stream")
++    return c.body(await open({ start, end }), 206)
++  }
++  const boundary = rangeBoundary()
++  c.header("Content-Type", `multipart/byteranges; boundary=${boundary}`)
++  c.header("Accept-Ranges", "bytes")
++  return c.body(multipartRanges(open, size, ranges, boundary), 206)
++}
++
+ let fsPromises: any = null
+ let createReadStream: any = null
+ 
+@@ -631,28 +733,17 @@ rawRouter.get("/*", async (c) => {
+             const size = fileItem.size || 0
+             const rangeHeader = c.req.header("Range")
+             if (rangeHeader && size > 0) {
+-              const { start, end, chunksize } = parseRangeHeader(
+-                rangeHeader,
+-                size,
+-              )
+-              const stream = await (driver as any).createReadStream(
+-                resolved.physical,
+-                { start, end },
+-              )
+-              c.header("Content-Range", `bytes ${start}-${end}/${size}`)
+-              c.header("Accept-Ranges", "bytes")
+-              c.header("Content-Length", chunksize.toString())
+-              c.header("Content-Type", "application/octet-stream")
+-              return c.body(stream as any, 206)
+-            } else {
+-              if (size > 0) c.header("Content-Length", size.toString())
+-              c.header("Accept-Ranges", "bytes")
+-              c.header("Content-Type", "application/octet-stream")
+-              const stream = await (driver as any).createReadStream(
+-                resolved.physical,
++              return rangeBody(c, size, rangeHeader, (r) =>
++                (driver as any).createReadStream(resolved.physical, r),
+               )
+-              return c.body(stream as any)
+             }
++            if (size > 0) c.header("Content-Length", size.toString())
++            c.header("Accept-Ranges", "bytes")
++            c.header("Content-Type", "application/octet-stream")
++            const stream = await (driver as any).createReadStream(
++              resolved.physical,
++            )
++            return c.body(stream as any)
+           } else {
+             const detail =
+               fileItem?.raw_url_error ||
+@@ -705,20 +796,14 @@ rawRouter.get("/*", async (c) => {
+     c.header("Access-Control-Allow-Origin", "*")
+     const rangeHeader = c.req.header("Range")
+     if (rangeHeader) {
+-      const { start, end, chunksize } = parseRangeHeader(rangeHeader, stat.size)
+-      const stream = createReadStream(resolved.physical, { start, end })
+-
+-      c.header("Content-Range", `bytes ${start}-${end}/${stat.size}`)
+-      c.header("Accept-Ranges", "bytes")
+-      c.header("Content-Length", chunksize.toString())
+-      c.header("Content-Type", "application/octet-stream")
+-      return c.body(stream as any, 206)
+-    } else {
+-      c.header("Content-Length", stat.size.toString())
+-      c.header("Accept-Ranges", "bytes")
+-      const stream = createReadStream(resolved.physical)
+-      return c.body(stream as any)
++      return rangeBody(c, stat.size, rangeHeader, (r) =>
++        createReadStream(resolved.physical, r),
++      )
+     }
++    c.header("Content-Length", stat.size.toString())
++    c.header("Accept-Ranges", "bytes")
++    const stream = createReadStream(resolved.physical)
++    return c.body(stream as any)
+   } catch (err: any) {
+     console.error(`[rawRouter] Download 404 for '${reqPath0}':`, err.message)
+     return c.text(`Not found: ${safeErrorMessage(err, "file not found")}`, 404)

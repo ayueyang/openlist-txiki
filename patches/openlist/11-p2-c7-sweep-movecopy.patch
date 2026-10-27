@@ -1,0 +1,388 @@
+--- a/src/backend/drivers/local.ts
++++ b/src/backend/drivers/local.ts
+@@ -23,6 +23,12 @@
+  * 目录，不会变成用户可见的半成品文件。
+  */
+ const UPLOAD_TMP_PREFIX = ".openlist-upload-"
++
++/**
++ * C7：临时目录的会话标记文件名。目录名带前缀还不够，回收例程只认「前缀 +
++ * session.json 可解析 + createdAt 早于阈值」的目录；无标记的同名目录一律不动。
++ */
++const UPLOAD_SESSION_MARKER = "session.json"
+ 
+ export class LocalDriver implements StorageDriver {
+   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+@@ -187,6 +193,24 @@
+       Math.random().toString(36).slice(2) + Date.now().toString(36)
+     const dir = path.join(physicalDir, UPLOAD_TMP_PREFIX + id)
+     await fs.mkdir(dir, { recursive: true })
++    // C7：建目录后立刻写标记；写失败就删目录再抛错，不留无标记目录给回收例程
++    // 当「用户自己建的目录」永远跳过。
++    try {
++      await fs.writeFile(
++        path.join(dir, UPLOAD_SESSION_MARKER),
++        JSON.stringify({
++          v: 1,
++          createdAt: Date.now(),
++          size,
++          target: path.join(physicalDir, fileName),
++        }),
++      )
++    } catch (e) {
++      try {
++        await fs.rm(dir, { recursive: true, force: true })
++      } catch {}
++      throw e
++    }
+     const chunkSize = 10 * 1024 * 1024
+     return {
+       reuse: false,
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -1789,10 +1789,15 @@
+   dstDir: string,
+   names: string[],
+   requestContext?: StorageRequestContext,
++  dstNames?: string[],
+ ): Promise<void> {
+-  for (const name of names) {
++  for (let i = 0; i < names.length; i++) {
++    const name = names[i]
++    // C7-7：可选目标名。给了就一次复制到 dstDir/dstName（同目录改名 COPY），
++    // 缺省保持上游行为：dstDir/源名。
++    const dstName = dstNames?.[i] || name
+     const srcVirtual = `${srcDir}/${name}`
+-    const dstVirtual = `${dstDir}/${name}`
++    const dstVirtual = `${dstDir}/${dstName}`
+     const srcResolved = await resolvePath(srcVirtual, requestContext?.env)
+     const dstResolved = await resolvePath(dstVirtual, requestContext?.env)
+     if (srcResolved.isVirtual || dstResolved.isVirtual) {
+@@ -1807,7 +1812,7 @@
+       await driver.copy(
+         srcDir,
+         dstDir,
+-        [name],
++        [dstName],
+         srcResolved.physical!,
+         dstResolved.physical!,
+       )
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -441,12 +441,30 @@
+         ) {
+           return metaForbidden(c)
+         }
+-        await moveItems(src.dir, dst.dir, [src.name], ctx)
+-        // C 段：Destination 的文件名与源不同时才是真正的「重命名 + 移动」。
+-        // op/storage 的 moveItems 按 src.name 落到 dst.dir，这里补一次 renameItem
+-        // 才能对齐 RFC 4918 和 Go webdav/file.go moveFiles 的语义（rclone rename 依赖它）。
+-        if (dst.name && dst.name !== src.name) {
+-          await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
++        const renaming = !!dst.name && dst.name !== src.name
++        // C7-6：同目录改名只调一次 renameItem，不走 moveItems——云端驱动的 move
++        // 是同 key 复制再删除，等于删掉自己（drivers/s3/driver.ts 231-249）。
++        if (src.dir === dst.dir) {
++          if (renaming) await renameItem(actualPath, dst.name, ctx)
++          return c.body(null, 201)
++        }
++        // C7-8：跨目录改名先在源目录改成目标名，再按目标名 move（单次驱动调用）；
++        // move 失败就补偿改回原名，补偿也失败时 500 报文给出真实落点。
++        if (renaming) await renameItem(actualPath, dst.name, ctx)
++        try {
++          await moveItems(src.dir, dst.dir, [renaming ? dst.name : src.name], ctx)
++        } catch (e: any) {
++          if (renaming) {
++            try {
++              await renameItem(`${src.dir}/${dst.name}`, src.name, ctx)
++            } catch (e2: any) {
++              return c.text(
++                `MOVE failed after rename; file is at ${src.dir}/${dst.name}: ${safeErrorMessage(e)}; ${safeErrorMessage(e2)}`,
++                500,
++              )
++            }
++          }
++          throw e
+         }
+         return c.body(null, 201)
+       }
+@@ -474,11 +492,27 @@
+         if (await deniedByMetaWrite(c, user, dst.dir, false)) {
+           return metaForbidden(c)
+         }
++        const renaming = !!dst.name && dst.name !== src.name
++        // C7-7：同目录改名 COPY 用单次 driver.copy 直接落到新名字；不能走
++        // 「copy 到 dst.dir/源名再改名」——同目录下那等于复制到自身再删源。
++        if (src.dir === dst.dir) {
++          if (renaming) {
++            await copyItems(src.dir, dst.dir, [src.name], ctx, [dst.name])
++          }
++          return c.body(null, 201)
++        }
++        // C7-9：跨目录改名 COPY 仍是「复制到 dst.dir/源名 + 改名」两步；改名失败
++        // 不删副本（删了可能毁掉被覆盖的原文件），500 报文写明副本落点。
+         await copyItems(src.dir, dst.dir, [src.name], ctx)
+-        // 同 MOVE：COPY 到不同文件名是「复制 + 改名」，moveItems/copyItems 只认
+-        // dst.dir，这里补 renameItem 才能让 Destination 的文件名生效。
+-        if (dst.name && dst.name !== src.name) {
+-          await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
++        if (renaming) {
++          try {
++            await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
++          } catch (e: any) {
++            return c.text(
++              `COPY failed after copy; copy is at ${dst.dir}/${src.name}: ${safeErrorMessage(e)}`,
++              500,
++            )
++          }
+         }
+         return c.body(null, 201)
+       }
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -6,7 +6,6 @@
+ import app from "../index"
+ import { loadConfig } from "./config"
+ import { openDatabase } from "./sqlite-d1"
+-import { startUploadSweep } from "./upload-sweep"
+ import { startUploadSweep } from "./upload-sweep"
+ 
+ // txiki 的 Headers 没有 getSetCookie（Node 18+/undici 才有）。Hono 在
+@@ -203,3 +202,7 @@
+ })
+ 
+ console.log(`[txiki] listening on ${cfg.hostname}:${cfg.port}`)
++
++// C7：分片临时目录回收（启动扫描 + 运行期 TTL）。放在 serve 之后异步跑，不挡首个
++// 200；internal 异常由 startUploadSweep 内部吞掉只打日志。
++startUploadSweep(env)
+--- a/src/backend/txiki/upload-sweep.ts
++++ b/src/backend/txiki/upload-sweep.ts
+@@ -0,0 +1,227 @@
++/**
++ * C7：分片上传临时目录的回收（C 段裁决 2026-10-21 11:00）。
++ *
++ * 两条路共用一个例程：
++ * - 启动扫描：tjs.serve 之后异步跑一次，cutoff 取扫描开始时刻。分片会话只存在
++ *   进程内存里（fs.ts 的 driver_session 不进 snapshot），重启后带标记的临时目录
++ *   必然是孤儿，所以不需要再按年龄判断。
++ * - 运行期 TTL：setInterval 跑同一例程，cutoff = now - 24h，兜住「上传中途被弃」。
++ *
++ * 只删「目录名前缀匹配 + session.json 可解析 + createdAt < cutoff」的目录；无标记
++ * 的同名目录一律不动，只计数（可能是用户自己建的）。扫描异常只打日志，不抛出。
++ */
++import { setEnvCtx, getStorages } from "../internal/model/db"
++
++declare const tjs: any
++
++const PREFIX = ".openlist-upload-"
++const MARKER = "session.json"
++const DEFAULT_INTERVAL_MS = 3600000
++const TTL_MS = 24 * 3600000
++const MAX_DIRS_PER_ROOT = 20000
++const MAX_MS_PER_ROOT = 5000
++const YIELD_EVERY = 64
++
++interface SweepStats {
++  roots: number
++  dirs: number
++  deleted: number
++  freed: number
++  unmarked: number
++  budgetHit: number
++}
++
++function errText(e: any): string {
++  return e && e.message ? e.message : String(e)
++}
++
++/** OPENLIST_TXIKI_SWEEP=log 只记日志不删（止损开关）；SWEEP_MS=0 关闭周期扫描。 */
++function readSweepConfig(): { dryRun: boolean; intervalMs: number } {
++  const env = (tjs.env || {}) as Record<string, string>
++  const dryRun = String(env.OPENLIST_TXIKI_SWEEP || "").toLowerCase() === "log"
++  const raw = env.OPENLIST_TXIKI_SWEEP_MS
++  let intervalMs = DEFAULT_INTERVAL_MS
++  if (raw !== undefined && raw !== "") {
++    const n = Number(raw)
++    if (Number.isFinite(n) && n >= 0) intervalMs = Math.floor(n)
++  }
++  return { dryRun, intervalMs }
++}
++
++async function readdirNames(dir: string): Promise<Array<{ name: string; isDir: boolean }>> {
++  const out: Array<{ name: string; isDir: boolean }> = []
++  const dh = await tjs.readDir(dir)
++  try {
++    for await (const de of dh) {
++      out.push({ name: String(de.name), isDir: !!de.isDirectory })
++    }
++  } finally {
++    try {
++      await dh.close()
++    } catch {}
++  }
++  return out
++}
++
++/** 标记解析：只认 createdAt 可用的 JSON；解析不了就当无标记。 */
++async function readMarker(
++  dir: string,
++): Promise<{ createdAt: number; size: number } | null> {
++  let raw: any
++  try {
++    raw = await tjs.readFile(`${dir}/${MARKER}`, "utf8")
++  } catch {
++    return null
++  }
++  try {
++    const o =
++      typeof raw === "string" ? JSON.parse(raw) : JSON.parse(new TextDecoder().decode(raw))
++    const createdAt = Number(o?.createdAt)
++    if (!Number.isFinite(createdAt)) return null
++    const size = Number(o?.size)
++    return { createdAt, size: Number.isFinite(size) && size > 0 ? size : 0 }
++  } catch {
++    return null
++  }
++}
++
++/** 目录当前占用字节：临时目录里只有分片文件与标记，平铺统计即可。 */
++async function dirBytes(dir: string): Promise<number> {
++  let total = 0
++  try {
++    for (const e of await readdirNames(dir)) {
++      if (e.isDir) continue
++      try {
++        total += Number((await tjs.stat(`${dir}/${e.name}`)).size) || 0
++      } catch {}
++    }
++  } catch {}
++  return total
++}
++
++async function walkRoot(
++  root: string,
++  cutoff: number,
++  dryRun: boolean,
++  stats: SweepStats,
++): Promise<void> {
++  const started = Date.now()
++  let dirs = 0
++  let sinceYield = 0
++  const queue: string[] = [root]
++  while (queue.length > 0) {
++    // 每个 root 的预算：先到先停，到顶打 budget_hit=1
++    if (dirs >= MAX_DIRS_PER_ROOT || Date.now() - started >= MAX_MS_PER_ROOT) {
++      stats.budgetHit = 1
++      return
++    }
++    const dir = queue.shift() as string
++    dirs++
++    stats.dirs++
++    // 每 64 个目录让出一次事件循环，避免扫描把首个请求拖住
++    if (++sinceYield % YIELD_EVERY === 0) {
++      await new Promise((r) => (globalThis as any).setTimeout(r, 0))
++    }
++    let entries: Array<{ name: string; isDir: boolean }>
++    try {
++      entries = await readdirNames(dir)
++    } catch {
++      continue
++    }
++    for (const e of entries) {
++      if (!e.isDir) continue
++      const full = dir.endsWith("/") ? `${dir}${e.name}` : `${dir}/${e.name}`
++      if (!e.name.startsWith(PREFIX)) {
++        queue.push(full)
++        continue
++      }
++      const marker = await readMarker(full)
++      if (!marker) {
++        // 无标记：可能是用户自己建的同名目录，一律不删，只计数
++        stats.unmarked++
++        continue
++      }
++      if (marker.createdAt >= cutoff) continue
++      const bytes = await dirBytes(full)
++      if (dryRun) {
++        stats.deleted++
++        stats.freed += bytes
++        continue
++      }
++      try {
++        await tjs.remove(full)
++        stats.deleted++
++        stats.freed += bytes
++      } catch (e) {
++        console.error(`[txiki] upload-sweep delete failed ${full}: ${errText(e)}`)
++      }
++    }
++  }
++}
++
++async function collectRoots(env: any): Promise<string[]> {
++  // getStorages 走请求级 env 上下文（D1 绑定）；扫描不在请求里，这里显式注入。
++  setEnvCtx(env)
++  const storages = (await getStorages()) || []
++  const roots = new Set<string>()
++  for (const s of storages) {
++    if (!s || String(s.driver || "").toLowerCase() !== "local") continue
++    let addition: any = s.addition
++    if (typeof addition === "string") {
++      try {
++        addition = JSON.parse(addition)
++      } catch {
++        continue
++      }
++    }
++    const root = addition?.root_folder_path
++    if (typeof root !== "string" || !root.trim()) continue
++    const clean = root.trim()
++    roots.add(clean.length > 1 ? clean.replace(/\/+$/, "") : clean)
++  }
++  return [...roots]
++}
++
++async function runOnce(
++  run: "boot" | "interval",
++  cutoff: number,
++  dryRun: boolean,
++  env: any,
++): Promise<void> {
++  const stats: SweepStats = {
++    roots: 0,
++    dirs: 0,
++    deleted: 0,
++    freed: 0,
++    unmarked: 0,
++    budgetHit: 0,
++  }
++  try {
++    const roots = await collectRoots(env)
++    stats.roots = roots.length
++    for (const root of roots) await walkRoot(root, cutoff, dryRun, stats)
++  } catch (e) {
++    console.error(`[txiki] upload-sweep run=${run} error: ${errText(e)}`)
++    return
++  }
++  const dry = dryRun ? " dry_run=1" : ""
++  console.log(
++    `[txiki] upload-sweep run=${run} roots=${stats.roots} dirs=${stats.dirs} deleted=${stats.deleted} freed=${stats.freed} unmarked=${stats.unmarked} budget_hit=${stats.budgetHit}${dry}`,
++  )
++}
++
++/**
++ * 启动回收：boot 扫描排到定时器里，不挡首个 200；周期扫描按 OPENLIST_TXIKI_SWEEP_MS
++ * 起（0 关闭）。readonly=1 也照跑（清的是本项目自己的垃圾）。
++ */
++export function startUploadSweep(env: any): void {
++  const { dryRun, intervalMs } = readSweepConfig()
++  ;(globalThis as any).setTimeout(() => {
++    void runOnce("boot", Date.now(), dryRun, env)
++  }, 0)
++  if (intervalMs > 0) {
++    ;(globalThis as any).setInterval(() => {
++      void runOnce("interval", Date.now() - TTL_MS, dryRun, env)
++    }, intervalMs)
++  }
++}

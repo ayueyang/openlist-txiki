@@ -1,0 +1,37 @@
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index 7da5b90..50106b5 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -35,6 +35,7 @@ import {
+   removeItems,
+   moveItems,
+   copyItems,
++  renameItem,
+ } from "../internal/op/storage"
+ import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
+ import { safeErrorMessage } from "../pkg/errs"
+@@ -441,6 +442,12 @@ webdavRouter.all("/*", async (c) => {
+           return metaForbidden(c)
+         }
+         await moveItems(src.dir, dst.dir, [src.name], ctx)
++        // C 段：Destination 的文件名与源不同时才是真正的「重命名 + 移动」。
++        // op/storage 的 moveItems 按 src.name 落到 dst.dir，这里补一次 renameItem
++        // 才能对齐 RFC 4918 和 Go webdav/file.go moveFiles 的语义（rclone rename 依赖它）。
++        if (dst.name && dst.name !== src.name) {
++          await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
++        }
+         return c.body(null, 201)
+       }
+ 
+@@ -468,6 +475,11 @@ webdavRouter.all("/*", async (c) => {
+           return metaForbidden(c)
+         }
+         await copyItems(src.dir, dst.dir, [src.name], ctx)
++        // 同 MOVE：COPY 到不同文件名是「复制 + 改名」，moveItems/copyItems 只认
++        // dst.dir，这里补 renameItem 才能让 Destination 的文件名生效。
++        if (dst.name && dst.name !== src.name) {
++          await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
++        }
+         return c.body(null, 201)
+       }
+ 

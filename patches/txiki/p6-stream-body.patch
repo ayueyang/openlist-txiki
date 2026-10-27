@@ -1,0 +1,144 @@
+diff -ruN a/src/httpserver.c b/src/httpserver.c
+--- a/src/httpserver.c	2026-10-24 05:15:26.785909264 +0800
++++ b/src/httpserver.c	2026-10-24 05:15:26.789388173 +0800
+@@ -37,6 +37,10 @@
+ #endif
+ #define TJS_HTTP_MAX_CHUNK_SIZE        (64 * 1024 * 1024)
+ #define TJS_HTTP_MAX_CHUNK_SIZE_DIGITS 16
++/* Content-Length bodies above this size are handed to JS as a stream
++ * (the same path a chunked body takes) instead of being accumulated in
++ * req->body_buf and copied to JS in one ArrayBuffer. */
++#define TJS_HTTP_STREAM_BODY_THRESHOLD (1024 * 1024)
+ #define TJS_HTTP_MAX_CHUNK_HEADER_SIZE 1024
+ /* Max payload handed to a single lws_write(). Over HTTP/2 a response body
+  * must be written in chunks the connection can flush per writable callback
+@@ -108,6 +112,7 @@
+     bool body_complete;
+     bool dispatched; /* JS handler has been invoked for this request */
+     bool chunked;    /* true for Transfer-Encoding: chunked — body is streamed to JS */
++    bool streaming_body; /* true for a Content-Length body above the stream threshold */
+     TJSHttpChunkState chunk_state;
+     size_t chunk_size;
+     size_t chunk_remaining;
+@@ -568,7 +573,7 @@
+     }
+     args[5] = JS_NewString(ctx, req->remote_addr);
+     args[6] = JS_FALSE; /* not a WS upgrade */
+-    args[7] = JS_NewBool(ctx, req->chunked);
++    args[7] = JS_NewBool(ctx, req->chunked || req->streaming_body);
+     args[8] = JS_NewString(ctx, tjs_http_version_name(req->http_version));
+ 
+     tjs_call_handler(ctx, s->callback, countof(args), args);
+@@ -1007,10 +1012,13 @@
+             if ((has_cl > 0 && atoi(cl) > 0) || has_te > 0) {
+                 /* Body expected, wait for LWS_CALLBACK_HTTP_BODY. */
+                 req->chunked = has_te > 0;
++                req->streaming_body = !req->chunked && has_cl > 0 &&
++                                      atoi(cl) > TJS_HTTP_STREAM_BODY_THRESHOLD;
+ 
+-                /* For chunked requests, invoke the handler immediately so JS
+-                 * can set up a ReadableStream for the request body. */
+-                if (req->chunked) {
++                /* For chunked requests and for large Content-Length requests,
++                 * invoke the handler immediately so JS can set up a
++                 * ReadableStream for the request body. */
++                if (req->chunked || req->streaming_body) {
+                     tjs_http_invoke_handler(s, req);
+                 }
+ 
+@@ -1030,6 +1038,12 @@
+             }
+ 
+             if (!req->chunked) {
++                if (req->streaming_body) {
++                    /* Large Content-Length body: forward the raw bytes to JS
++                     * the same way a chunked body is forwarded. */
++                    tjs_http_emit_body_chunk(s, req, (const uint8_t *) in, len);
++                    return 0;
++                }
+                 /* Non-chunked: accumulate as-is. */
+                 tbuf_put(&req->body_buf, in, len);
+                 return 0;
+@@ -1170,6 +1184,16 @@
+             }
+ 
+             req->body_complete = true;
++            if (req->streaming_body) {
++                /* Close the JS ReadableStream (the chunked path sends the
++                 * same NULL sentinel from its terminal chunk). */
++                JSContext *ctx = s->ctx;
++                JSValue cb_args[2];
++                cb_args[0] = JS_NewInt64(ctx, req->id);
++                cb_args[1] = JS_NULL;
++                tjs_call_handler(ctx, s->body_chunk_callback, 2, cb_args);
++                JS_FreeValue(ctx, cb_args[0]);
++            }
+             tjs_http_invoke_handler(s, req);
+             return 0;
+         }
+@@ -1336,14 +1360,21 @@
+              * reader loop can stop instead of hanging on a dead connection. */
+             tjs_http_req_settle_drain(s->ctx, req, false);
+ 
+-            /* If streaming body was in progress, signal end-of-stream. */
+-            if (req->chunked && !req->body_complete) {
++            /* If a streaming body was in progress when the connection died,
++             * settle the JS stream. A Content-Length body that did not arrive
++             * in full is an error, not an end-of-stream: closing the stream
++             * normally would let the consumer store a truncated upload as a
++             * complete file. The third argument tells JS to error the stream
++             * (the chunked path keeps its historic close semantics). */
++            if ((req->chunked || req->streaming_body) && !req->body_complete) {
+                 req->body_complete = true;
+-                JSValue cb_args[2];
++                JSValue cb_args[3];
+                 cb_args[0] = JS_NewInt64(s->ctx, req->id);
+                 cb_args[1] = JS_NULL;
+-                tjs_call_handler(s->ctx, s->body_chunk_callback, 2, cb_args);
++                cb_args[2] = JS_NewBool(s->ctx, req->streaming_body);
++                tjs_call_handler(s->ctx, s->body_chunk_callback, 3, cb_args);
+                 JS_FreeValue(s->ctx, cb_args[0]);
++                JS_FreeValue(s->ctx, cb_args[2]);
+             }
+ 
+             HASH_DEL(s->active_requests, req);
+diff -ruN a/src/js/core/httpserver.js b/src/js/core/httpserver.js
+--- a/src/js/core/httpserver.js	2026-10-24 05:15:26.787638423 +0800
++++ b/src/js/core/httpserver.js	2026-10-24 05:15:26.791507442 +0800
+@@ -91,17 +91,31 @@
+             }
+         };
+ 
+-        const onBodyChunk = (requestId, chunk) => {
++        const onBodyChunk = (requestId, chunk, isError) => {
+             const controller = this.#streamControllers.get(requestId);
+ 
+             if (!controller) {
+                 return;
+             }
+ 
+-            if (chunk) {
+-                controller.enqueue(new Uint8Array(chunk));
+-            } else {
+-                controller.close();
++            try {
++                if (isError) {
++                    // The connection died with the request body incomplete.
++                    // Closing the stream normally would let the consumer
++                    // treat a truncated upload as a complete one.
++                    this.#streamControllers.delete(requestId);
++                    controller.error(new Error('request body aborted'));
++                } else if (chunk) {
++                    controller.enqueue(new Uint8Array(chunk));
++                } else {
++                    controller.close();
++                    this.#streamControllers.delete(requestId);
++                }
++            } catch {
++                // The reader is gone (early return / cancel) but the native
++                // side may still push chunks for a streaming body. Drop the
++                // controller so later pushes are cheap no-ops instead of
++                // throwing inside the event loop.
+                 this.#streamControllers.delete(requestId);
+             }
+         };

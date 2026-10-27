@@ -1,0 +1,110 @@
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -800,6 +800,23 @@
+   return p
+ }
+ 
++/**
++ * 写请求的错误映射：请求路径在虚拟文件系统里没有匹配到任何存储（含 `/w/../x`
++ * 这类被 resolvePath 折叠到虚拟根、只剩 `/x` 的路径）属于客户端路径错误，
++ * 必须回 4xx，不能把 HTTP 状态码留在 Hono 默认的 200 上。
++ * 其余错误（驱动 / IO / 权限之外的运行期故障）保持 500。
++ *
++ * 选 404 的理由：路径规范化后确实不存在对应挂载点，与「Not Found」语义一致；
++ * 403 会让客户端误以为有权限问题并暴露路径校验分支。
++ */
++function writeFailure(c: any, e: any) {
++  const message = safeErrorMessage(e)
++  if (/storage not found/i.test(message)) {
++    return c.json({ code: 404, message, data: null }, 404)
++  }
++  return c.json({ code: 500, message, data: null })
++}
++
+ fsRouter.post("/mkdir", async (c) => {
+   const user = await getUserFromContext(c)
+   if (!canWrite(user)) return permissionDenied(c)
+@@ -817,7 +834,7 @@
+     await makeDirectory(reqPath, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -842,7 +859,7 @@
+     await renameItem(actualOldPath, cleanName, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -879,7 +896,7 @@
+     await removeItems(actualDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -921,7 +938,7 @@
+     await moveItems(actualSrcDir, actualDstDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -963,7 +980,7 @@
+     await copyItems(actualSrcDir, actualDstDir, cleanNames, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -991,7 +1008,7 @@
+     await putItem(reqPath, body.buffer, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+@@ -1030,7 +1047,7 @@
+     await putItem(reqPath, buffer, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+-    return c.json({ code: 500, message: safeErrorMessage(e), data: null })
++    return writeFailure(c, e)
+   }
+ })
+ 
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -527,7 +527,17 @@
+     }
+   } catch (e: any) {
+     const msg = safeErrorMessage(e)
+-    if (msg.includes("not found") || msg.includes("storage not found")) {
++    // A10：驱动层「对象/路径不存在」要回 404。Local 驱动 rename/cp 对不存在的
++    // 源抛 ENOENT（报文是 "ENOENT: no such file or directory, rename ..."，
++    // 不含 "not found" 字样），此前落到 500。这里只补 ENOENT/ENOTDIR 两种
++    // 明确的「不存在」错误；其它驱动/IO 故障仍是 500。
++    // 注意：C7-8/C7-9 的补偿失败分支在 case 内直接 return 500，不经过本 catch。
++    if (
++      msg.includes("not found") ||
++      msg.includes("storage not found") ||
++      msg.includes("ENOENT") ||
++      msg.includes("ENOTDIR")
++    ) {
+       return c.text("Not Found", 404)
+     }
+     return c.text(msg, 500)

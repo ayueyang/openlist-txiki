@@ -1,0 +1,572 @@
+diff --git a/src/backend/internal/op/share.ts b/src/backend/internal/op/share.ts
+index 9bde9ad..698fa92 100644
+--- a/src/backend/internal/op/share.ts
++++ b/src/backend/internal/op/share.ts
+@@ -1,4 +1,10 @@
+ import { getDb, saveDb } from "../model/db"
++import { canonicalizePath, type PathRejectReason } from "../../pkg/canonical-path"
++import {
++  getActualPath,
++  isWithinUserRoot,
++  type UserPermissionObj,
++} from "../../pkg/permission"
+ 
+ /**
+  * Share path resolution for /@s/{shareId}/... (frontend browsing)
+@@ -8,30 +14,101 @@ import { getDb, saveDb } from "../model/db"
+ export interface ShareResolveResult {
+   ok: boolean
+   error?: string
++  /** HTTP status hint for callers: 403 for path rejections; others keep their old code */
++  status?: number
+   share?: any
+   /** Mapped real storage path (single-file shares or sub-paths) */
+   realPath?: string
+   /** Multi-file share root — frontend should render a virtual list */
+   virtualList?: boolean
++  /** Canonicalized share roots (virtual list must use these, never raw db strings) */
++  files?: string[]
+ }
+ 
+-// FIX(C-3): the old implementation only did filter(Boolean), so ".." segments
+-// survived verbatim and `/@s/{id}/../../../` escalated a single-file share
+-// into browsing the entire storage root (verified at runtime).
+-// Backslashes are normalized first for the same reason as resolvePath (C-2).
+-const normalize = (p: string) => {
+-  const stack: string[] = []
+-  for (const seg of String(p || "")
+-    .replace(/\\/g, "/")
+-    .split("/")) {
+-    if (seg === "" || seg === ".") continue
+-    if (seg === "..") {
+-      stack.pop() // clamp at the share root instead of escaping upward
+-      continue
++export interface SharePathReject {
++  ok: false
++  status: 400 | 403
++  error: string
++}
++export interface SharePathOk {
++  ok: true
++  files: string[]
++}
++
++function rejectOf(reason: PathRejectReason): SharePathReject {
++  const forbidden = reason === "relative-path" || reason === "encoded-residue"
++  return {
++    ok: false,
++    status: forbidden ? 403 : 400,
++    error: forbidden ? "relative path" : "invalid path",
++  }
++}
++
++/**
++ * 分享 files 的唯一收口（P1-20）：不解码（body 已是解码后形态），只规范化 +
++ * 拼 base_path + 自检。返回的 files 是规范形全局虚拟路径，直接落库。
++ */
++export function canonicalizeShareFiles(
++  caller: UserPermissionObj | null | undefined,
++  input: unknown,
++): SharePathOk | SharePathReject {
++  if (!Array.isArray(input) || input.length === 0) {
++    return { ok: false, status: 400, error: "must add at least 1 object" }
++  }
++  const admin = !!caller && caller.role === 2
++  const out: string[] = []
++  for (const item of input) {
++    if (typeof item !== "string")
++      return { ok: false, status: 400, error: "invalid path" }
++    if (item === "")
++      return { ok: false, status: 400, error: "must add at least 1 object" }
++    const c = canonicalizePath(item)
++    if (!c.ok) return rejectOf(c.reason)
++    let actual = c.path
++    if (!admin) {
++      try {
++        actual = getActualPath(caller, c.path)
++      } catch {
++        return { ok: false, status: 403, error: "relative path" }
++      }
++      if (!isWithinUserRoot(caller, actual)) {
++        // 拼接后越界在当前实现里不可达（canonicalize 已拒 ..），保留为断言式自检
++        return {
++          ok: false,
++          status: 403,
++          error: `permission denied to share path [${actual}]`,
++        }
++      }
+     }
+-    stack.push(seg)
++    if (!out.includes(actual)) out.push(actual)
++  }
++  return { ok: true, files: out }
++}
++
++/** 规范形路径是否位于 root 内（含 root 本身；root 为 "/" 时直接放行）。 */
++function within(root: string, p: string): boolean {
++  return root === "/" || p === root || p.startsWith(root + "/")
++}
++
++/**
++ * 创建者根（P1-20 第二层，conductor 01:xx 裁定保留）：防「落库干净但根外」的
++ * 分享被匿名下载。用户表里的 role 优先于记录里的 creator_role，伪造该字段也
++ * 绕不过根检查。
++ */
++function creatorScope(
++  share: any,
++  db: any,
++): { kind: "any" } | { kind: "root"; root: string } | { kind: "deny" } {
++  const users = Array.isArray(db.users) ? db.users : []
++  const u = users.find((x: any) => x && x.username === share.creator)
++  const role = u ? Number(u.role) : Number(share.creator_role)
++  if (role === 2) return { kind: "any" } // 管理员（含以管理员名义代建），不限制
++  if (!u) return { kind: "any" } // 创建者已删除，不额外限制
++  try {
++    return { kind: "root", root: getActualPath(u, "/") }
++  } catch {
++    return { kind: "deny" } // base_path 坏配置，fail-closed
+   }
+-  return "/" + stack.join("/")
+ }
+ 
+ /**
+@@ -44,8 +121,10 @@ export async function resolveShare(
+   password: string,
+   envCtx?: any,
+ ): Promise<ShareResolveResult> {
+-  const clean = normalize(reqPath)
+-  const parts = clean.split("/").filter(Boolean)
++  // P1-20：访客路径与 share.files 走同一个 canonicalizePath，拒绝即 403
++  const req = canonicalizePath(reqPath)
++  if (!req.ok) return { ok: false, error: "relative path", status: 403 }
++  const parts = req.path.split("/").filter(Boolean)
+   if (parts.length < 1) {
+     return { ok: false, error: "Invalid share path" }
+   }
+@@ -83,45 +162,68 @@ export async function resolveShare(
+     return { ok: false, error: "share is empty" }
+   }
+ 
++  // P1-20：第一层（规范形，拒绝编码残留/..）+ 第二层（创建者当前根）。
++  // 已落库的越界记录在这里整条拒绝，不做数据迁移。
++  const scope = creatorScope(share, db)
++  if (scope.kind === "deny")
++    return { ok: false, error: "relative path", status: 403 }
++  const roots: string[] = []
++  for (const f of share.files) {
++    const c = canonicalizePath(String(f ?? ""))
++    if (!c.ok) {
++      const forbidden =
++        c.reason === "relative-path" || c.reason === "encoded-residue"
++      return {
++        ok: false,
++        error: forbidden ? "relative path" : "invalid path",
++        status: forbidden ? 403 : 400,
++      }
++    }
++    if (scope.kind === "root" && !within(scope.root, c.path)) {
++      return { ok: false, error: "relative path", status: 403 }
++    }
++    roots.push(c.path)
++  }
++
+   // Count this access
+   share.accessed = (share.accessed || 0) + 1
+   saveDb(db, envCtx).catch(() => {})
+ 
+   // Multi-file share root → virtual list
+   if (share.files.length > 1 && rest.length === 0) {
+-    return { ok: true, share, virtualList: true }
++    return { ok: true, share, files: roots, virtualList: true }
+   }
+ 
+-  // FIX(C-3): containment check. Whatever normalize() produces, the result
+-  // must stay inside one of the explicitly shared paths.
+-  const allowedRoots: string[] = (share.files || []).map((f: string) =>
+-    normalize(f),
+-  )
++  // P1-20：范围检查与解析同源 —— 两边都只比较规范形 roots
+   const withinShare = (p: string) =>
+-    allowedRoots.some((a) => p === a || p.startsWith(a === "/" ? "/" : a + "/"))
++    roots.some((a) => a === "/" || p === a || p.startsWith(a + "/"))
+ 
+   // Single-file share: one file has no sub-paths, so trailing segments are
+   // always suspicious — reject instead of concatenating them.
+   if (share.files.length === 1) {
+     if (rest.length > 0) return { ok: false, error: "path not found in share" }
+-    return { ok: true, share, realPath: normalize(share.files[0]) }
++    return { ok: true, share, files: roots, realPath: roots[0] }
+   }
+ 
+   // Multi-file share, sub-path: match by basename
+   const subName = rest[0]
+-  const match = share.files.find((f: string) => {
+-    const segs = String(f).split("/").filter(Boolean)
++  const match = roots.find((f) => {
++    const segs = f.split("/").filter(Boolean)
+     return segs[segs.length - 1] === subName
+   })
+   if (!match) return { ok: false, error: "path not found in share" }
+-  const real = normalize([normalize(match), ...rest.slice(1)].join("/"))
++  const joined = canonicalizePath([match, ...rest.slice(1)].join("/"))
++  if (!joined.ok) return { ok: false, error: "relative path", status: 403 }
++  const real = joined.path
+   if (!withinShare(real)) return { ok: false, error: "path not found in share" }
+-  return { ok: true, share, realPath: real }
++  return { ok: true, share, files: roots, realPath: real }
+ }
+ 
+ /** Extract the share id from a path like `/@s/abc/sub` or `/abc/sub` */
+ export function extractShareId(reqPath: string): string | null {
+-  const parts = normalize(reqPath).split("/").filter(Boolean)
++  const c = canonicalizePath(reqPath)
++  if (!c.ok) return null
++  const parts = c.path.split("/").filter(Boolean)
+   if (parts.length === 0) return null
+   if (parts[0] === "@s") return parts[1] || null
+   return parts[0]
+diff --git a/src/backend/internal/op/share_path.test.ts b/src/backend/internal/op/share_path.test.ts
+new file mode 100644
+index 0000000..bdeee11
+--- /dev/null
++++ b/src/backend/internal/op/share_path.test.ts
+@@ -0,0 +1,149 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++import { saveDb } from "../model/db"
++import { canonicalizeShareFiles, resolveShare } from "./share"
++
++const env: any = {}
++
++const SH_USER: any = { role: 0, permission: 16384, base_path: "/t/pub" }
++
++const seed = (shares: any[], users: any[] = []) =>
++  saveDb(
++    {
++      settings: [],
++      users,
++      storages: [],
++      shares,
++    },
++    env,
++  )
++
++const share = (over: any = {}) => ({
++  id: "abc",
++  files: ["/t/pub/inside.txt"],
++  creator: "audsh",
++  creator_role: 0,
++  pwd: "",
++  disabled: false,
++  expires: null,
++  max_accessed: 0,
++  accessed: 0,
++  ...over,
++})
++
++test("P1-20 create: 四种编码写法全部 403 relative path", () => {
++  for (const bad of [
++    "/%2e%2e/secret/secret.txt",
++    "/..../secret/secret.txt",
++    "/%252e%252e/secret/secret.txt",
++    "/..%2Fsecret/secret.txt",
++  ]) {
++    const r = canonicalizeShareFiles(SH_USER, [bad])
++    assert.equal(r.ok, false, bad)
++    if (!r.ok) {
++      assert.equal(r.status, 403, bad)
++      assert.equal(r.error, "relative path", bad)
++    }
++  }
++})
++
++test("P1-20 create: 合法项落库为规范全局路径，逐字节", () => {
++  const r = canonicalizeShareFiles(SH_USER, ["/inside.txt"])
++  assert.equal(r.ok, true)
++  if (r.ok) assert.deepEqual(r.files, ["/t/pub/inside.txt"])
++})
++
++test("P1-20 create: 规范化后重复项去重保留首次（单文件分享不退化成 virtualList）", () => {
++  const r = canonicalizeShareFiles(SH_USER, ["/inside.txt", "/inside.txt", "/./inside.txt"])
++  assert.equal(r.ok, true)
++  if (r.ok) assert.deepEqual(r.files, ["/t/pub/inside.txt"])
++})
++
++test("P1-20 create: 空项/空数组/非数组/非字符串 400", () => {
++  for (const bad of [[], [""], ["", "/x"], undefined, "x", [1], [null]]) {
++    const r = canonicalizeShareFiles(SH_USER, bad as any)
++    assert.equal(r.ok, false, String(bad))
++    if (!r.ok) assert.equal(r.status, 400, String(bad))
++  }
++})
++
++test("P1-20 create: 非管理员提交 /@s/... 403（不能分享另一条分享）", () => {
++  const r = canonicalizeShareFiles(SH_USER, ["/@s/abc"])
++  assert.equal(r.ok, false)
++  if (!r.ok) assert.equal(r.status, 403)
++})
++
++test("P1-20 create: 管理员允许根外绝对路径，仍过规范化", () => {
++  const admin: any = { role: 2, permission: 0, base_path: "/" }
++  const ok = canonicalizeShareFiles(admin, ["/t/secret/secret.txt"])
++  assert.equal(ok.ok, true)
++  if (ok.ok) assert.deepEqual(ok.files, ["/t/secret/secret.txt"])
++  const bad = canonicalizeShareFiles(admin, ["/%2e%2e/x"])
++  assert.equal(bad.ok, false)
++  if (!bad.ok) assert.equal(bad.status, 403)
++})
++
++test("P1-20 access: 旧记录含编码残留整条拒绝 403", async () => {
++  await seed([share({ files: ["/t/pub/%2e%2e/secret/secret.txt"] })])
++  const r = await resolveShare("/@s/abc", "", env)
++  assert.equal(r.ok, false)
++  assert.equal(r.status, 403)
++  assert.equal(r.error, "relative path")
++})
++
++test("P1-20 access: 规范串但在创建者当前根外 403（第二层）", async () => {
++  await seed(
++    [share({ files: ["/t/secret/secret.txt"] })],
++    [{ username: "audsh", role: 0, permission: 16384, base_path: "/t/pub" }],
++  )
++  const r = await resolveShare("/@s/abc", "", env)
++  assert.equal(r.ok, false)
++  assert.equal(r.status, 403)
++})
++
++test("P1-20 access: 用户表 role 优先于记录里的 creator_role（伪造 2 绕不过）", async () => {
++  await seed(
++    [share({ files: ["/t/secret/secret.txt"], creator_role: 2 })],
++    [{ username: "audsh", role: 0, permission: 16384, base_path: "/t/pub" }],
++  )
++  const r = await resolveShare("/@s/abc", "", env)
++  assert.equal(r.ok, false)
++  assert.equal(r.status, 403)
++})
++
++test("P1-20 access: 合法单文件分享 realPath 逐字节等于落库串", async () => {
++  await seed([share()])
++  const r = await resolveShare("/@s/abc", "", env)
++  assert.equal(r.ok, true)
++  assert.equal(r.realPath, "/t/pub/inside.txt")
++})
++
++test("P1-20 access: 多文件分享返回规范 roots，子路径按 basename 落到规范串", async () => {
++  await seed([share({ files: ["/t/pub/inside.txt", "/t/pub/sub/inside3.txt"] })])
++  const root = await resolveShare("/@s/abc", "", env)
++  assert.equal(root.ok, true)
++  assert.deepEqual(root.files, ["/t/pub/inside.txt", "/t/pub/sub/inside3.txt"])
++  assert.equal(root.virtualList, true)
++  const sub = await resolveShare("/@s/abc/inside3.txt", "", env)
++  assert.equal(sub.ok, true)
++  assert.equal(sub.realPath, "/t/pub/sub/inside3.txt")
++})
++
++test("P1-20 access: 目录分享 realPath 为规范根；访客 .. 一律 403", async () => {
++  await seed([share({ files: ["/t/pub"] })])
++  const r = await resolveShare("/@s/abc", "", env)
++  assert.equal(r.ok, true)
++  assert.equal(r.realPath, "/t/pub")
++  for (const bad of ["/@s/abc/../../..", "/@s/abc/%2e%2e", "/@s/abc/...."]) {
++    const rr = await resolveShare(bad, "", env)
++    assert.equal(rr.ok, false, bad)
++    assert.equal(rr.status, 403, bad)
++  }
++})
++
++test("P1-20 access: 密码错仍回 wrong password（顺序不变）", async () => {
++  await seed([share({ pwd: "p120pw" })])
++  const r = await resolveShare("/@s/abc", "wrong", env)
++  assert.equal(r.ok, false)
++  assert.equal(r.error, "wrong password")
++})
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index d0f6317..f96e719 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -224,16 +224,19 @@ import {
+ // 分享请求错误统一出口：
+ // - 密码错误 → 403，前端据此弹出提取码输入框（State.NeedPassword）
+ // - 其他（不存在/禁用/过期/超次数/为空）→ 400，前端显示友好提示
+-const shareErrorResponse = (c: any, error?: string) => {
++const shareErrorResponse = (c: any, error?: string, status?: number) => {
+   const isWrongPassword = error === "wrong password"
+   const msg = error || "share error"
++  // P1-20：路径拒绝（403 relative path）由 resolveShare 的 status 带出来；
++  // 其余错误保持旧码（密码错 403、不存在/禁用/过期 400）。
++  const code = status ?? (isWrongPassword ? 403 : 400)
+   return c.json(
+     {
+-      code: isWrongPassword ? 403 : 400,
++      code,
+       message: msg,
+       data: null,
+     },
+-    isWrongPassword ? 403 : 400,
++    code as any,
+   )
+ }
+ 
+@@ -260,11 +263,11 @@ fsRouter.post("/dirs", async (c) => {
+     if (reqPath.startsWith("/@s")) {
+       const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+       if (!shareRes.ok) {
+-        return shareErrorResponse(c, shareRes.error)
++        return shareErrorResponse(c, shareRes.error, shareRes.status)
+       }
+       if (shareRes.virtualList) {
+         const dirs = []
+-        for (const f of shareRes.share.files || []) {
++        for (const f of shareRes.files || []) {
+           try {
+             const { item } = await getItem(f, requestContext)
+             if (item.is_dir) {
+@@ -350,13 +353,13 @@ fsRouter.post("/list", async (c) => {
+     if (reqPath.startsWith("/@s")) {
+       const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+       if (!shareRes.ok) {
+-        return shareErrorResponse(c, shareRes.error)
++        return shareErrorResponse(c, shareRes.error, shareRes.status)
+       }
+ 
+       // Multi-file share root → virtual list of the shared items
+       if (shareRes.virtualList) {
+         const items = []
+-        for (const f of shareRes.share.files || []) {
++        for (const f of shareRes.files || []) {
+           const segs = String(f).split("/").filter(Boolean)
+           const name = segs[segs.length - 1] || f
+           try {
+@@ -620,7 +623,7 @@ fsRouter.post("/get", async (c) => {
+     if (reqPath.startsWith("/@s")) {
+       const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+       if (!shareRes.ok) {
+-        return shareErrorResponse(c, shareRes.error)
++        return shareErrorResponse(c, shareRes.error, shareRes.status)
+       }
+ 
+       // Multi-file share root: report as a virtual folder so the frontend lists it
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index a829a17..0775ac7 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -536,7 +536,10 @@ rawRouter.get("/*", async (c) => {
+       const sharePwd = c.req.query("pwd") || cookiePwd
+       const shareRes = await resolveShare(reqPath, sharePwd, c.env)
+       if (!shareRes.ok) {
+-        return c.text(shareRes.error || "Share not found", 404)
++        return c.text(
++          shareRes.error || "Share not found",
++          (shareRes.status || 404) as any,
++        )
+       }
+       if (shareRes.virtualList || !shareRes.realPath) {
+         return c.text("Cannot download share root", 400)
+diff --git a/src/backend/server/share.ts b/src/backend/server/share.ts
+index 71093e5..d42c282 100644
+--- a/src/backend/server/share.ts
++++ b/src/backend/server/share.ts
+@@ -1,19 +1,11 @@
+ import { Hono } from "hono"
+ import { getDb, saveDb } from "../internal/model/db"
+ import { adminAuthMiddleware, getUserFromContext } from "./middlewares"
+-import { can, PermissionBit, isAdmin, getActualPath } from "../pkg/permission"
++import { can, PermissionBit, isAdmin } from "../pkg/permission"
++import { canonicalizeShareFiles } from "../internal/op/share"
+ 
+ export const shareRouter = new Hono()
+ 
+-function sanitizePath(p: string): string {
+-  const normalized = (p || "").replace(/\\/g, "/").replace(/\/+/g, "/")
+-  const segments = normalized.split("/").filter((s) => s && s !== ".")
+-  if (segments.some((s) => s === "..")) {
+-    throw new Error("Path traversal segment '..' is not allowed")
+-  }
+-  return "/" + segments.join("/")
+-}
+-
+ // 分享管理接口需要管理员权限（list/get/update/delete）
+ shareRouter.use("/list", adminAuthMiddleware)
+ shareRouter.use("/get", adminAuthMiddleware)
+@@ -60,21 +52,16 @@ shareRouter.post("/create", async (c) => {
+   const body = await c.req.json().catch(() => ({}))
+   const db = await getDb(c.env)
+ 
+-  // 校验并清理分享路径
+-  let files: string[] = []
+-  if (Array.isArray(body.files)) {
+-    try {
+-      files = body.files.map((f: string) => {
+-        const clean = sanitizePath(String(f))
+-        return isAdmin(user) ? clean : getActualPath(user, clean)
+-      })
+-    } catch (err: any) {
+-      return c.json(
+-        { code: 400, message: err.message || "Invalid file path", data: null },
+-        400,
+-      )
+-    }
++  // P1-20：分享 files 的唯一收口（解码 0 次，规范化 + 拼 base_path + 自检）。
++  // 任何一项失败整单拒绝，且发生在落库之前。
++  const normalizedFiles = canonicalizeShareFiles(user, body.files)
++  if (!normalizedFiles.ok) {
++    return c.json(
++      { code: normalizedFiles.status, message: normalizedFiles.error, data: null },
++      normalizedFiles.status,
++    )
+   }
++  const files = normalizedFiles.files
+ 
+   // P1-12：空 files / 缺 files 与 Go sharing.go:520-521 对齐，回 400 且不落库
+   if (files.length === 0) {
+@@ -116,9 +103,14 @@ shareRouter.post("/create", async (c) => {
+     new_id: body.new_id || shareId,
+     // 对齐 Go CreateSharing：管理员恢复分享时可通过 creator/creator_role 字段
+     // 保留原创建者，否则默认当前登录用户。
+-    creator: body.creator || user.username || "user",
+-    creator_role:
+-      body.creator_role !== undefined ? body.creator_role : (user.role ?? 1),
++    creator: isAdmin(user)
++      ? body.creator || user.username || "user"
++      : user.username || "user",
++    creator_role: isAdmin(user)
++      ? body.creator_role !== undefined
++        ? body.creator_role
++        : (user.role ?? 1)
++      : (user.role ?? 1),
+     accessed: body.accessed ?? 0,
+     expires: body.expires || null,
+     pwd: body.pwd || "",
+@@ -150,6 +142,23 @@ shareRouter.post("/update", async (c) => {
+   const body = await c.req.json().catch(() => ({}))
+   const db = await getDb(c.env)
+ 
++  // P1-20：files 是全仓第三个未校验的分享路径写入口，先过同一套收口
++  // （管理员只规范化、不拼根，与创建侧同源）。
++  let updateFiles: string[] | undefined
++  if (body.files !== undefined) {
++    const normalizedUpdate = canonicalizeShareFiles(
++      await getUserFromContext(c),
++      body.files,
++    )
++    if (!normalizedUpdate.ok) {
++      return c.json(
++        { code: normalizedUpdate.status, message: normalizedUpdate.error, data: null },
++        normalizedUpdate.status,
++      )
++    }
++    updateFiles = normalizedUpdate.files
++  }
++
+   if (!body.id) {
+     return c.json({ code: 400, message: "share id is required", data: null })
+   }
+@@ -199,7 +208,7 @@ shareRouter.post("/update", async (c) => {
+       body.extract_folder !== undefined
+         ? body.extract_folder
+         : db.shares[idx].extract_folder,
+-    files: body.files !== undefined ? body.files : db.shares[idx].files,
++    files: updateFiles !== undefined ? updateFiles : db.shares[idx].files,
+     remark: body.remark !== undefined ? body.remark : db.shares[idx].remark,
+     readme: body.readme !== undefined ? body.readme : db.shares[idx].readme,
+     header: body.header !== undefined ? body.header : db.shares[idx].header,

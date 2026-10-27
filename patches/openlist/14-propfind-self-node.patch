@@ -1,0 +1,153 @@
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -37,7 +37,7 @@
+   copyItems,
+   renameItem,
+ } from "../internal/op/storage"
+-import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
++import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav/webdav"
+ import { safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
+ 
+@@ -347,18 +347,35 @@
+           return metaForbidden(c)
+         }
+         const depth = c.req.header("Depth") || "1"
+-        const res = await listItems(actualPath, ctx)
+-        const items = (res.content || []).map((it: any) => ({
+-          name: it.name,
+-          size: it.size || 0,
+-          isFolder: !!it.is_dir,
+-          modified: it.modified || new Date().toISOString(),
+-        }))
++        // 先按路径取元信息，判定「存在/类型」。此前无条件 listItems：文件与不存在
++        // 的路径都落进「列目录」分支，被当成集合返回 207 + <d:collection/>，rclone
++        // 的上传、回读、改名、复制、单文件删除全被这一层挡住（见 progress.md）。
++        // 不存在的路径由驱动 get() 抛错（Local 的 ENOENT、云端的 not found），经
++        // 外层 catch 的统一映射回 404；虚拟路径与存储根由 getItem 直接判为目录。
++        const { item } = await getItem(actualPath, ctx)
++        if (!item) return c.text("Not found", 404)
++        const isFolder = !!item.is_dir
++        // Depth 0 只回自身；Depth 1（以及本实现不递归的 infinity）回自身加一层
++        // 子项，与修复前的列目录行为一致。文件没有子项，任何 Depth 都只回自身。
++        let items: WebDavItem[] = []
++        if (isFolder && depth !== "0") {
++          const res = await listItems(actualPath, ctx)
++          items = (res.content || []).map((it: any) => ({
++            name: it.name,
++            size: it.size || 0,
++            isFolder: !!it.is_dir,
++            modified: it.modified || new Date().toISOString(),
++          }))
++        }
+         // davPathOf 已剥掉挂载前缀，那是给存储层寻址用的；href 必须反映真实请求
+         // 路径。少了挂载前缀，rclone / Windows 资源管理器会因「返回的 href 与请求
+         // 路径对不上」丢弃全部记录（能下载但列不出目录）。见 Issue #104。
+-        const xml = buildWebDavPropfindResponse(davRequestPath(c), items)
+-        return c.body(xml, depth === "0" ? 207 : 207, {
++        const xml = buildWebDavPropfindResponse(davRequestPath(c), items, {
++          isFolder,
++          size: item.size || 0,
++          modified: item.modified,
++        })
++        return c.body(xml, 207, {
+           "Content-Type": "application/xml; charset=utf-8",
+         })
+       }
+--- a/src/backend/pkg/xml.ts
++++ b/src/backend/pkg/xml.ts
+@@ -80,6 +80,22 @@
+ }
+ 
+ /**
++ * 被请求资源自身（PROPFIND 的第一个 <d:response>）的属性来源。
++ *
++ * 修 PROPFIND 缺陷前，自节点无条件按集合输出（见下）；现在由调用方按
++ * op/storage.getItem 判出的真实类型传入。省略整个参数时保持旧行为（当集合），
++ * 既有调用方与测试不受影响。
++ */
++export interface WebDavSelf {
++  /** 自节点是否为集合。undefined 视为集合（历史行为）。 */
++  isFolder?: boolean
++  /** 文件大小；仅非集合输出 <d:getcontentlength>。 */
++  size?: number
++  /** 自节点修改时间（ISO 字符串）；缺省或无法解析时用当前时间。 */
++  modified?: string
++}
++
++/**
+  * 生成 PROPFIND 的 207 Multi-Status 响应体。
+  *
+  * @param requestPath 被请求资源的**请求路径**（`URL.pathname`，已百分号编码）。
+@@ -97,19 +113,37 @@
+ export function generateWebDavXml(
+   requestPath: string,
+   items: WebDavItem[],
++  self?: WebDavSelf,
+ ): string {
+-  const selfHref = encodeXmlSensitiveChars(asCollectionHref(requestPath))
++  // 自节点不是集合时（文件）href 不能带尾斜杠，resourcetype 必须为空并给出
++  // getcontentlength —— 否则 rclone/Windows 资源管理器会把文件当成集合，上传/
++  // 回读/改名/复制/单文件删除全部被挡（见 progress.md 的 PROPFIND 缺陷条目）。
++  const selfIsFolder = self?.isFolder !== false
++  const selfHref = encodeXmlSensitiveChars(
++    selfIsFolder ? asCollectionHref(requestPath) : requestPath,
++  )
++  const selfModifiedMs = self?.modified ? new Date(self.modified).getTime() : NaN
++  const selfDateStr = isNaN(selfModifiedMs)
++    ? new Date().toUTCString()
++    : new Date(selfModifiedMs).toUTCString()
++  const selfSize = Number(self?.size) || 0
+ 
+   let xml = `<?xml version="1.0" encoding="utf-8" ?>\n`
+   xml += `<d:multistatus xmlns:d="DAV:">\n`
+ 
+-  // 被请求的资源本身：PROPFIND 在本实现中总是列目录，故按集合输出
++  // 被请求的资源本身：类型由调用方按存储层元信息传入
+   xml += `  <d:response>\n`
+   xml += `    <d:href>${selfHref}</d:href>\n`
+   xml += `    <d:propstat>\n`
+   xml += `      <d:prop>\n`
+-  xml += `        <d:resourcetype><d:collection/></d:resourcetype>\n`
+-  xml += `        <d:getlastmodified>${new Date().toUTCString()}</d:getlastmodified>\n`
++  if (selfIsFolder) {
++    xml += `        <d:resourcetype><d:collection/></d:resourcetype>\n`
++  } else {
++    xml += `        <d:resourcetype/>\n`
++    xml += `        <d:getcontentlength>${selfSize}</d:getcontentlength>\n`
++    xml += `        <d:getcontenttype>application/octet-stream</d:getcontenttype>\n`
++  }
++  xml += `        <d:getlastmodified>${selfDateStr}</d:getlastmodified>\n`
+   xml += `      </d:prop>\n`
+   xml += `      <d:status>HTTP/1.1 200 OK</d:status>\n`
+   xml += `    </d:propstat>\n`
+--- a/src/backend/internal/webdav/webdav.ts
++++ b/src/backend/internal/webdav/webdav.ts
+@@ -1,6 +1,10 @@
+-import { generateWebDavXml, type WebDavItem } from "../../pkg/xml"
++import {
++  generateWebDavXml,
++  type WebDavItem,
++  type WebDavSelf,
++} from "../../pkg/xml"
+ 
+-export type { WebDavItem }
++export type { WebDavItem, WebDavSelf }
+ 
+ /**
+  * 构造 PROPFIND 的 207 Multi-Status 响应体。
+@@ -10,10 +14,12 @@
+  *   完整 URI 两种形态，本实现用相对引用），因此这里传请求路径而不是挂载前缀 ——
+  *   挂在子路径下（如 /list/dav）时也自动正确。
+  * @param items 直接子项
++ * @param self 自节点的真实类型/大小/时间（由调用方按 getItem 判定；省略时当集合）
+  */
+ export function buildWebDavPropfindResponse(
+   requestPath: string,
+   items: WebDavItem[],
++  self?: WebDavSelf,
+ ): string {
+-  return generateWebDavXml(requestPath, items)
++  return generateWebDavXml(requestPath, items, self)
+ }
+\ No newline at end of file

@@ -1,0 +1,549 @@
+diff --git a/src/backend/internal/model/store/driver/d1.ts b/src/backend/internal/model/store/driver/d1.ts
+index 98420f3..d2b8ab7 100644
+--- a/src/backend/internal/model/store/driver/d1.ts
++++ b/src/backend/internal/model/store/driver/d1.ts
+@@ -10,6 +10,9 @@ import {
+   buildDdl,
+   buildSingleFlightDdl,
+   KV_SCHEMA_SQLITE,
++  getTablePrefix,
++  tableSqlName,
++  SQL_INIT_MARK,
+ } from "../schema"
+ 
+ /**
+@@ -48,9 +51,66 @@ function getD1(env?: any): any | null {
+ 
+ const d1Inited = new WeakMap<object, boolean>()
+ 
++/** 标识符加反引号；表名只来自 schema.ts 的常量，不含用户输入。 */
++function quote(name: string): string {
++  return "`" + name + "`"
++}
++
++/**
++ * 旧 TS 库的表名迁移。只做 sqlite；MySQL 驱动的 RENAME TABLE 由 mysql.ts 另行处理。
++ *
++ * 必须在建表之前跑：否则新代码先建出空的 x_meta，旧库的 x_metas 就再也没机会改名。
++ */
++async function migrateLegacyTables(db: any, env?: any): Promise<void> {
++  const prefix = getTablePrefix(env)
++  const pairs = [{ from: prefix + "metas", to: tableSqlName("metas", env) }]
++  for (const p of pairs) {
++    if (p.from === p.to) continue
++    const hasOld = await db
++      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
++      .bind(p.from)
++      .first()
++    if (!hasOld) continue
++    const hasNew = await db
++      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
++      .bind(p.to)
++      .first()
++    if (hasNew) continue // 两张都在，交给人工，不自动合并
++    await db.prepare(`ALTER TABLE ${quote(p.from)} RENAME TO ${quote(p.to)}`).run()
++  }
++}
++
++/**
++ * Go 库兼容标记：schema_info 是 TS 私有表，Go 库没有。
++ *
++ * 不写标记，sqlFormat.load() 会把有数据的 Go 库当成“未初始化”。
++ * 只加表/加一行，Go 侧不读这张表。写之前必须确认 x_users 存在且有 role=2 的行，
++ * 防止把半拷贝/空库误标为已初始化。幂等。
++ */
++async function markGoCompatible(db: any, env?: any): Promise<void> {
++  const users = getTablePrefix(env) + "users"
++  const exists = await db
++    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
++    .bind(users)
++    .first()
++  if (!exists) return
++  const admin = await db
++    .prepare(`SELECT id FROM ${quote(users)} WHERE role = 2 LIMIT 1`)
++    .first()
++  if (!admin) return
++  await db
++    .prepare("INSERT OR IGNORE INTO schema_info (k, v) VALUES (?, ?)")
++    .bind(SQL_INIT_MARK, `go-compat:1:${Date.now()}`)
++    .run()
++}
++
+ async function ensureSchema(db: any, env?: any): Promise<void> {
+   if (d1Inited.get(db)) return
+-  // KV 表（map/key 格式）+ 列式表（sql 格式）+ singleflight 协调表一并创建
++
++  // 1) 旧 TS/D1 库的元数据表叫 x_metas；先改名，避免被下面新建的空 x_meta 顶掉。
++  await migrateLegacyTables(db, env)
++
++  // 2) KV 表（map/key 格式）+ 列式表（sql 格式）+ singleflight 协调表一并创建
+   for (const ddl of [
+     ...KV_SCHEMA_SQLITE,
+     ...buildDdl("sqlite", env),
+@@ -58,6 +118,10 @@ async function ensureSchema(db: any, env?: any): Promise<void> {
+   ]) {
+     await db.prepare(ddl).run()
+   }
++
++  // 3) Go 库没有 schema_info 标记，补一个；只有确认过 x_users 里有 admin 才写。
++  await markGoCompatible(db, env)
++
+   d1Inited.set(db, true)
+ }
+ 
+diff --git a/src/backend/internal/model/store/format/sql.ts b/src/backend/internal/model/store/format/sql.ts
+index 6498bfc..7c3a127 100644
+--- a/src/backend/internal/model/store/format/sql.ts
++++ b/src/backend/internal/model/store/format/sql.ts
+@@ -14,19 +14,60 @@ import {
+   tableSqlName,
+   rowToEntity,
+   entityToRow,
++  SQL_INIT_MARK,
+ } from "../schema"
+ 
+-const INIT_MARK = "openlist_config"
+-
+ function quote(name: string): string {
+   return "`" + name + "`"
+ }
+ 
++/**
++ * 目标表真实存在的列（每驱动每表一次，进程内缓存）。
++ *
++ * 用于屏蔽“schema 里有、目标库没有”的列：Go 库没有 pwd_update_at/seed_policy；
++ * 旧 TS 库没有 pwd_hash/pwd_ts。返回 null 表示探测失败，按全列处理（保持旧行为）。
++ */
++const columnCache = new WeakMap<object, Map<string, Set<string> | null>>()
++
++async function tableColumns(
++  driver: Driver,
++  sqlName: string,
++  env?: any,
++): Promise<Set<string> | null> {
++  if (!driver.query) return null
++  let per = columnCache.get(driver as any)
++  if (!per) {
++    per = new Map()
++    columnCache.set(driver as any, per)
++  }
++  if (per.has(sqlName)) return per.get(sqlName)!
++
++  let out: Set<string> | null = null
++  try {
++    const rows =
++      driver.name === "mysql"
++        ? await driver.query(`SHOW COLUMNS FROM ${quote(sqlName)}`, [], env)
++        : await driver.query(`PRAGMA table_info(${quote(sqlName)})`, [], env)
++    const names = (rows || [])
++      .map((r: any) => String(r?.name ?? r?.Field ?? ""))
++      .filter(Boolean)
++    out = names.length > 0 ? new Set(names) : null
++  } catch (err) {
++    console.warn(
++      `[sql] column introspection failed for ${sqlName}; using full column list`,
++      err,
++    )
++  }
++  per.set(sqlName, out)
++  return out
++}
++
+ /**
+  * 生成 UPSERT 语句。
+  *
+  * SQLite（D1 / DO）与 MySQL 语法不同，必须按方言分支：
+- *   - SQLite: INSERT OR REPLACE INTO ...
++ *   - SQLite: INSERT INTO ... ON CONFLICT DO UPDATE（不能用 INSERT OR REPLACE，
++ *     它会删行重插，把目标库未列出的列清成 NULL）
+  *   - MySQL:  INSERT INTO ... ON DUPLICATE KEY UPDATE ...
+  *
+  * 驱动名即方言标识：d1 / do 为 SQLite，mysql 为 MySQL。
+@@ -36,27 +77,29 @@ function upsertSql(
+   columns: string[],
+   params: any[],
+   driver: Driver,
++  updatable?: string[],
+ ): { sql: string; params: any[] } {
+   const cols = columns.map((c) => quote(c)).join(", ")
+   const placeholders = columns.map(() => "?").join(", ")
++  const updates = (updatable ?? columns.filter((c) => c !== columns[0])).filter(
++    (c) => columns.includes(c),
++  )
+ 
+   if (driver.name === "mysql") {
+-    // MySQL 无 INSERT OR REPLACE；用 ON DUPLICATE KEY UPDATE 覆盖全部非主键列。
+-    // 主键列不参与 UPDATE（写回自身无意义），其余列以 VALUES(col) 覆盖。
+-    const updates = columns
+-      .slice(1)
+-      .map((c) => `${quote(c)} = VALUES(${quote(c)})`)
+-      .join(", ")
+-    const sql = updates
+-      ? `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${updates}`
++    // MySQL 无 INSERT OR REPLACE；用 ON DUPLICATE KEY UPDATE 覆盖可更新列。
++    const sets = updates.map((c) => `${quote(c)} = VALUES(${quote(c)})`).join(", ")
++    const sql = sets
++      ? `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${sets}`
+       : `INSERT INTO ${table} (${cols}) VALUES (${placeholders})`
+     return { sql, params }
+   }
+ 
+-  return {
+-    sql: `INSERT OR REPLACE INTO ${table} (${cols}) VALUES (${placeholders})`,
+-    params,
+-  }
++  // SQLite/D1：只更新冲突时点名的列，未列出列（Go 的 pwd_hash/pwd_ts）保持不变。
++  const sets = updates.map((c) => `${quote(c)} = excluded.${quote(c)}`).join(", ")
++  const sql = sets
++    ? `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT DO UPDATE SET ${sets}`
++    : `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`
++  return { sql, params }
+ }
+ 
+ /** 带前缀+复数的完整表名（含反引号）。 */
+@@ -80,7 +123,7 @@ export const sqlFormat: FormatAdapter = {
+     // 检查是否已初始化（schema_info 为 TS 内部标记表，不加前缀）
+     const marks = await driver.query(
+       "SELECT v FROM schema_info WHERE k = ?",
+-      [INIT_MARK],
++      [SQL_INIT_MARK],
+       env,
+     )
+     if (!marks || marks.length === 0) return null
+@@ -115,10 +158,15 @@ export const sqlFormat: FormatAdapter = {
+       const keyCol = TABLE_KEY[table]
+       const entities: any[] = data?.[table] || []
+       const keepKeys: string[] = []
++      const present = await tableColumns(driver, tableSqlName(table, env), env)
+ 
+       for (const entity of entities) {
+-        const { columns, values } = entityToRow(table, entity)
+-        const upsert = upsertSql(qn(table, env), columns, values, driver)
++        const { columns, values, updatable } = entityToRow(
++          table,
++          entity,
++          present ?? undefined,
++        )
++        const upsert = upsertSql(qn(table, env), columns, values, driver, updatable)
+         statements.push({ sql: upsert.sql, params: upsert.params })
+ 
+         const pk = entity?.[keyCol]
+@@ -140,7 +188,7 @@ export const sqlFormat: FormatAdapter = {
+       upsertSql(
+         quote("schema_info"),
+         ["k", "v"],
+-        [INIT_MARK, String(Date.now())],
++        [SQL_INIT_MARK, String(Date.now())],
+         driver,
+       ),
+     )
+@@ -169,12 +217,15 @@ export const sqlFormat: FormatAdapter = {
+     }
+     const t = table as TableName
+ 
++    // 已知限制：先 DELETE 全表再插入，对共享 Go 库会删掉 Go 独有列的值。
++    // P1 没有调用点；P2 要用必须先改成 UPSERT + 删差集。
+     const statements: Array<{ sql: string; params: any[] }> = [
+       { sql: `DELETE FROM ${qn(t, env)}`, params: [] },
+     ]
+ 
++    const present = await tableColumns(driver, tableSqlName(t, env), env)
+     for (const entity of records) {
+-      const { columns, values } = entityToRow(t, entity)
++      const { columns, values } = entityToRow(t, entity, present ?? undefined)
+       const placeholders = columns.map(() => "?").join(", ")
+       const sql = `INSERT INTO ${qn(t, env)} (${columns
+         .map((c) => quote(c))
+@@ -217,9 +268,10 @@ export const sqlFormat: FormatAdapter = {
+     const t = table as TableName
+     void key
+ 
+-    const { columns, values } = entityToRow(t, record)
+-    // 方言兼容的 UPSERT（SQLite: INSERT OR REPLACE / MySQL: ON DUPLICATE KEY UPDATE）
+-    const { sql } = upsertSql(qn(t, env), columns, values, driver)
++    const present = await tableColumns(driver, tableSqlName(t, env), env)
++    const { columns, values, updatable } = entityToRow(t, record, present ?? undefined)
++    // 方言兼容的 UPSERT（SQLite: ON CONFLICT DO UPDATE / MySQL: ON DUPLICATE KEY UPDATE）
++    const { sql } = upsertSql(qn(t, env), columns, values, driver, updatable)
+ 
+     await driver.execute(sql, values, env)
+   },
+diff --git a/src/backend/internal/model/store/schema.ts b/src/backend/internal/model/store/schema.ts
+index d707b59..1ef9c27 100644
+--- a/src/backend/internal/model/store/schema.ts
++++ b/src/backend/internal/model/store/schema.ts
+@@ -154,6 +154,9 @@ export const TABLES: Record<DdlTableName, TableDef> = {
+     columns: [
+       { name: "id", type: "number", pk: true },
+       { name: "username", type: "string", unique: true },
++      // Go 的真实口令存储（internal/model/user.go: PwdHash/PwdTS）
++      { name: "pwd_hash", type: "string", nullable: true },
++      { name: "pwd_ts", type: "number", nullable: true }, // int64 Unix 秒，不是 ISO
+       { name: "password", type: "string", nullable: true },
+       { name: "base_path", type: "string", nullable: true },
+       { name: "role", type: "number", nullable: true },
+@@ -273,7 +276,7 @@ export const TABLE_SQL_NAMES: Record<DdlTableName, string> = {
+   storages: "storages",
+   users: "users",
+   shares: "sharing_dbs",
+-  metas: "metas",
++  metas: "meta", // Go: x_meta（不是 x_metas）
+   plugins: "plugins",
+   sshkeys: "ssh_public_keys",
+ }
+@@ -292,6 +295,9 @@ export function tableSqlName(table: DdlTableName, env?: any): string {
+   return getTablePrefix(env) + TABLE_SQL_NAMES[table]
+ }
+ 
++/** schema_info 里标记“列式配置已完成初始化”的键。Go 库没有这张表，由驱动补写。 */
++export const SQL_INIT_MARK = "openlist_config"
++
+ /**
+  * 对象字段值 → SQL 列值。
+  */
+@@ -380,25 +386,57 @@ export function rowToEntity(table: DdlTableName, row: any): any {
+       out[key] = value
+     }
+   }
++  // users：Go 行的 password 是空串，真实口令在 pwd_hash。显式取，别依赖列序。
++  if (table === "users" && out.pwd_hash) {
++    out.password = out.pwd_hash
++  }
+   return out
+ }
+ 
+ /**
+  * 将对象转换为 INSERT 的列与参数。
++ *
++ * `presentColumns` 为目标表真实存在的列：schema 里有、目标库没有的列
++ * （Go 库没有 pwd_update_at/seed_policy，旧 TS 库没有 pwd_hash/pwd_ts）必须跳过。
++ * 返回值 `updatable` 是 UPSERT 冲突时允许覆盖的列，只含 entity 里真的带值的列。
+  */
+-export function entityToRow(table: DdlTableName, entity: any): {
+-  columns: string[]
+-  values: any[]
+-} {
++export function entityToRow(
++  table: DdlTableName,
++  entity: any,
++  presentColumns?: Set<string>,
++): { columns: string[]; values: any[]; updatable: string[] } {
+   const def = TABLES[table]
+   const columns: string[] = []
+   const values: any[] = []
++  const updatable: string[] = []
++  const isUsers = table === "users"
++  const hasPwdHash = isUsers && (!presentColumns || presentColumns.has("pwd_hash"))
++  const hasPwdValue =
++    entity?.pwd_hash !== undefined || entity?.password !== undefined
+   for (const col of def.columns) {
++    if (presentColumns && !presentColumns.has(col.name)) continue
+     const key = col.key ?? col.name
+     columns.push(col.name)
+-    values.push(serializeColumn(col, entity?.[key]))
++    if (isUsers && col.name === "pwd_hash") {
++      // password 是内存里的规范字段；落 Go 列时写进 pwd_hash
++      values.push(serializeColumn(col, entity?.pwd_hash ?? entity?.password))
++    } else if (isUsers && col.name === "password" && hasPwdHash) {
++      // 有 pwd_hash 列时 password 保持空串，跟 Go 的行形态一致
++      values.push("")
++    } else {
++      values.push(serializeColumn(col, entity?.[key]))
++    }
++    // 只更新 entity 里真的带了这个键的列，避免把 Go 独有列写成 NULL/空串。
++    // users.pwd_hash 例外：password 有值也算它带了值（旧调用方只设 password）。
++    const hasKey =
++      isUsers && col.name === "pwd_hash"
++        ? hasPwdValue
++        : entity && Object.prototype.hasOwnProperty.call(entity, key)
++    if (!col.pk && !(isUsers && col.name === "password" && hasPwdHash) && hasKey) {
++      updatable.push(col.name)
++    }
+   }
+-  return { columns, values }
++  return { columns, values, updatable }
+ }
+ 
+ /** SQL 列类型 → 方言类型。 */
+diff --git a/src/backend/internal/model/store/store.test.ts b/src/backend/internal/model/store/store.test.ts
+index 9ee8cb9..958bb24 100644
+--- a/src/backend/internal/model/store/store.test.ts
++++ b/src/backend/internal/model/store/store.test.ts
+@@ -44,7 +44,7 @@ function createMockKvDriver(): Driver {
+ }
+ 
+ /** 基于局部 Map 的简易 SQL 驱动（隔离测试，支持 sqlFormat 用到的 SQL）。 */
+-function createMockSqlDriver(name = "mock-sql"): Driver {
++function createMockSqlDriver(name = "mock-sql", columns?: Record<string, string[]>): Driver {
+   // table -> rows (对象数组)
+   const tables = new Map<string, any[]>()
+   // schema_info: k -> v
+@@ -73,6 +73,17 @@ function createMockSqlDriver(name = "mock-sql"): Driver {
+       // SELECT * FROM `table`
+       const m = trimmed.match(/^SELECT \* FROM `?(\w+)`?/i)
+       if (m) return ensureTable(m[1]).map((r) => ({ ...r }))
++      // PRAGMA table_info(`table`) / SHOW COLUMNS FROM `table`：列内省
++      const colm = trimmed.match(
++        /^(?:PRAGMA table_info\(`?(\w+)`?\)|SHOW COLUMNS FROM `?(\w+)`?)$/i,
++      )
++      if (colm) {
++        const table = colm[1] || colm[2]
++        const names =
++          columns?.[table] ??
++          [...new Set((tables.get(table) || []).flatMap((r: any) => Object.keys(r)))]
++        return names.map((n) => ({ name: n, Field: n }))
++      }
+       throw new Error(`mock-sql unsupported query: ${sql}`)
+     },
+     async execute(_sql: string, _params: any[]): Promise<void> {
+@@ -104,17 +115,53 @@ function createMockSqlDriver(name = "mock-sql"): Driver {
+           continue
+         }
+         // schema_info 的 UPSERT 必须先于通用 INSERT 匹配，否则会被当作数据行。
+-        // SQLite 方言：INSERT OR REPLACE INTO `schema_info` (`k`, `v`) VALUES (?, ?)
+-        if (/^INSERT OR REPLACE INTO `?schema_info`?/i.test(trimmed)) {
++        // 覆盖 SQLite(ON CONFLICT) / MySQL(ON DUPLICATE) / 旧的 INSERT OR REPLACE。
++        if (/^INSERT (?:OR REPLACE )?INTO `?schema_info`?/i.test(trimmed)) {
+           schemaInfo.set(String(params[0]), String(params[1]))
+           continue
+         }
+-        // MySQL 方言：INSERT INTO `schema_info` (...) VALUES (...) ON DUPLICATE KEY UPDATE ...
+-        if (
+-          /^INSERT INTO `?schema_info`?/i.test(trimmed) &&
+-          /ON DUPLICATE KEY UPDATE/i.test(trimmed)
+-        ) {
+-          schemaInfo.set(String(params[0]), String(params[1]))
++        // 数据行 UPSERT（SQLite）：INSERT INTO ... ON CONFLICT DO UPDATE SET ...
++        // 只更新 SET 里点名的列，模拟 SQLite 语义（未列出列保持不变）。
++        const upConflict = trimmed.match(
++          /^INSERT INTO `?(\w+)`? \(([^)]+)\) VALUES \(([^)]+)\) ON CONFLICT DO UPDATE SET (.+)$/i,
++        )
++        if (upConflict) {
++          const table = upConflict[1]
++          const cols = upConflict[2].split(",").map((c) => c.trim().replace(/`/g, ""))
++          const row: any = {}
++          cols.forEach((c, i) => {
++            row[c] = params[i]
++          })
++          const rows = ensureTable(table)
++          const pkCol = cols[0]
++          const idx = rows.findIndex(
++            (r: any) => String(r[pkCol]) === String(row[pkCol]),
++          )
++          if (idx >= 0) {
++            const sets = [...upConflict[4].matchAll(/(?:`?(\w+)`?)\s*=\s*excluded\./gi)]
++              .map((m) => m[1])
++            for (const c of sets) rows[idx][c] = row[c]
++          } else {
++            rows.push(row)
++          }
++          continue
++        }
++        // 数据行 UPSERT（SQLite）：INSERT INTO ... ON CONFLICT DO NOTHING
++        const upNothing = trimmed.match(
++          /^INSERT INTO `?(\w+)`? \(([^)]+)\) VALUES \(([^)]+)\) ON CONFLICT DO NOTHING$/i,
++        )
++        if (upNothing) {
++          const table = upNothing[1]
++          const cols = upNothing[2].split(",").map((c) => c.trim().replace(/`/g, ""))
++          const row: any = {}
++          cols.forEach((c, i) => {
++            row[c] = params[i]
++          })
++          const rows = ensureTable(table)
++          const pkCol = cols[0]
++          if (!rows.some((r: any) => String(r[pkCol]) === String(row[pkCol]))) {
++            rows.push(row)
++          }
+           continue
+         }
+         // 数据行 UPSERT（SQLite）：INSERT OR REPLACE INTO `table` (...) VALUES (...)
+@@ -191,7 +238,7 @@ test("schema: SQL table names align with Go GORM naming", () => {
+   assert.equal(TABLE_SQL_NAMES.shares, "sharing_dbs")
+   assert.equal(TABLE_SQL_NAMES.storages, "storages")
+   assert.equal(TABLE_SQL_NAMES.users, "users")
+-  assert.equal(TABLE_SQL_NAMES.metas, "metas")
++  assert.equal(TABLE_SQL_NAMES.metas, "meta")
+ 
+   // 表前缀固定 x_（对齐 Go 的默认值）
+   assert.equal(getTablePrefix({}), "x_")
+@@ -294,6 +341,28 @@ test("sql format: roundtrip via mock SQL driver (columnar)", async () => {
+   assert.deepEqual(await sqlFormat.load(driver), SAMPLE_DB)
+ })
+ 
++test("sql format: UPSERT 不清空目标库的 Go 独有列（pwd_hash/pwd_ts）", async () => {
++  // Go 库的 x_users 有 pwd_hash/pwd_ts，没有 pwd_update_at。
++  const cols = [
++    "id", "username", "pwd_hash", "pwd_ts", "salt", "password",
++    "base_path", "role", "disabled", "permission", "otp_secret",
++    "sso_id", "authn", "allow_ldap",
++  ]
++  const driver: any = createMockSqlDriver("mock-sql", { x_users: cols })
++  const hash = "a".repeat(64)
++  await driver.batch([
++    {
++      sql: "INSERT INTO `x_users` (`id`, `username`, `pwd_hash`, `pwd_ts`, `salt`, `role`) VALUES (?, ?, ?, ?, ?, ?)",
++      params: [1, "admin", hash, 1700000000, "salt1234", 2],
++    },
++  ])
++  // 只带 username/role 的实体：不得把 pwd_hash/pwd_ts 写成 NULL。
++  await sqlFormat.save({ users: [{ id: 1, username: "admin", role: 2 }] }, driver)
++  const row = await sqlFormat.getRecord("users", "1", driver)
++  assert.equal((row as any).pwd_hash, hash)
++  assert.equal((row as any).pwd_ts, 1700000000)
++})
++
+ test("sql format: MySQL dialect uses ON DUPLICATE KEY UPDATE (no INSERT OR REPLACE)", async () => {
+   // 回归防护：MySQL 不支持 INSERT OR REPLACE，若方言分支失效，
+   // mock 驱动会在收到该语句时抛错，从而让本测试失败。
+diff --git a/src/backend/pkg/password.ts b/src/backend/pkg/password.ts
+index 079144d..9ecffea 100644
+--- a/src/backend/pkg/password.ts
++++ b/src/backend/pkg/password.ts
+@@ -70,8 +70,11 @@ export async function setUserPassword(
+   plain: string,
+ ): Promise<void> {
+   user.salt = generateSalt()
+-  user.password = await twoStepHash(plain, user.salt)
+-  user.pwd_update_at = new Date().toISOString()
++  const hash = await twoStepHash(plain, user.salt)
++  user.password = hash
++  user.pwd_hash = hash              // Go 的存储列
++  user.pwd_ts = Math.floor(Date.now() / 1000) // Go int64 Unix 秒
++  user.pwd_update_at = new Date().toISOString() // 旧 TS 库的回退指纹
+ }
+ 
+ /**
+@@ -84,13 +87,16 @@ export async function setUserPassword(
+  *
+  * 取值为空字符串（旧数据/未设置）时两侧一致，视为相等，不影响历史账号。
+  */
+-export function passwordStampOf(user: any): string {
++export function passwordStampOf(user: any): string | number {
++  const ts = user?.pwd_ts
++  // Go 用 int64 秒做 claims.PwdTS，json 里必须是数字；字符串会让 Go 解析失败
++  if (typeof ts === "number" && Number.isFinite(ts)) return ts
+   return String(user?.pwd_update_at ?? "")
+ }
+ 
+ /** 校验令牌内的密码指纹是否与数据库当前值一致 */
+ export function isPasswordStampValid(payload: any, user: any): boolean {
+-  return String(payload?.pwd_ts ?? "") === passwordStampOf(user)
++  return String(payload?.pwd_ts ?? "") === String(passwordStampOf(user))
+ }
+ 
+ // ---- 工具函数（与存储无关） ----
+diff --git a/src/backend/server/auth.ts b/src/backend/server/auth.ts
+index d275380..17990c2 100644
+--- a/src/backend/server/auth.ts
++++ b/src/backend/server/auth.ts
+@@ -269,7 +269,8 @@ export async function verifyUserStaticHash(
+   user: any,
+   inputStatic: string,
+ ): Promise<boolean> {
+-  const stored = String(user?.password || "")
++  // Go 行 password=''、pwd_hash 有值；旧 TS 行只有 password。显式取，不靠列序。
++  const stored = String(user?.pwd_hash || user?.password || "")
+     .trim()
+     .toLowerCase()
+   const input = String(inputStatic || "")

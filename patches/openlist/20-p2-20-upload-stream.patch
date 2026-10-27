@@ -1,0 +1,530 @@
+diff --git a/src/backend/drivers/local.ts b/src/backend/drivers/local.ts
+--- a/src/backend/drivers/local.ts
++++ b/src/backend/drivers/local.ts
+@@ -166,6 +166,121 @@
+     await fs.writeFile(physicalPath, content)
+   }
+ 
++  // ---- P1-17 A 层：流式上传 ----
++  //
++  // 目标文件所在目录里建 .openlist-upload-<id> 临时目录，写 session.json 标记
++  // （与分片上传同一前缀、同一标记名，upload-sweep 的 readMarker 逐字段兼容：
++  // 重启扫描与 24h TTL 会把孤儿目录收掉，不新增回收器）。数据写临时目录里的
++  // part，commit 时 close + rename 到目标（同一文件系统，原子替换），abort 时
++  // close + 删目录，全部幂等，可重复调用。峰值 = 写句柄 + 单块，与文件大小无关。
++  async beginStream(physicalPath: string): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
++    await initNodeModules()
++    if (!fs || !path)
++      throw new Error("LocalDriver is not supported in Edge Runtime")
++    const tjs: any = (globalThis as any).tjs
++    if (!tjs || typeof tjs.open !== "function")
++      throw new Error("LocalDriver: tjs.open is unavailable")
++    const dir = path.dirname(physicalPath)
++    let parentExisted = true
++    try {
++      await fs.stat(dir)
++    } catch {
++      parentExisted = false
++    }
++    await fs.mkdir(dir, { recursive: true })
++    const id =
++      Math.random().toString(36).slice(2) + Date.now().toString(36)
++    const tmpDir = path.join(dir, UPLOAD_TMP_PREFIX + id)
++    await fs.mkdir(tmpDir, { recursive: true })
++    try {
++      await fs.writeFile(
++        path.join(tmpDir, UPLOAD_SESSION_MARKER),
++        JSON.stringify({
++          v: 1,
++          createdAt: Date.now(),
++          size: 0,
++          target: physicalPath,
++        }),
++      )
++    } catch (e) {
++      try {
++        await fs.rm(tmpDir, { recursive: true, force: true })
++      } catch {}
++      throw e
++    }
++    const partPath = path.join(tmpDir, "part")
++    let fh: any
++    try {
++      fh = await tjs.open(partPath, "w")
++    } catch (e) {
++      try {
++        await fs.rm(tmpDir, { recursive: true, force: true })
++      } catch {}
++      throw e
++    }
++    let closed = false
++    const closeQuiet = async () => {
++      if (closed) return
++      closed = true
++      try {
++        await fh.close()
++      } catch {}
++    }
++    // 落盘攒批：lws 每块只有 ~16 KiB，逐块 write 的 syscall 次数会把消费速度
++    // 压到比生产慢。这里攒到 256 KiB 写一次（内存 +256 KiB，与 payload 无关），
++    // 拒绝路径的 JS 队列堆积随之收敛；块顺序与字节数不变。
++    const FLUSH_BYTES = 262144
++    let pending: Uint8Array | null = null
++    let pendingLen = 0
++    const flush = async () => {
++      if (!pending || pendingLen === 0) return
++      const out =
++        pendingLen === pending.byteLength ? pending : pending.subarray(0, pendingLen)
++      await fh.write(out)
++      pendingLen = 0
++    }
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (!pending) pending = new Uint8Array(FLUSH_BYTES)
++        let off = 0
++        while (off < chunk.byteLength) {
++          if (pendingLen === FLUSH_BYTES) await flush()
++          const n = Math.min(chunk.byteLength - off, FLUSH_BYTES - pendingLen)
++          pending.set(chunk.subarray(off, off + n), pendingLen)
++          pendingLen += n
++          off += n
++        }
++      },
++      commit: async () => {
++        await flush()
++        await closeQuiet()
++        await fs.rename(partPath, physicalPath)
++        try {
++          await fs.rm(tmpDir, { recursive: true, force: true })
++        } catch {}
++      },
++      abort: async () => {
++        pending = null
++        pendingLen = 0
++        await closeQuiet()
++        try {
++          await fs.rm(tmpDir, { recursive: true, force: true })
++        } catch {}
++        if (!parentExisted) {
++          try {
++            // 只删空父目录：非空绝不动，防误删并发上传写进来的文件
++            const names = await fs.readdir(dir)
++            if (names.length === 0) await tjs.remove(dir)
++          } catch {}
++        }
++      },
++    }
++  }
++
+   // ---- P2 C：分片上传 ----
+   //
+   // fs.ts 的 /api/fs/multipart/* 只在驱动实现 createUploadSession 时才走分片，
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -1,6 +1,7 @@
+ import { resolvePath, getDb, getSettings, saveDb } from "../model/db"
+ import { encodeDownloadPath } from "../../pkg/path"
+ import { assertCanonicalPath } from "../../pkg/canonical-path"
++import type { UploadTarget } from "../../pkg/upload-stream"
+ import { singleflight } from "../../pkg/singleflight"
+ import { canUseProxyEndpoint, normalizeExtList } from "../driver/proxy"
+ import { FileItem, StorageDriver, calcFileType } from "../driver/base"
+@@ -1853,3 +1854,78 @@
+   // 上传/覆盖：该文件的旧直链与父目录列表缓存失效
+   await invalidatePaths([virtualPath], requestContext?.env)
+ }
++
++
++/**
++ * P1-17 A 层：为一次上传准备目标（SPEC-P117 §3.2）。
++ *
++ * 驱动实现 beginStream 时真流式（Local）：数据边收边写临时文件，峰值与文件
++ * 大小无关。否则缓冲回退：write() 只收集块，commit() 合并后走 driver.put，
++ * 内存 = payload（受上传上限约束，SPEC §3.8 的已知限制，不在 P1-17 门内）。
++ *
++ * 收尾必须复用 putItem 的两步（flushPendingDriverState + invalidatePaths），
++ * 否则上传后直链与目录缓存不失效，属回归。
++ */
++export async function beginUpload(
++  virtualPath: string,
++  requestContext?: StorageRequestContext,
++): Promise<UploadTarget> {
++  const resolved = await resolvePath(virtualPath, requestContext?.env)
++  if (resolved.isVirtual) {
++    throw new Error("failed get storage: storage not found")
++  }
++  const driver = await getDriver(resolved.storage!.driver, resolved.storage)
++  const finish = async () => {
++    await flushPendingDriverState(
++      resolved.storage!.driver,
++      resolved.storage,
++      driver,
++      requestContext,
++    )
++    await invalidatePaths([virtualPath], requestContext?.env)
++  }
++  // 能力探测用结构化判断（与 fs.ts 判 createUploadSession 同一写法），
++  // 不改 StorageDriver 接口，避免动 base.ts 和 100 多个驱动。
++  const beginStream = (driver as any).beginStream
++  if (typeof beginStream === "function") {
++    const handle = await beginStream.call(driver, resolved.physical!)
++    let settled = false
++    return {
++      stream: true,
++      write: (chunk: Uint8Array) => handle.write(chunk),
++      commit: async () => {
++        if (settled) return
++        settled = true
++        await handle.commit()
++        await finish()
++      },
++      abort: async () => {
++        if (settled) return
++        settled = true
++        try {
++          await handle.abort()
++        } catch {}
++      },
++    }
++  }
++  const parts: Uint8Array[] = []
++  let settled = false
++  return {
++    stream: false,
++    write: async (chunk: Uint8Array) => {
++      parts.push(chunk)
++    },
++    commit: async () => {
++      if (settled) return
++      settled = true
++      const buffer = Buffer.concat(parts)
++      parts.length = 0
++      await driver.put(virtualPath, resolved.physical!, buffer)
++      await finish()
++    },
++    abort: async () => {
++      settled = true
++      parts.length = 0
++    },
++  }
++}
+diff --git a/src/backend/pkg/upload-stream.ts b/src/backend/pkg/upload-stream.ts
+new file mode 100644
+--- /dev/null
++++ b/src/backend/pkg/upload-stream.ts
+@@ -0,0 +1,162 @@
++/**
++ * P1-17 A 层：上传请求体的流式读写（SPEC-P117 §3.1）。
++ *
++ * 上传路径一次都不碰 `c.req.arrayBuffer()`：只从 `c.req.raw.body` 拿
++ * ReadableStream，一次读一块、写一块、计一次数。峰值因此与 payload 脱钩。
++ *
++ * drain 不是优化：txiki 的 httpserver.js onBodyChunk 是无背压的 enqueue，
++ * 请求体一旦开始流式，没人读的时候块会全堆在 JS 队列里。拒绝路径必须把
++ * 剩余 body 读完丢弃，否则「413 了但内存照样吃满」，与修复前等价。
++ */
++
++export interface UploadTarget {
++  /** 驱动是否真流式（false=缓冲回退，内存与 payload 同阶） */
++  stream: boolean
++  write(chunk: Uint8Array): Promise<void>
++  /** 成功：落盘 + 缓存失效 */
++  commit(): Promise<void>
++  /** 失败：清临时文件/目录，幂等 */
++  abort(): Promise<void>
++}
++
++export type PipeResult =
++  | { ok: true; bytes: number }
++  | {
++      ok: false
++      limit: number
++      received: number
++      reason: "content-length" | "counted"
++    }
++
++/** Content-Length 头；缺失/非数字返回 null（缺失不能当 0 参与判断）。 */
++export function contentLengthOf(c: any): number | null {
++  let raw: any
++  try {
++    raw = c?.req?.header?.("Content-Length")
++  } catch {}
++  if (raw === undefined || raw === null) {
++    try {
++      raw = c?.req?.raw?.headers?.get?.("content-length")
++    } catch {}
++  }
++  if (raw === undefined || raw === null) return null
++  const s = String(raw).trim()
++  if (!s) return null
++  const n = Number(s)
++  if (!Number.isFinite(n) || n < 0) return null
++  return Math.floor(n)
++}
++
++async function drainReader(reader: any, deadlineMs: number): Promise<void> {
++  let timer: any = null
++  if (deadlineMs > 0) {
++    timer = setTimeout(() => {
++      try {
++        void reader.cancel()
++      } catch {}
++    }, deadlineMs)
++    try {
++      timer?.unref?.()
++    } catch {}
++  }
++  try {
++    for (;;) {
++      const { done } = await reader.read()
++      if (done) break
++    }
++  } catch {
++    // 客户端断连、流已被取消：body 不可读，drain 到此为止
++  } finally {
++    if (timer !== null) {
++      try {
++        clearTimeout(timer)
++      } catch {}
++    }
++  }
++}
++
++/** 把请求体读完丢弃，默认 60 s 硬超时后 cancel（慢客户端不许吊住连接）。 */
++export async function drainRequestBody(
++  req: Request,
++  deadlineMs = 60000,
++): Promise<void> {
++  const anyReq = req as any
++  const body = anyReq?.body
++  if (!body || anyReq.bodyUsed) return
++  let reader: any
++  try {
++    reader = body.getReader()
++  } catch {
++    return
++  }
++  await drainReader(reader, deadlineMs)
++}
++
++export async function drainBody(c: any, deadlineMs = 60000): Promise<void> {
++  const req = c?.req?.raw
++  if (!req) return
++  await drainRequestBody(req, deadlineMs)
++}
++
++/**
++ * 逐块读 body、逐块写 target、逐块计数。
++ *
++ * 顺序是判据的一部分：
++ * 1) 声明长度超限：不读 body，只 drain；
++ * 2) 无 body（Content-Length: 0）：直接 commit；
++ * 3) 边读边超限：先 abort，再把剩余块读完丢弃（drain），最后才返回；
++ * 4) 正常结束：commit；
++ * 5) 任何异常：abort 后原样抛出（交给 writeFailure / sourceStep 映射）。
++ *
++ * 调用方必须在建 target 之前做一次 CL 预检（SPEC §3.7 第 1 条：超限请求连
++ * 临时目录都不该建）；这里的同一条判断是幂等兜底，防别的调用点漏了预检。
++ */
++export async function pipeBody(
++  c: any,
++  limit: number,
++  target: UploadTarget,
++): Promise<PipeResult> {
++  const cl = contentLengthOf(c)
++  if (cl !== null && cl > limit) {
++    await target.abort()
++    await drainBody(c)
++    return { ok: false, limit, received: cl, reason: "content-length" }
++  }
++
++  const body: any = c?.req?.raw?.body
++  if (!body) {
++    await target.commit()
++    return { ok: true, bytes: 0 }
++  }
++
++  const reader = body.getReader()
++  let received = 0
++  let overflow = false
++  try {
++    for (;;) {
++      const { done, value } = await reader.read()
++      if (done) break
++      if (!value) continue
++      received += value.byteLength
++      if (received > limit) {
++        overflow = true
++        await target.abort()
++        break
++      }
++      await target.write(value)
++    }
++    if (overflow) {
++      await drainReader(reader, 60000)
++      return { ok: false, limit, received, reason: "counted" }
++    }
++  } catch (e) {
++    try {
++      await target.abort()
++    } catch {}
++    // 写盘失败时客户端可能还在发：先 drain 再抛，避免剩余块堆在 JS 队列里
++    await drainReader(reader, 60000)
++    throw e
++  }
++  await target.commit()
++  return { ok: true, bytes: received }
++}
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -9,6 +9,7 @@
+   moveItems,
+   copyItems,
+   putItem,
++  beginUpload,
+   getDriver,
+ } from "../internal/op/storage"
+ import { resolveShare } from "../internal/op/share"
+@@ -51,6 +52,7 @@
+ } from "../pkg/sign"
+ import { safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
++import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+ import { search } from "../internal/op/search"
+ import {
+   getDisableIndex,
+@@ -1075,9 +1077,16 @@
+     return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+   try {
+-    const body = await readBodyWithinLimit(c)
+-    if (!body.ok) return tooLargeResponse(c, body.limit)
+-    await putItem(reqPath, body.buffer, requestContext)
++    const limit = getUploadSizeLimit(c, false)
++    // CL 预检必须在建临时目标之前：超限请求连临时目录都不建（SPEC §3.7 第 1 条）。
++    const declared = contentLengthOf(c)
++    if (declared !== null && declared > limit) {
++      await drainBody(c)
++      return tooLargeResponse(c, limit)
++    }
++    const target = await beginUpload(reqPath, requestContext)
++    const r = await pipeBody(c, limit, target)
++    if (!r.ok) return tooLargeResponse(c, r.limit)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+     return writeFailure(c, e)
+@@ -1106,6 +1115,15 @@
+     return permissionDenied(c)
+   const requestContext = getStorageRequestContext(c)
+   try {
++    // SPEC §3.8：multipart 本轮不流式化，只加 CL 预检 + drain。
++    // multipart 的 Content-Length 含边界与各段头，比文件本身大，这里留 256 KiB
++    // 余量，保证「文件正好等于上限」的合法请求不被预检误杀；文件实际字节数
++    // 仍在下面按 buffer.length 复核。
++    const declaredForm = contentLengthOf(c)
++    if (declaredForm !== null && declaredForm > getUploadSizeLimit(c, false) + 262144) {
++      await drainBody(c)
++      return tooLargeResponse(c, getUploadSizeLimit(c, false))
++    }
+     const form = await c.req.formData()
+     const file = form.get("file")
+     if (!file || typeof file === "string") {
+diff --git a/src/backend/server/s3.ts b/src/backend/server/s3.ts
+--- a/src/backend/server/s3.ts
++++ b/src/backend/server/s3.ts
+@@ -4,10 +4,12 @@
+   listItems,
+   getItem,
+   putItem,
++  beginUpload,
+   removeItems,
+ } from "../internal/op/storage"
+ import { safeErrorMessage } from "../pkg/errs"
+-import { readBodyWithinLimit } from "../pkg/upload-limit"
++import { getUploadSizeLimit } from "../pkg/upload-limit"
++import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+ import {
+   canRemove,
+   canWrite,
+@@ -301,18 +303,28 @@
+     return s3Error("AccessDenied", "Write permission denied for this path", 403)
+   }
+   try {
+-    // 体积上限按**实际收到的字节数**判定（与 /fs/put 共用 pkg/upload-limit）。
+-    // 历史缺陷：PutObject 完全没有大小限制，MAX_UPLOAD/MAX_UPPART 都不生效，
+-    // 超大请求体会被整包读入内存——与 /fs/put 的防护形成明显不对称。
+-    const body = await readBodyWithinLimit(c, false)
+-    if (!body.ok) {
++    // P1-17 A 层：逐块读、逐块写、逐块计数。对外行为保持现状——超限仍是
++    // HTTP 400 + EntityTooLarge XML（conductor 2026-10-24 06:58 裁定：
++    // 413 属现有回归抓不到的对外行为变更，本批不改，记交件 README 已知差异）。
++    const limit = getUploadSizeLimit(c, false)
++    const declared = contentLengthOf(c)
++    if (declared !== null && declared > limit) {
++      await drainBody(c)
+       return s3Error(
+         "EntityTooLarge",
+-        `Object exceeds the ${body.limit} byte limit`,
++        `Object exceeds the ${limit} byte limit`,
+         400,
+       )
+     }
+-    await putItem(virtualPath, body.buffer, getCtx(c))
++    const target = await beginUpload(virtualPath, getCtx(c))
++    const r = await pipeBody(c, limit, target)
++    if (!r.ok) {
++      return s3Error(
++        "EntityTooLarge",
++        `Object exceeds the ${r.limit} byte limit`,
++        400,
++      )
++    }
+     // 不再返回伪造的 ETag。
+     //
+     // 历史实现返回 `Date.now().toString(16)`，不是内容摘要：依赖 ETag 做幂等/
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -24,6 +24,8 @@
+   decodeWirePath,
+   isPathRejected,
+ } from "../pkg/canonical-path"
++import { getUploadSizeLimit } from "../pkg/upload-limit"
++import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+ import {
+   canAccess,
+   canRead as canReadMeta,
+@@ -41,6 +43,7 @@
+   moveItems,
+   copyItems,
+   renameItem,
++  beginUpload,
+ } from "../internal/op/storage"
+ import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav/webdav"
+ import { safeErrorMessage } from "../pkg/errs"
+@@ -517,8 +520,17 @@
+         if (await deniedByMetaWrite(c, user, splitPath(actualPath).dir, true)) {
+           return metaForbidden(c)
+         }
+-        const buffer = Buffer.from(await c.req.arrayBuffer())
+-        await sourceStep(() => putItem(actualPath, buffer, ctx))
++        // SPEC §3.5：DAV PUT 此前完全没有体积上限（32/64 MiB OOM 的实际入口）。
++        // 顺序：canManage -> deniedByMetaWrite -> 体积（403 优先于 413，不泄露限额）。
++        const limit = getUploadSizeLimit(c, false)
++        const declared = contentLengthOf(c)
++        if (declared !== null && declared > limit) {
++          await drainBody(c)
++          return c.text(`File too large (max ${limit} bytes)`, 413)
++        }
++        const target = await sourceStep(() => beginUpload(actualPath, ctx))
++        const r = await sourceStep(() => pipeBody(c, limit, target))
++        if (!r.ok) return c.text(`File too large (max ${r.limit} bytes)`, 413)
+         return c.body(null, 201)
+       }
+ 

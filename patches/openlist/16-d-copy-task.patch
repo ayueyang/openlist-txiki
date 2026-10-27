@@ -1,0 +1,398 @@
+diff --git a/src/backend/server/copy-task.ts b/src/backend/server/copy-task.ts
+new file mode 100644
+index 0000000..824599e
+--- /dev/null
++++ b/src/backend/server/copy-task.ts
+@@ -0,0 +1,304 @@
++/**
++ * D 段：复制任务（持久化 + 进度查询 + 取消）。
++ *
++ * 为什么要这一个文件：上游 server/task.ts 在 Worker/Serverless 里是空占位
++ * （tasks 常量数组 + 生命周期接口一律 501）。txiki 是长驻进程，有 SQLite，
++ * 可以像 Go 版一样把复制任务落库并串行执行。这里只做复制，不动 /api/fs/copy
++ * 的同步语义（G4/C7 依赖它立即返回、立即可见）；创建入口另开
++ * POST /api/task/copy，查询/取消沿用 Go 的路由形状。
++ *
++ * 判据（task_plan D 段原文）：
++ * - 重启后状态不丢：任务行在 SQLite 里，重启后仍能查到。
++ * - 没有卡在 running 的僵尸行：启动时把 running/canceling 一律改成 failed，
++ *   并写明原因；pending 任务由工作循环继续跑。
++ *
++ * 执行粒度：一个 name 一次 copyItems（与同步 /api/fs/copy 完全同一条代码
++ * 路径）。取消在两个 name 之间生效；单个 name 内部的拷贝不打断（与 Go 版
++ * 按文件检查 ctx 的粒度一致，不额外引入分块拷贝语义）。
++ */
++import { copyItems } from "../internal/op/storage"
++import { setEnvCtx } from "../internal/model/db"
++
++declare const crypto: any
++
++const TABLE = "openlist_copy_tasks"
++const TICK_MS = 200
++
++export const UNDONE_STATES = ["pending", "running", "canceling", "failed"]
++export const DONE_STATES = ["canceled", "succeeded"]
++
++let dbRef: any = null
++let envRef: any = null
++let timer: any = null
++let ticking = false
++const cancelRequested = new Set<string>()
++
++function errText(e: any): string {
++  if (e && typeof e.message === "string") return e.message
++  return String(e)
++}
++
++function newId(): string {
++  try {
++    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID()
++  } catch {}
++  return (
++    Date.now().toString(36) +
++    "-" +
++    Math.random().toString(36).slice(2, 10) +
++    Math.random().toString(36).slice(2, 10)
++  )
++}
++
++function normDir(p: any): string {
++  if (typeof p !== "string" || !p.startsWith("/")) throw new Error("path must start with /")
++  if (p.split("/").some((seg) => seg === "..")) throw new Error("path must not contain ..")
++  return p.length > 1 ? p.replace(/\/+$/, "") : p
++}
++
++function normName(n: any): string {
++  if (typeof n !== "string" || !n.trim()) throw new Error("empty file name")
++  if (n === "." || n === ".." || n.includes("/") || n.includes("\\"))
++    throw new Error(`invalid file name [${n}]`)
++  return n
++}
++
++export interface CopyTaskRow {
++  id: string
++  name: string
++  state: string
++  status: string
++  progress: number
++  total_bytes: number
++  src_dir: string
++  dst_dir: string
++  names_json: string
++  error: string
++  creator: string
++  creator_role: number
++  created_at: number
++  start_time: number | null
++  end_time: number | null
++}
++
++function toApi(row: CopyTaskRow): Record<string, any> {
++  return {
++    id: row.id,
++    name: row.name,
++    creator: row.creator || "",
++    creator_role: Number.isFinite(Number(row.creator_role)) ? Number(row.creator_role) : -1,
++    state: row.state,
++    status: row.status || "",
++    progress: Number(row.progress) || 0,
++    start_time: row.start_time ? new Date(Number(row.start_time)).toISOString() : null,
++    end_time: row.end_time ? new Date(Number(row.end_time)).toISOString() : null,
++    total_bytes: Number(row.total_bytes) || 0,
++    error: row.error || "",
++  }
++}
++
++async function one(sql: string, params: any[] = []): Promise<any> {
++  return dbRef.prepare(sql).bind(...params).first()
++}
++
++async function run(sql: string, params: any[] = []): Promise<void> {
++  await dbRef.prepare(sql).bind(...params).run()
++}
++
++async function getRow(id: string): Promise<CopyTaskRow | null> {
++  return (await one(`SELECT * FROM ${TABLE} WHERE id = ?`, [id])) as CopyTaskRow | null
++}
++
++async function patch(id: string, fields: Record<string, any>): Promise<void> {
++  const keys = Object.keys(fields)
++  if (keys.length === 0) return
++  const sets = keys.map((k) => `${k} = ?`).join(", ")
++  await run(
++    `UPDATE ${TABLE} SET ${sets} WHERE id = ?`,
++    [...keys.map((k) => fields[k]), id],
++  )
++}
++
++/** 建表 + 重启恢复。entry.ts 在起服务后调用一次，返回后工作循环开始。 */
++export async function initCopyTasks(env: any): Promise<void> {
++  dbRef = env.DB
++  envRef = env
++  await dbRef
++    .prepare(
++      `CREATE TABLE IF NOT EXISTS ${TABLE} (
++        id TEXT PRIMARY KEY,
++        name TEXT NOT NULL DEFAULT '',
++        state TEXT NOT NULL,
++        status TEXT NOT NULL DEFAULT '',
++        progress REAL NOT NULL DEFAULT 0,
++        total_bytes INTEGER NOT NULL DEFAULT 0,
++        src_dir TEXT NOT NULL,
++        dst_dir TEXT NOT NULL,
++        names_json TEXT NOT NULL,
++        error TEXT NOT NULL DEFAULT '',
++        creator TEXT NOT NULL DEFAULT '',
++        creator_role INTEGER NOT NULL DEFAULT -1,
++        created_at INTEGER NOT NULL,
++        start_time INTEGER,
++        end_time INTEGER
++      )`,
++    )
++    .run()
++  const now = Date.now()
++  // 重启恢复：进程死时正在跑的，不可能续跑（copy 无断点），一律明确 failed；
++  // pending 不动，工作循环会接着跑。
++  await run(
++    `UPDATE ${TABLE} SET state = 'failed', status = '', error = ?, end_time = ?
++     WHERE state IN ('running', 'canceling')`,
++    ["interrupted by server restart (mid-copy); destination may be partial", now],
++  )
++  startWorker()
++}
++
++function startWorker(): void {
++  if (timer) return
++  timer = (globalThis as any).setInterval(() => {
++    void tick()
++  }, TICK_MS)
++}
++
++async function tick(): Promise<void> {
++  if (ticking || !dbRef) return
++  ticking = true
++  try {
++    const row = (await one(
++      `SELECT * FROM ${TABLE} WHERE state = 'pending' ORDER BY created_at ASC, id ASC LIMIT 1`,
++    )) as CopyTaskRow | null
++    if (row) await runTask(row)
++  } catch (e) {
++    console.error(`[txiki] copy-task worker error: ${errText(e)}`)
++  } finally {
++    ticking = false
++  }
++}
++
++async function isCancelling(id: string): Promise<boolean> {
++  if (cancelRequested.has(id)) return true
++  const row = await getRow(id)
++  return !!row && row.state === "canceling"
++}
++
++async function finish(id: string, state: "succeeded" | "canceled", error = ""): Promise<void> {
++  cancelRequested.delete(id)
++  const fields: Record<string, any> = { state, status: "", error, end_time: Date.now() }
++  if (state === "succeeded") fields.progress = 100
++  await patch(id, fields)
++}
++
++async function runTask(row: CopyTaskRow): Promise<void> {
++  const id = row.id
++  const started = Date.now()
++  await patch(id, { state: "running", status: "starting", start_time: started, error: "" })
++  try {
++    setEnvCtx(envRef)
++    const names: string[] = JSON.parse(row.names_json)
++    let done = 0
++    for (const name of names) {
++      if (await isCancelling(id)) {
++        await finish(id, "canceled")
++        return
++      }
++      await patch(id, { status: `copying ${name} (${done + 1}/${names.length})` })
++      await copyItems(row.src_dir, row.dst_dir, [name], { env: envRef })
++      done++
++      await patch(id, {
++        progress: names.length ? (done / names.length) * 100 : 100,
++        status: `copied ${done}/${names.length}`,
++      })
++    }
++    await finish(id, "succeeded")
++    console.log(`[txiki] copy-task ${id} succeeded names=${names.length}`)
++  } catch (e) {
++    const msg = errText(e)
++    if (await isCancelling(id)) {
++      await finish(id, "canceled")
++    } else {
++      cancelRequested.delete(id)
++      await patch(id, { state: "failed", status: "", error: msg, end_time: Date.now() })
++      console.error(`[txiki] copy-task ${id} failed: ${msg}`)
++    }
++  }
++}
++
++export async function createCopyTasks(
++  env: any,
++  body: any,
++  creator = "",
++  creatorRole = -1,
++): Promise<Record<string, any>[]> {
++  const srcDir = normDir(body?.src_dir ?? "/")
++  const dstDir = normDir(body?.dst_dir ?? "/")
++  const names = Array.isArray(body?.names) ? body.names.map(normName) : []
++  if (names.length === 0) throw new Error("Parameter 'names' must be a non-empty array")
++  const now = Date.now()
++  const id = newId()
++  const display =
++    names.length === 1
++      ? `copy ${srcDir}/${names[0]} to ${dstDir}`
++      : `copy ${names.length} items ${srcDir} to ${dstDir}`
++  await run(
++    `INSERT INTO ${TABLE}
++     (id, name, state, status, progress, total_bytes, src_dir, dst_dir, names_json,
++      error, creator, creator_role, created_at, start_time, end_time)
++     VALUES (?, ?, 'pending', '', 0, 0, ?, ?, ?, '', ?, ?, ?, NULL, NULL)`,
++    [id, display, srcDir, dstDir, JSON.stringify(names), creator, creatorRole, now],
++  )
++  dbRef = env.DB
++  const row = await getRow(id)
++  return row ? [toApi(row)] : []
++}
++
++export async function listCopyTasks(undone: boolean): Promise<Record<string, any>[]> {
++  const states = undone ? UNDONE_STATES : DONE_STATES
++  const marks = states.map(() => "?").join(", ")
++  const rows = await dbRef
++    .prepare(`SELECT * FROM ${TABLE} WHERE state IN (${marks}) ORDER BY created_at DESC`)
++    .bind(...states)
++    .all()
++  return ((rows?.results || []) as CopyTaskRow[]).map(toApi)
++}
++
++export async function getCopyTask(id: string): Promise<Record<string, any> | null> {
++  const row = await getRow(id)
++  return row ? toApi(row) : null
++}
++
++/** 取消：pending 直接 canceled；running/canceling 标 canceling，工作循环在下一个 name 前收尾。 */
++export async function cancelCopyTask(id: string): Promise<{ ok: boolean; message?: string; task?: any }> {
++  const row = await getRow(id)
++  if (!row) return { ok: false, message: "task not found" }
++  if (row.state === "succeeded" || row.state === "canceled" || row.state === "failed") {
++    return { ok: true, task: toApi(row) }
++  }
++  cancelRequested.add(id)
++  if (row.state === "pending") {
++    cancelRequested.delete(id)
++    await patch(id, { state: "canceled", status: "", end_time: Date.now() })
++  } else {
++    await patch(id, { state: "canceling", status: "canceling" })
++  }
++  return { ok: true, task: await getCopyTask(id) }
++}
++
++export async function deleteCopyTask(id: string): Promise<{ ok: boolean; message?: string }> {
++  const row = await getRow(id)
++  if (!row) return { ok: false, message: "task not found" }
++  if (row.state === "running" || row.state === "canceling" || row.state === "pending") {
++    return { ok: false, message: "task is not finished; cancel it first" }
++  }
++  await run(`DELETE FROM ${TABLE} WHERE id = ?`, [id])
++  return { ok: true }
++}
++
++export async function clearCopyTasks(mode: "done" | "succeeded"): Promise<void> {
++  if (mode === "succeeded") {
++    await run(`DELETE FROM ${TABLE} WHERE state = 'succeeded'`)
++    return
++  }
++  await run(`DELETE FROM ${TABLE} WHERE state IN ('canceled', 'failed', 'succeeded')`)
++}
+diff --git a/src/backend/server/task.ts b/src/backend/server/task.ts
+index 6e0c51a..fbfac62 100644
+--- a/src/backend/server/task.ts
++++ b/src/backend/server/task.ts
+@@ -2,6 +2,14 @@ import { Hono } from "hono"
+ import { getDb, saveDb } from "../internal/model/db"
+ import { getDriver } from "../internal/op/storage"
+ import { adminAuthMiddleware, matchCronSecret } from "./middlewares"
++import {
++  cancelCopyTask,
++  clearCopyTasks,
++  createCopyTasks,
++  deleteCopyTask,
++  getCopyTask,
++  listCopyTasks,
++} from "./copy-task"
+ 
+ export const taskRouter = new Hono()
+ 
+@@ -106,6 +114,68 @@ const tasks: Record<string, any[]> = {
+ // later carry real file-operation metadata)
+ taskRouter.use("*", adminAuthMiddleware)
+ 
++// ── D 段：复制任务（真实实现，落 SQLite；见 ./copy-task.ts） ──
++// 创建入口是 txiki 扩展：POST /api/task/copy。上游 Go 用 POST /api/fs/copy
++// 建任务，但本移植的 /api/fs/copy 必须保持同步（G4/C7 依赖立即返回可见），
++// 所以不翻转它的语义。
++taskRouter.post("/copy", async (c) => {
++  let body: any = {}
++  try {
++    body = await c.req.json()
++  } catch {
++    return c.json({ code: 400, message: "invalid request format", data: null }, 400)
++  }
++  try {
++    const tasks = await createCopyTasks(c.env, body)
++    return c.json({
++      code: 200,
++      message: `Successfully created ${tasks.length} copy task(s)`,
++      data: { message: `Successfully created ${tasks.length} copy task(s)`, tasks },
++    })
++  } catch (e: any) {
++    return c.json({ code: 400, message: e?.message || String(e), data: null }, 400)
++  }
++})
++
++taskRouter.get("/copy/undone", async (c) => {
++  return c.json({ code: 200, message: "success", data: await listCopyTasks(true) })
++})
++
++taskRouter.get("/copy/done", async (c) => {
++  return c.json({ code: 200, message: "success", data: await listCopyTasks(false) })
++})
++
++taskRouter.post("/copy/info", async (c) => {
++  const task = await getCopyTask(c.req.query("tid") || "")
++  if (!task) return c.json({ code: 404, message: "task not found", data: null }, 404)
++  return c.json({ code: 200, message: "success", data: task })
++})
++
++taskRouter.post("/copy/cancel", async (c) => {
++  const r = await cancelCopyTask(c.req.query("tid") || "")
++  if (!r.ok) return c.json({ code: 404, message: r.message || "task not found", data: null }, 404)
++  return c.json({ code: 200, message: "success", data: r.task ?? null })
++})
++
++taskRouter.post("/copy/delete", async (c) => {
++  const r = await deleteCopyTask(c.req.query("tid") || "")
++  if (!r.ok) {
++    const status = r.message === "task not found" ? 404 : 409
++    return c.json({ code: status, message: r.message || "failed", data: null }, status as any)
++  }
++  return c.json({ code: 200, message: "success", data: null })
++})
++
++taskRouter.post("/copy/clear_done", async (c) => {
++  await clearCopyTasks("done")
++  return c.json({ code: 200, message: "success", data: null })
++})
++
++taskRouter.post("/copy/clear_succeeded", async (c) => {
++  await clearCopyTasks("succeeded")
++  return c.json({ code: 200, message: "success", data: null })
++})
++
+ taskRouter.get("/:type/:state", (c) => {
+   const type = c.req.param("type")
+   const state = c.req.param("state") // "undone" | "done"

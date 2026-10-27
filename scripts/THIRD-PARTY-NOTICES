@@ -1,0 +1,38 @@
+openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
+================================================
+
+注：ISC 声明已按 reviewer 2026-10-22 裁决删除（包内无 alist-encrypt 派生代码）。
+
+1. OpenList-Worker（AGPL-3.0-only）
+   本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
+   上游基线 commit：5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
+   修改范围与逐条补丁 sha256 见同目录 build-manifest.json 的 patches 数组
+   （16 个补丁，按序 apply）。许可证全文见 LICENSE.AGPL-3.0。
+   对应源码获取方式见 SOURCE-OFFER（分「本机自用 / 对外分发」两档）。
+
+2. openpgp 6.3.1（LGPL-3.0-or-later）
+   本包 bundle 内包含 openpgp 6.3.1（未修改），
+   上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 。
+   LGPL 对未修改库允许以要约提供源码：源码即上述上游 tag，许可证全文见 LICENSE.LGPL-3.0。
+
+3. 运行时（全部静态链入 /usr/libexec/openlist-txiki/tjs，按各自上游许可证分发）
+   txiki.js（MIT）、libwebsockets（MIT，含例外条款）、QuickJS（MIT）、
+   libuv（MIT）、libffi（MIT）、ada URL 解析器（Apache-2.0 OR MIT）、
+   mbedtls（Apache-2.0 OR GPL-2.0-or-later，本包按 Apache-2.0 使用）、
+   WAMR / wasm-micro-runtime（Apache-2.0，含 LLVM Exceptions）、
+   mimalloc（MIT）、sqlite3（Public Domain）、tweetnacl（Public Domain）。
+   上述组件由 tjs 静态链接，可用字符串实测复核（wasm_runtime、mimalloc、sqlite3、
+   libuv、ada、mbedtls、quickjs、libffi 均命中）。
+   mbedtls 含本项目 2026-10-22 的窄修复（TLS1.2 PSS，补丁 sha256
+   cd1d269777facec3a07c3b0549c451c4b9d8278b8e4593e50fd9da85adbdae98），
+   该修改的源码与构建方式见 SOURCE-OFFER 与源码归档 work/txiki-26.9/。
+
+4. 许可证全文（包内 /usr/share/openlist-txiki/）
+   LICENSE.AGPL-3.0    AGPL-3.0（OpenList-Worker 修改版）
+   LICENSE.LGPL-3.0    LGPL-3.0（openpgp）
+   LICENSE.Apache-2.0  Apache-2.0 全文，含 WAMR 的 LLVM Exceptions 段
+   LICENSE.MIT         MIT 原文（txiki.js、libwebsockets、QuickJS、libuv、libffi、mimalloc）
+   sqlite3 与 tweetnacl 为 Public Domain，不要求附许可证全文。
+
+5. 对外分发前仍需（SOURCE-OFFER 档二）
+   公开源码地址与发布位置；补齐后按 SOURCE-OFFER 第二节写生效行，再重新出包。

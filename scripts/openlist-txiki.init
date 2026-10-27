@@ -1,0 +1,239 @@
+#!/bin/sh /etc/rc.common
+# openlist-txiki：OpenList Worker (txiki.js) 的 procd 服务。
+# 与 Go openlist(5244)、alist-encrypt(5344) 并列的独立服务，默认监听 5345。
+# 启动前用 build-manifest.json 校验包内 bundle 与 tjs 的 sha256，不符拒绝启动。
+
+USE_PROCD=1
+START=99
+STOP=10
+
+PKG_DIR=/usr/libexec/openlist-txiki
+DATA_DIR=/etc/openlist-txiki
+ENV_FILE=$DATA_DIR/openlist-txiki.env
+MANIFEST=/usr/share/openlist-txiki/build-manifest.json
+TMP_DIR=/tmp/openlist-txiki
+
+log() { logger -t openlist-txiki "$*"; }
+
+# 从 build-manifest.json 取一个 64 位 sha 字段，不引 jq
+manifest_sha() {
+	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1
+}
+
+# 端口是否已在监听（/proc/net/tcp{,6} 状态 0A）
+port_busy() {
+	local hex f
+	hex=$(printf '%04X' "$1")
+	for f in /proc/net/tcp /proc/net/tcp6; do
+		[ -r "$f" ] || continue
+		awk -v p="$hex" 'NR > 1 { split($2, a, ":"); if (a[2] == p && $4 == "0A") found = 1 } END { exit !found }' "$f" && return 0
+	done
+	return 1
+}
+
+# 监听地址是否只能本机访问（127.0.0.0/8、::1、localhost）。
+# 只认 127.x.x.x 的数字形式，避免把 "127.example.com" 这类可解析到外网的主机名当 loopback。
+# 判错时按「非 loopback」处理（fail-closed 方向），宁可多拦一次。
+is_loopback() {
+	case "$1" in
+		localhost|::1|\[::1\]) return 0 ;;
+		127.*)
+			echo "$1" | grep -Eq '^127(\.[0-9]{1,3}){3}$' && return 0
+			return 1 ;;
+	esac
+	return 1
+}
+
+# JWT_SECRET 只在首次启动生成一次，追加写入 0600 的 env 文件
+ensure_secret() {
+	[ -n "$JWT_SECRET" ] && return 0
+	JWT_SECRET=$(head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"')
+	printf '\n# 由 init 脚本首次启动时生成，勿手工改短\nJWT_SECRET=%s\n' "$JWT_SECRET" >> "$ENV_FILE"
+	chmod 600 "$ENV_FILE"
+	log "generated JWT_SECRET into $ENV_FILE"
+}
+
+# 引导口令优先取 env，其次 root 只读的 admin.pass（post-install/post-upgrade 生成）。
+# 口令只用于首次建 admin；已有合法 admin 时应用侧不会重置。
+load_admin_pass() {
+	ADMIN_PASS_SOURCE=none
+	if [ -n "${TJS_ADMIN_PASS:-}" ]; then
+		ADMIN_PASS_SOURCE=env
+		return 0
+	fi
+	TJS_ADMIN_PASS=""
+	if [ -r "$DATA_DIR/admin.pass" ]; then
+		TJS_ADMIN_PASS=$(cat "$DATA_DIR/admin.pass" 2>/dev/null)
+		[ -n "$TJS_ADMIN_PASS" ] && ADMIN_PASS_SOURCE=admin.pass
+	fi
+	return 0
+}
+
+# 选一个 loopback 空闲端口给 probe 用：LISTEN_PORT+1000 起，最多试 10 个。
+pick_probe_port() {
+	probe_port=$((LISTEN_PORT + 1000))
+	probe_try=0
+	while [ "$probe_try" -lt 10 ]; do
+		port_busy "$probe_port" || return 0
+		probe_port=$((probe_port + 1))
+		probe_try=$((probe_try + 1))
+	done
+	return 1
+}
+
+# 启动前自检：用同一个数据目录起一个只绑 127.0.0.1 的临时实例，问 init_status。
+# 只有看到 "initialized":true 才算证明 admin 存在；临时进程无论如何都会杀掉。
+# 设备 busybox 的 sleep 不支持小数，轮询按 1 秒一次、最多 20 次（约 20 秒）。
+probe_admin_ready() {
+	if ! pick_probe_port; then
+		log "probe: $((LISTEN_PORT + 1000)) 起连续 10 个端口都被占用，无法做启动前检查"
+		return 1
+	fi
+	mkdir -p "$TMP_DIR" || return 1
+	chmod 700 "$TMP_DIR"
+	rm -f "$TMP_DIR/probe.log"
+	TJS_HOST=127.0.0.1 TJS_PORT=$probe_port TJS_DATA_DIR="$DATA_DIR" \
+		TJS_JWT_SECRET="$JWT_SECRET" TJS_ADMIN_PASS="${TJS_ADMIN_PASS:-}" \
+		OPENLIST_TXIKI_READONLY=1 TMPDIR="$TMP_DIR" \
+		"$PKG_DIR/tjs" run "$PKG_DIR/openlist-txiki.js" >>"$TMP_DIR/probe.log" 2>&1 &
+	probe_pid=$!
+	probe_ok=1
+	probe_i=0
+	while [ "$probe_i" -lt 20 ]; do
+		sleep 1
+		probe_body=$(wget -q -T 2 -O - "http://127.0.0.1:$probe_port/api/public/init_status" 2>/dev/null)
+		case "$probe_body" in
+			*'"initialized":true'*) probe_ok=0; break ;;
+			*'"initialized":false'*) probe_ok=1; break ;;
+		esac
+		probe_i=$((probe_i + 1))
+	done
+	kill -TERM "$probe_pid" 2>/dev/null
+	probe_i=0
+	while [ "$probe_i" -lt 5 ] && kill -0 "$probe_pid" 2>/dev/null; do
+		sleep 1
+		probe_i=$((probe_i + 1))
+	done
+	kill -KILL "$probe_pid" 2>/dev/null
+	wait "$probe_pid" 2>/dev/null
+	return $probe_ok
+}
+
+# .admin-ready 是「启动前已确认有 admin」的凭据；只在 probe 成功后原子写入。
+write_admin_ready() {
+	probe_marker="$DATA_DIR/.admin-ready.$$"
+	printf '%s admin source=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ADMIN_PASS_SOURCE" > "$probe_marker" || return 1
+	chmod 600 "$probe_marker"
+	mv "$probe_marker" "$DATA_DIR/.admin-ready"
+}
+
+# data.db 是否像应用真正建过的库：SQLite 魔数 + 超过一个 4KiB 页。
+# marker 只是上次 probe 成功的快照，不是「现在有 admin」的证明；库被删除、清空或截断后
+# 继续信它就会跳过启动前自检（auditor 2026-10-22 实测 R1：marker + 0 字节库 + 0.0.0.0
+# 时首个 setup 回 200）。判定失败一律按不可信处理，宁可多 probe 一次。
+db_looks_initialized() {
+	[ -f "$DATA_DIR/data.db" ] || return 1
+	[ "$(wc -c < "$DATA_DIR/data.db" 2>/dev/null || echo 0)" -gt 4096 ] || return 1
+	head -c 16 "$DATA_DIR/data.db" 2>/dev/null | grep -q '^SQLite format 3' || return 1
+	return 0
+}
+
+start_service() {
+	[ -x "$PKG_DIR/tjs" ] || { log "missing $PKG_DIR/tjs"; exit 1; }
+	[ -f "$PKG_DIR/openlist-txiki.js" ] || { log "missing $PKG_DIR/openlist-txiki.js"; exit 1; }
+	[ -f "$MANIFEST" ] || { log "missing $MANIFEST"; exit 1; }
+	[ -f "$ENV_FILE" ] || { log "missing $ENV_FILE (post-install should create it)"; exit 1; }
+
+	want_bundle=$(manifest_sha bundle_sha256)
+	want_tjs=$(manifest_sha tjs_sha256)
+	if [ -z "$want_bundle" ] || [ -z "$want_tjs" ]; then
+		log "build-manifest.json 缺少 bundle_sha256/tjs_sha256，拒绝启动"
+		exit 1
+	fi
+	got_bundle=$(sha256sum "$PKG_DIR/openlist-txiki.js" | cut -d' ' -f1)
+	got_tjs=$(sha256sum "$PKG_DIR/tjs" | cut -d' ' -f1)
+	if [ "$got_bundle" != "$want_bundle" ]; then
+		log "bundle sha256 不符：包内 $got_bundle 期望 $want_bundle，拒绝启动"
+		exit 1
+	fi
+	if [ "$got_tjs" != "$want_tjs" ]; then
+		log "tjs sha256 不符：包内 $got_tjs 期望 $want_tjs，拒绝启动"
+		exit 1
+	fi
+
+	. "$ENV_FILE"
+	: "${LISTEN_ADDR:=127.0.0.1}"
+	: "${LISTEN_PORT:=5345}"
+	: "${READONLY:=1}"
+
+	load_admin_pass
+	ensure_secret
+
+	mkdir -p "$TMP_DIR" || { log "mkdir $TMP_DIR failed"; exit 1; }
+	chmod 700 "$TMP_DIR"
+
+	# 启动前自检（architect 2026-10-22 18:52 方案）：admin 是否存在只能靠应用自己回答，
+	# data.db 存不存在、口令设没设都不能当证据。已有 .admin-ready 且库文件像样才跳过；
+	# marker 失效时先删掉再 probe，避免「库没了 marker 还在」把自检短路掉（R1）。
+	# probe 失败时：loopback 且没口令才允许继续（留给本机安装向导），其余一律拒启动。
+	if [ -f "$DATA_DIR/.admin-ready" ] && ! db_looks_initialized; then
+		log "admin bootstrap: marker 在但 data.db 不可信（缺失/空/非 SQLite），删 marker 重新 probe"
+		rm -f "$DATA_DIR/.admin-ready"
+	fi
+	if [ -f "$DATA_DIR/.admin-ready" ]; then
+		log "admin bootstrap: marker present, skip probe"
+	elif probe_admin_ready; then
+		if write_admin_ready; then
+			log "admin bootstrap ok: user=admin source=$ADMIN_PASS_SOURCE"
+		else
+			log "admin bootstrap: 已确认 admin，但写 $DATA_DIR/.admin-ready 失败（下次启动会重新 probe）"
+		fi
+	else
+		probe_tail=$(tail -n 3 "$TMP_DIR/probe.log" 2>/dev/null | tr '\n' ' ')
+		log "admin bootstrap failed: $probe_tail"
+		if is_loopback "$LISTEN_ADDR" && [ -z "${TJS_ADMIN_PASS:-}" ]; then
+			log "admin bootstrap: 未初始化且未设口令，按本机安装向导模式继续（仅 $LISTEN_ADDR 可达）。首次打开 http://127.0.0.1:$LISTEN_PORT 完成向导；成功后再改 LISTEN_ADDR=0.0.0.0"
+		else
+			log "拒绝启动：启动前检查未证明 admin 已存在（LISTEN_ADDR=$LISTEN_ADDR，口令来源=$ADMIN_PASS_SOURCE）。检查 $DATA_DIR/admin.pass 是否可读，或先保持 127.0.0.1 完成安装向导。"
+			exit 1
+		fi
+	fi
+
+	if port_busy "$LISTEN_PORT"; then
+		log "端口 $LISTEN_PORT 已被占用，拒绝启动（不改端口、不重试别的端口）"
+		exit 1
+	fi
+
+	# 清掉 probe 的临时日志和残留，procd 启动前给一个干净的 0700 临时目录
+	rm -rf "$TMP_DIR"
+	mkdir -p "$TMP_DIR"
+	chmod 700 "$TMP_DIR"
+
+	procd_open_instance openlist-txiki
+	procd_set_param command "$PKG_DIR/tjs" run "$PKG_DIR/openlist-txiki.js"
+	# 固定转发 7 个键（第 7 个是 TJS_ADMIN_PASS：空值也传，应用侧读空等于没设，行为可预期）；
+	# 后面 5 个可选键只在用户于 env 文件里显式设置时才传，
+	# 不设就不传，应用侧走自己的默认值（upload-limit.ts 的 25MB/16MB）。
+	ENV_ARGS="TJS_HOST=$LISTEN_ADDR TJS_PORT=$LISTEN_PORT TJS_DATA_DIR=$DATA_DIR TJS_JWT_SECRET=$JWT_SECRET TJS_ADMIN_PASS=${TJS_ADMIN_PASS:-} OPENLIST_TXIKI_READONLY=$READONLY TMPDIR=$TMP_DIR"
+	[ -n "${MAX_UPLOAD:-}" ] && ENV_ARGS="$ENV_ARGS MAX_UPLOAD=$MAX_UPLOAD"
+	[ -n "${MAX_UPPART:-}" ] && ENV_ARGS="$ENV_ARGS MAX_UPPART=$MAX_UPPART"
+	[ -n "${OPENLIST_TXIKI_SWEEP:-}" ] && ENV_ARGS="$ENV_ARGS OPENLIST_TXIKI_SWEEP=$OPENLIST_TXIKI_SWEEP"
+	[ -n "${OPENLIST_TXIKI_SWEEP_MS:-}" ] && ENV_ARGS="$ENV_ARGS OPENLIST_TXIKI_SWEEP_MS=$OPENLIST_TXIKI_SWEEP_MS"
+	# DB_SYNC 只在显式设置时才传（r9 起 B1 开关，不传=应用侧默认 NORMAL）
+	[ -n "${DB_SYNC:-}" ] && ENV_ARGS="$ENV_ARGS DB_SYNC=$DB_SYNC"
+	# 故意不加引号：procd_set_param 要的是逐个 KEY=VALUE 参数；上面这些值都是数字或路径，不含空白。
+	procd_set_param env $ENV_ARGS
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+	log "started: listen=$LISTEN_ADDR:$LISTEN_PORT data=$DATA_DIR readonly=$READONLY"
+}
+
+stop_service() {
+	rm -rf "$TMP_DIR"
+}
+
+reload_service() {
+	restart
+}

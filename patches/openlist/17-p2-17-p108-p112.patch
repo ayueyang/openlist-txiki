@@ -1,0 +1,78 @@
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 0a30d59..cfdcf35 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -870,7 +870,9 @@ fsRouter.post("/rename", async (c) => {
+   // 重命名使用独立的 RENAME 权限位（此前误用 WRITE_CONTENT，导致「只有上传
+   // 权限的用户也能改名」而「只授予 RENAME 的用户反被拒绝」）。
+   if (!canRename(user)) return permissionDenied(c)
+-  const { path: oldPath, name: newName } = await c.req.json().catch(() => ({}))
++  const { path: oldPath, name: newName, overwrite } = await c.req
++    .json()
++    .catch(() => ({}))
+   let cleanName = ""
+   try {
+     validateDirPath(oldPath || "/")
+@@ -883,6 +885,29 @@ fsRouter.post("/rename", async (c) => {
+     const actualOldPath = getActualPath(user, oldPath || "/")
+     if (await deniedByMetaWriteAcl(c, user, [actualOldPath]))
+       return permissionDenied(c)
++    // P1-08：目标已存在且未显式 overwrite:true 时回 403，对齐 Go
++    // fsmanage.go:314-318 的 file [x] exists；此前会静默覆盖目标并删掉源文件。
++    const parentPath = actualOldPath.slice(0, actualOldPath.lastIndexOf("/")) || "/"
++    const targetPath = `${parentPath === "/" ? "" : parentPath}/${cleanName}`
++    if (overwrite !== true && targetPath !== actualOldPath) {
++      let targetExists = false
++      try {
++        // 虚拟路径（挂载点本身）没有真实文件：保持原有 404 语义，交给 renameItem
++        const targetResolved = await resolvePath(targetPath)
++        if (!targetResolved.isVirtual) {
++          const { item } = await getItem(targetPath, requestContext)
++          targetExists = Boolean(item)
++        }
++      } catch {
++        // 目标不存在或读取失败：交给 renameItem，真实错误由 writeFailure 归一
++      }
++      if (targetExists) {
++        return c.json(
++          { code: 403, message: `file [${cleanName}] exists`, data: null },
++          403,
++        )
++      }
++    }
+     await renameItem(actualOldPath, cleanName, requestContext)
+     return c.json({ code: 200, message: "success", data: null })
+   } catch (e: any) {
+diff --git a/src/backend/server/share.ts b/src/backend/server/share.ts
+index 2ad743d..71093e5 100644
+--- a/src/backend/server/share.ts
++++ b/src/backend/server/share.ts
+@@ -76,6 +76,14 @@ shareRouter.post("/create", async (c) => {
+     }
+   }
+ 
++  // P1-12：空 files / 缺 files 与 Go sharing.go:520-521 对齐，回 400 且不落库
++  if (files.length === 0) {
++    return c.json(
++      { code: 400, message: "must add at least 1 object", data: null },
++      400,
++    )
++  }
++
+   // 校验自定义 ID 格式
+   const rawId = body.id ? String(body.id).trim() : ""
+   if (rawId && !/^[a-zA-Z0-9_-]{1,64}$/.test(rawId)) {
+@@ -205,7 +213,12 @@ shareRouter.post("/delete", async (c) => {
+   const id = c.req.query("id") || ""
+   const db = await getDb(c.env)
+   if (!db.shares) db.shares = []
+-  db.shares = db.shares.filter((s: any) => s.id !== id)
++  const idx = db.shares.findIndex((s: any) => s.id === id)
++  // P1-12：删不存在的分享回 404（Go sharing.go:587），此前静默回 200
++  if (idx === -1) {
++    return c.json({ code: 404, message: "share not found", data: null }, 404)
++  }
++  db.shares.splice(idx, 1)
+   await saveDb(db, c.env)
+   return c.json({ code: 200, message: "success", data: null })
+ })

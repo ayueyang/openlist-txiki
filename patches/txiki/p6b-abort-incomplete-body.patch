@@ -1,0 +1,41 @@
+# p6b: incomplete-body close on a chunked PUT must error the JS body stream.
+#
+# base file: src/httpserver.c sha256
+#   1aa0dcb65a706c43a6e22c250dbc3b7ddfc1143bea6851c8828b30b960686c7b
+# after applying this patch:
+#   a4d74f27cce8bab00dcee743a6c900646cda73aa22fe32814a685db9b950f275
+#
+# Applies on the p6 tree: /home/admin/txiki-merged (txiki-js 26.9 @ a07d6aa
+# + s1a + s1b + p6-stream-body). The file there is CRLF, so the hunks carry CRLF.
+#   cd /home/admin/txiki-merged && patch -p1 < work/txiki-26.9/patches/p6b-abort-incomplete-body.patch
+#
+# What it does: in LWS_CALLBACK_CLOSED_HTTP, when a streaming request body did not
+# arrive in full, the JS body stream is errored for BOTH streaming_body and chunked
+# (the original only errored streaming_body and let chunked close normally). A
+# truncated chunked PUT therefore cannot be committed as a complete file: the
+# pipeBody catch runs target.abort(), the temp dir is removed, nothing is renamed.
+# Legal bodies are untouched: a chunked terminal 0-chunk sets body_complete before
+# this callback, and the empty-file upload still closes normally.
+#
+# One line of C, no JS/bundle change.
+diff -ruN a/src/httpserver.c b/src/httpserver.c
+--- a/src/httpserver.c	2026-10-24 09:23:30.659367467 +0800
++++ b/src/httpserver.c	2026-10-24 09:23:30.672073360 +0800
+@@ -1364,14 +1364,14 @@
+              * settle the JS stream. A Content-Length body that did not arrive
+              * in full is an error, not an end-of-stream: closing the stream
+              * normally would let the consumer store a truncated upload as a
+-             * complete file. The third argument tells JS to error the stream
+-             * (the chunked path keeps its historic close semantics). */
++             * complete file. Any incomplete streaming body is an error,
++             * chunked included: a truncated chunked PUT must not commit. */
+             if ((req->chunked || req->streaming_body) && !req->body_complete) {
+                 req->body_complete = true;
+                 JSValue cb_args[3];
+                 cb_args[0] = JS_NewInt64(s->ctx, req->id);
+                 cb_args[1] = JS_NULL;
+-                cb_args[2] = JS_NewBool(s->ctx, req->streaming_body);
++                cb_args[2] = JS_TRUE;
+                 tjs_call_handler(s->ctx, s->body_chunk_callback, 3, cb_args);
+                 JS_FreeValue(s->ctx, cb_args[0]);
+                 JS_FreeValue(s->ctx, cb_args[2]);

@@ -1,0 +1,24 @@
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -57,18 +57,15 @@
+  * 是否支持；OPTIONS 也只宣告 DAV:1。
+  */
+ const DAV_READONLY = new Set(["OPTIONS", "PROPFIND", "GET", "HEAD"])
+ const DAV_ALLOW = "OPTIONS, PROPFIND, GET, HEAD"
+ 
+ function davGate(req: Request): Response | null {
+-  let pathname = ""
+-  try {
+-    pathname = new URL(req.url).pathname
+-  } catch {
+-    return null
+-  }
++  // 与 apiReadonlyGate 共用 gatePath：解码百分号编码、合并重复斜杠、去尾斜杠。
++  // 用原始 pathname 判断会被 /d%61v、/dav%2F、//dav 这类变形绕过（B1）。
++  const pathname = gatePath(req)
+   if (pathname !== "/dav" && !pathname.startsWith("/dav/")) return null
+   if (req.method === "OPTIONS") {
+     return new Response(null, {
+       status: 200,
+       headers: { DAV: "1", Allow: DAV_ALLOW, "Content-Length": "0" },
+     })

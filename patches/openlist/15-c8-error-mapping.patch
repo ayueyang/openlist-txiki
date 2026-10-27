@@ -1,0 +1,253 @@
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -801,17 +801,44 @@
+ }
+ 
+ /**
+- * 写请求的错误映射：请求路径在虚拟文件系统里没有匹配到任何存储（含 `/w/../x`
+- * 这类被 resolvePath 折叠到虚拟根、只剩 `/x` 的路径）属于客户端路径错误，
+- * 必须回 4xx，不能把 HTTP 状态码留在 Hono 默认的 200 上。
+- * 其余错误（驱动 / IO / 权限之外的运行期故障）保持 500。
++ * File-Path 头按契约只解码一次；非法百分号转义（/w/%zz、/w/50%off.txt）会让
++ * decodeURIComponent 抛 URIError。这是客户端编码错误，回 400 而不是 500，
++ * 与 raw.ts 对同类路径的处理保持一致。
++ */
++function decodeFilePathHeader(c: any): { ok: true; path: string } | { ok: false } {
++  try {
++    return { ok: true, path: decodeURIComponent(c.req.header("File-Path") || "") }
++  } catch {
++    return { ok: false }
++  }
++}
++
++const badFilePath = (c: any) =>
++  c.json({ code: 400, message: "Invalid File-Path encoding", data: null }, 400)
++
++/**
++ * 「虚拟文件系统里没有匹配到任何存储」的判定：fs 写路由与 webdav 的源不存在
++ * 判定共用这一份实现，避免两处各写一种大小写写法、以后只改一处。
++ * 只认上游固定的 "failed get storage: storage not found" 文案；ENOENT 之类
++ * 的驱动错误不走这里。
++ */
++export function isStorageNotFoundError(e: unknown): boolean {
++  return /storage not found/i.test(safeErrorMessage(e))
++}
++
++/**
++ * 写请求的错误映射（只服务 /api/fs/* 的 7 个写路由；其余写端点维持上游 500）。
++ * 请求路径在虚拟文件系统里没有匹配到任何存储（含 `/w/../x` 这类被 resolvePath
++ * 折叠到虚拟根、只剩 `/x` 的路径）属于客户端路径错误，必须回 4xx，不能把 HTTP
++ * 状态码留在 Hono 默认的 200 上。其余错误（驱动 / IO / 权限之外的运行期故障）
++ * 保持 500。
+  *
+  * 选 404 的理由：路径规范化后确实不存在对应挂载点，与「Not Found」语义一致；
+  * 403 会让客户端误以为有权限问题并暴露路径校验分支。
+  */
+-function writeFailure(c: any, e: any) {
++function writeFailure(c: any, e: any): Response {
+   const message = safeErrorMessage(e)
+-  if (/storage not found/i.test(message)) {
++  if (isStorageNotFoundError(e)) {
+     return c.json({ code: 404, message, data: null }, 404)
+   }
+   return c.json({ code: 500, message, data: null })
+@@ -987,7 +1014,9 @@
+ fsRouter.put("/put", async (c) => {
+   const user = await getUserFromContext(c)
+   if (!canWrite(user)) return permissionDenied(c)
+-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
++  const pathHeader = decodeFilePathHeader(c)
++  if (!pathHeader.ok) return badFilePath(c)
++  const rawPath = pathHeader.path
+   if (!rawPath.trim()) {
+     return c.json(
+       { code: 400, message: "Missing File-Path header", data: null },
+@@ -1015,7 +1044,9 @@
+ fsRouter.put("/form", async (c) => {
+   const user = await getUserFromContext(c)
+   if (!canWrite(user)) return permissionDenied(c)
+-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
++  const pathHeader = decodeFilePathHeader(c)
++  if (!pathHeader.ok) return badFilePath(c)
++  const rawPath = pathHeader.path
+   if (!rawPath.trim()) {
+     return c.json(
+       { code: 400, message: "Missing File-Path header", data: null },
+@@ -1497,7 +1528,9 @@
+   const user = await getUserFromContext(c)
+   if (!user || !canWrite(user)) return permissionDenied(c)
+ 
+-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
++  const pathHeader = decodeFilePathHeader(c)
++  if (!pathHeader.ok) return badFilePath(c)
++  const rawPath = pathHeader.path
+   const size = parseInt(c.req.header("X-File-Size") || "0", 10)
+   const rawChunk = parseInt(c.req.header("X-Chunk-Size") || "0", 10)
+   const md5 = c.req.header("X-File-Md5") || ""
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -40,6 +40,7 @@
+ import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav/webdav"
+ import { safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
++import { isStorageNotFoundError } from "./fs"
+ 
+ /**
+  * WebDAV 协议服务（挂载于 /dav/*）。
+@@ -281,6 +282,43 @@
+     : ""
+ }
+ 
++/**
++ * 源路径不存在（只用于「源解析 / 首次驱动调用」这一层）。判据 code 优先；
++ * 驱动层 110 处「不存在」仍以文案表达（pkg/errs 的 OpenListError 在生产代码
++ * 零使用），所以这里保留一条文案兜底，且只允许出现在这里——深层 IO 的
++ * ENOENT 必须继续是 500。storage not found 与 fs.ts 写路由共用同一判定。
++ */
++function isSourceMissing(e: any): boolean {
++  const code = e?.code
++  if (code === "ENOENT" || code === "ENOTDIR") return true
++  if (code === 404 || code === 1004) return true
++  if (isStorageNotFoundError(e)) return true
++  return /not found/i.test(String(e?.message || ""))
++}
++
++class SourceMissingError extends Error {
++  constructor(original: any) {
++    super(String(original?.message || original))
++  }
++}
++
++/**
++ * 只包「源解析 / 首次驱动调用」：命中源不存在抛 SourceMissingError，外层 catch
++ * 统一回 404 "Not Found"；其余错误原样抛给外层 catch（仍是 500）。
++ * 用抛错而不是直接 return c.text：C7-8 的跨目录 MOVE 把 moveItems 包在 try 里，
++ * 补偿改名必须在错误冒泡前执行；直接返回 Response 会短路 catch，文件会停在
++ * 目标名上。
++ */
++async function sourceStep<T>(call: () => Promise<T>): Promise<T> {
++  try {
++    return await call()
++  } catch (e: any) {
++    if (!isSourceMissing(e)) throw e
++    console.error(`[dav] source missing: ${String(e?.message || e)}`)
++    throw new SourceMissingError(e)
++  }
++}
++
+ webdavRouter.all("/*", async (c) => {
+   const method = c.req.method.toUpperCase()
+ 
+@@ -351,8 +389,8 @@
+         // 的路径都落进「列目录」分支，被当成集合返回 207 + <d:collection/>，rclone
+         // 的上传、回读、改名、复制、单文件删除全被这一层挡住（见 progress.md）。
+         // 不存在的路径由驱动 get() 抛错（Local 的 ENOENT、云端的 not found），经
+-        // 外层 catch 的统一映射回 404；虚拟路径与存储根由 getItem 直接判为目录。
+-        const { item } = await getItem(actualPath, ctx)
++        // sourceStep 的统一映射回 404；虚拟路径与存储根由 getItem 直接判为目录。
++        const { item } = await sourceStep(() => getItem(actualPath, ctx))
+         if (!item) return c.text("Not found", 404)
+         const isFolder = !!item.is_dir
+         // Depth 0 只回自身；Depth 1（以及本实现不递归的 infinity）回自身加一层
+@@ -387,7 +425,7 @@
+         if (await deniedByMetaRead(c, user, actualPath, metaPassword)) {
+           return metaForbidden(c)
+         }
+-        const { item, rawUrl } = await getItem(actualPath, ctx)
++        const { item, rawUrl } = await sourceStep(() => getItem(actualPath, ctx))
+         if (!item) return c.text("Not found", 404)
+         if (item.is_dir) return c.text("Is a directory", 400)
+         // 重定向到 rawRouter 实际下载；rawRouter 已处理所有驱动的下载协议
+@@ -410,7 +448,7 @@
+           return metaForbidden(c)
+         }
+         const buffer = Buffer.from(await c.req.arrayBuffer())
+-        await putItem(actualPath, buffer, ctx)
++        await sourceStep(() => putItem(actualPath, buffer, ctx))
+         return c.body(null, 201)
+       }
+ 
+@@ -420,7 +458,7 @@
+         if (await deniedByMetaWrite(c, user, splitPath(actualPath).dir, true)) {
+           return metaForbidden(c)
+         }
+-        await makeDirectory(actualPath, ctx)
++        await sourceStep(() => makeDirectory(actualPath, ctx))
+         return c.body(null, 201)
+       }
+ 
+@@ -431,7 +469,7 @@
+           return metaForbidden(c)
+         }
+         const { dir, name } = splitPath(actualPath)
+-        await removeItems(dir, [name], ctx)
++        await sourceStep(() => removeItems(dir, [name], ctx))
+         return c.body(null, 204)
+       }
+ 
+@@ -462,14 +500,18 @@
+         // C7-6：同目录改名只调一次 renameItem，不走 moveItems——云端驱动的 move
+         // 是同 key 复制再删除，等于删掉自己（drivers/s3/driver.ts 231-249）。
+         if (src.dir === dst.dir) {
+-          if (renaming) await renameItem(actualPath, dst.name, ctx)
++          if (renaming) {
++            await sourceStep(() => renameItem(actualPath, dst.name, ctx))
++          }
+           return c.body(null, 201)
+         }
+         // C7-8：跨目录改名先在源目录改成目标名，再按目标名 move（单次驱动调用）；
+         // move 失败就补偿改回原名，补偿也失败时 500 报文给出真实落点。
+-        if (renaming) await renameItem(actualPath, dst.name, ctx)
++        if (renaming) await sourceStep(() => renameItem(actualPath, dst.name, ctx))
+         try {
+-          await moveItems(src.dir, dst.dir, [renaming ? dst.name : src.name], ctx)
++          await sourceStep(() =>
++            moveItems(src.dir, dst.dir, [renaming ? dst.name : src.name], ctx),
++          )
+         } catch (e: any) {
+           if (renaming) {
+             try {
+@@ -514,13 +556,15 @@
+         // 「copy 到 dst.dir/源名再改名」——同目录下那等于复制到自身再删源。
+         if (src.dir === dst.dir) {
+           if (renaming) {
+-            await copyItems(src.dir, dst.dir, [src.name], ctx, [dst.name])
++            await sourceStep(() =>
++              copyItems(src.dir, dst.dir, [src.name], ctx, [dst.name]),
++            )
+           }
+           return c.body(null, 201)
+         }
+         // C7-9：跨目录改名 COPY 仍是「复制到 dst.dir/源名 + 改名」两步；改名失败
+         // 不删副本（删了可能毁掉被覆盖的原文件），500 报文写明副本落点。
+-        await copyItems(src.dir, dst.dir, [src.name], ctx)
++        await sourceStep(() => copyItems(src.dir, dst.dir, [src.name], ctx))
+         if (renaming) {
+           try {
+             await renameItem(`${dst.dir}/${src.name}`, dst.name, ctx)
+@@ -543,20 +587,10 @@
+         return c.text("Method Not Allowed", 405)
+     }
+   } catch (e: any) {
+-    const msg = safeErrorMessage(e)
+-    // A10：驱动层「对象/路径不存在」要回 404。Local 驱动 rename/cp 对不存在的
+-    // 源抛 ENOENT（报文是 "ENOENT: no such file or directory, rename ..."，
+-    // 不含 "not found" 字样），此前落到 500。这里只补 ENOENT/ENOTDIR 两种
+-    // 明确的「不存在」错误；其它驱动/IO 故障仍是 500。
+-    // 注意：C7-8/C7-9 的补偿失败分支在 case 内直接 return 500，不经过本 catch。
+-    if (
+-      msg.includes("not found") ||
+-      msg.includes("storage not found") ||
+-      msg.includes("ENOENT") ||
+-      msg.includes("ENOTDIR")
+-    ) {
+-      return c.text("Not Found", 404)
+-    }
+-    return c.text(msg, 500)
++    // C8：404 只能从 sourceStep（首次驱动调用判定源不存在）出来；深层 IO 的
++    // ENOENT/ENOTDIR 与 "... not found" 文案一律按原样回 500，报文仍经
++    // safeErrorMessage 输出。A10 四形态走 fs.ts 的 writeFailure，不经这里。
++    if (e instanceof SourceMissingError) return c.text("Not Found", 404)
++    return c.text(safeErrorMessage(e), 500)
+   }
+ })

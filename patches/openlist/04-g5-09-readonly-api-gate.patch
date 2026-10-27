@@ -1,0 +1,73 @@
+diff --git a/src/backend/txiki/entry.ts b/src/backend/txiki/entry.ts
+index 20831fe..1077e71 100644
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -82,8 +82,67 @@ function davGate(req: Request): Response | null {
+   return null
+ }
+ 
++/**
++ * P1 只读模式的 API 写门（conductor 2026-10-20 17:08 裁决，G5-09）。
++ *
++ * /dav 由上面的 davGate 按方法白名单拦；这里补 API 侧两条已实测能落盘的写路由：
++ *   - PUT /api/fs/put：fs.ts 的上传入口，直接 putItem 写盘
++ *   - /s3/* 的写方法：S3 网关的 PutObject / DeleteObject
++ *
++ * 只拦入口，不改上游业务代码，也不依赖上游权限位。选 403 不选 405：路由和
++ * 方法本身都存在，是部署形态（P1 只读）拒绝执行；S3 客户端对 AccessDenied
++ * 的处理也最直接。
++ *
++ * 注意：/api/fs/form（multipart 上传）、/api/fs/multipart/chunk 以及
++ * /api/fs/{mkdir,rename,remove,move,copy} 不在此次裁决的点名范围内，未拦，
++ * 已记在 progress.md 待 conductor 决定。
++ */
++const READONLY_MESSAGE = "read-only deployment: write operations are disabled in P1"
++const S3_WRITE_METHODS = new Set(["PUT", "POST", "PATCH", "DELETE"])
++
++/**
++ * 归一化 pathname：能解码就解码（防 %2F 绕过），合并重复斜杠、去掉末尾斜杠。
++ * 只用于入口判定，不改变转发给 Hono 的原始请求。
++ */
++function gatePath(req: Request): string {
++  let p = ""
++  try {
++    p = new URL(req.url).pathname
++  } catch {
++    return ""
++  }
++  try {
++    p = decodeURIComponent(p)
++  } catch {
++    // 非法百分号编码保持原样
++  }
++  return p.replace(/\/{2,}/g, "/").replace(/\/+$/, "") || "/"
++}
++
++function apiReadonlyGate(req: Request): Response | null {
++  const pathname = gatePath(req)
++  if (!pathname) return null
++  if (req.method === "PUT" && pathname === "/api/fs/put") {
++    return new Response(
++      JSON.stringify({ code: 403, message: READONLY_MESSAGE, data: null }),
++      { status: 403, headers: { "Content-Type": "application/json" } },
++    )
++  }
++  if (
++    (pathname === "/s3" || pathname.startsWith("/s3/")) &&
++    S3_WRITE_METHODS.has(req.method)
++  ) {
++    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code><Message>${READONLY_MESSAGE}</Message></Error>`
++    return new Response(xml, {
++      status: 403,
++      headers: { "Content-Type": "application/xml", "x-amz-request-id": "-" },
++    })
++  }
++  return null
++}
++
+ async function handle(req: Request): Promise<Response> {
+-  const blocked = davGate(req)
++  const blocked = davGate(req) || apiReadonlyGate(req)
+   if (blocked) return blocked
+   return app.fetch(req, env, ctx as any)
+ }
