@@ -25,7 +25,7 @@
 
 - **默认只监听 `127.0.0.1:5345`**。要在局域网用，改 `/etc/openlist-txiki/openlist-txiki.env` 的 `LISTEN_ADDR` 后重启服务，同时换掉初始口令。
 - **包内不含前端 SPA**，只有 API 和 WebDAV；要用网页界面得自己构建前端并另行部署。
-- **档一**：单用户、本机自用定位。对外多用户分发未做合规收口前不建议。
+- **分发**：按公开分发口径发布（AGPL-3.0）；每个 Release 附源码包与 `SOURCE-OFFER`，许可证全文随包。
 - 天翼云盘 189 目前不通：驱动请求拿到的是 200 页面而非登录跳转，属上游风控，不是移植缺陷。
 - 归档重建（从零 clone 上游再打补丁）需要把树放在同一绝对路径，因为 tjs 源码路径会进二进制；细节见 `docs/BUILD.md`。
 
@@ -57,7 +57,7 @@ tjs run openlist-txiki.js
 
 ## 从源码构建
 
-见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、20 个应用补丁、6 个 tjs 补丁、构建脚本与校验方式都在仓库里。
+见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、21 个应用补丁、6 个 tjs 补丁、构建脚本与校验方式都在仓库里。
 
 ## 许可证
 

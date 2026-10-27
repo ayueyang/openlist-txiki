@@ -4,7 +4,7 @@
 
 - 应用：**OpenListTeam/OpenList-Worker**，许可证 AGPL-3.0
   固定基线 commit：`5f53f58dd0f5e5d03eb6079da7f637fa151d8dca`
-  应用补丁：20 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）
+  应用补丁：21 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）
 - 运行时：**qwtel/txiki-js** fork（txiki.js 26.9.0），许可证 MIT
   tjs 侧补丁：6 个，见 `patches/txiki/`
 

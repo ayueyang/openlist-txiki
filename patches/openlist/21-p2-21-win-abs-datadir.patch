@@ -1,0 +1,46 @@
+diff --git a/src/backend/txiki/config.ts b/src/backend/txiki/config.ts
+index da1fec4..4bf8986 100644
+--- a/src/backend/txiki/config.ts
++++ b/src/backend/txiki/config.ts
+@@ -34,6 +34,29 @@ const DEFAULTS = {
+   readonly: true,
+ }
+ 
++// 绝对路径判定。POSIX 只认 "/"（与 r13 逐字符相同）；Windows 另认盘符与 UNC：
++// "X:/"、"X:\"、"\\server\share"（UNC 两种写法都以两个反斜杠开头）。
++function isAbsolutePath(p: string, windows: boolean): boolean {
++  if (p.startsWith("/")) return true
++  if (!windows) return false
++  if (/^[A-Za-z]:[\\/]/.test(p)) return true
++  if (p.startsWith("\\\\")) return true
++  return false
++}
++
++function isWindowsEnv(env: Record<string, string>): boolean {
++  return env.OS === "Windows_NT"
++}
++
++// 默认数据目录：Windows 用 %LOCALAPPDATA%\openlist-txiki；LOCALAPPDATA 为空时退回
++// 当前目录（不猜别的盘）。其它平台保持 /etc/openlist-txiki 一字不改。
++function defaultDataDir(env: Record<string, string>): string {
++  if (!isWindowsEnv(env)) return DEFAULTS.dataDir
++  const base = (env.LOCALAPPDATA || "").replace(/[\/]+$/, "")
++  if (base) return `${base}\\openlist-txiki`
++  return (tjs as any).cwd || "."
++}
++
+ export function loadConfig(): TxikiConfig {
+   const env = (tjs.env || {}) as Record<string, string>
+   let file: Record<string, any> = {}
+@@ -53,9 +76,9 @@ export function loadConfig(): TxikiConfig {
+     return f === undefined || f === null ? "" : String(f)
+   }
+ 
+-  const dataDir = pick("dataDir", "TJS_DATA_DIR") || DEFAULTS.dataDir
++  const dataDir = pick("dataDir", "TJS_DATA_DIR") || defaultDataDir(env)
+   let dbPath = pick("dbPath", "TJS_DB") || `${dataDir}/data.db`
+-  if (!dbPath.startsWith("/")) dbPath = `${dataDir}/${dbPath}`
++  if (!isAbsolutePath(dbPath, isWindowsEnv(env))) dbPath = `${dataDir}/${dbPath}`
+ 
+   const portRaw = pick("port", "TJS_PORT")
+   const port = portRaw ? Number(portRaw) : DEFAULTS.port

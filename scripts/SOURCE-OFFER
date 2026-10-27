@@ -1,74 +1,58 @@
-openlist-txiki 对应源码获取声明（AGPL-3.0 §13 书面要约）
-=========================================================
+openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
+================================================================
+
+包名与版本：openlist-txiki 0.1.0-r16（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
 
 本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js），
-按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本声明分两档，
-按实际分发范围对号入座；当前包按档一（本机自用）分发。
+按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本包按对外分发口径发布。
 
-一、档一：本机自用（当前档，不对第三方分发）
-不触发 AGPL §13 的对外义务。为了审计与将来升级，完整源码快照保存在分发者本机：
+一、源码归档（对外可达地址）
 
-  归档：dist-src/openlist-txiki-source-0.1.0-r3.tar.gz
-  sha256：dd94d9a071fc63cb634fb12801713a28f5e151379569ccdb13885d49090961f8
-  字节：161173621
+  归档文件名：openlist-txiki-source-0.1.0-r16.tar.gz
+  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r16/openlist-txiki-source-0.1.0-r16.tar.gz
+  sha256 与字节数：见同目录 build-manifest.json 的 source_archive_sha256 / source_archive_bytes
+  （打包时现算，与归档文件逐字节一致）。
 
-归档内容（缺一不可）：
-1. 上游 OpenListTeam/OpenList-Worker 在 commit
-   5f53f58dd0f5e5d03eb6079da7f637fa151d8dca 的完整树，含 .git 与 pnpm-lock.yaml；
-2. 本项目对该上游的 16 个补丁文件本体（名称、顺序与 sha256 见
-   work/p2-source-manifest.txt 与包内 build-manifest.json 的 patches）；
-3. 适配层 src/backend/txiki/ 全部源码；
-4. 构建入口 work/build-txiki.mjs、源码指纹清单 work/p2-source-manifest.txt、REBUILD.md；
-5. 运行时 txiki.js 26.9 完整源码树 work/txiki-26.9/（含依赖源码与构建脚本），
-   以及 mbedtls 3.6.6 的 TLS1.2 PSS 窄修复补丁
-   work/txiki-26.9/patches/mbedtls-tls12-pss.patch
-   （sha256 cd1d269777facec3a07c3b0549c451c4b9d8278b8e4593e50fd9da85adbdae98）；
-   另加流式 body 中断修复补丁
-   work/txiki-26.9/patches/p6b-abort-incomplete-body.patch
-   （sha256 893c647e7d09aa6c8b2aff95ef7a84a5029f5a9bbfbd7c29fe9bb3ace28aafe1，2,444 B）。
+  归档内容（缺一不可）：
+  1. 上游 OpenListTeam/OpenList-Worker 在 commit
+     5f53f58dd0f5e5d03eb6079da7f637fa151d8dca 的完整树（CRLF 工作区，含浅克隆 .git
+     与 pnpm-lock.yaml，不含 node_modules）；
+  2. 本项目对该上游的 21 个补丁（顺序、sha256 见 work/p2-source-manifest.txt 与包内
+     build-manifest.json 的 patches；本体在 patches/openlist/01..21 与 work/）；
+  3. 适配层 src/backend/txiki/ 全部源码；
+  4. 构建入口 build/build-txiki.mjs、源码指纹清单 build/p2-source-manifest.txt、
+     构建说明 docs/BUILD.md；
+  5. 打包脚本与生命周期钩子 scripts/（apk 打包用）。
 
-归档不进 git（体积原因），随分发介质提供，或按下面的书面请求提供。
-书面请求请联系：84396@163.com（注明包版本，见 build-manifest.json 的 package_version）。
+  重建口径：按 docs/BUILD.md 第 1 节从零重建，得到与包内逐字节相同的
+  bundle（2,019,788 B，sha256
+  6b3e679f57f97f4d5638efda1f506dc673c201cf594bdaa87cf8807477597908，inputs 437）。
+  预检对 21 个补丁 sha256、32 条源码指纹、注释头与行尾规则逐项 fail-closed，
+  任何不符即中止、不出包。
 
-0.1.0-r4 与上述归档的差异：只改 scripts/apk 下的 init、post-install、post-upgrade
-与 env 模板（B1 启动前 admin 自检），bundle 与 tjs 逐字节未变；这四个脚本的源码在
-仓库对应提交里，重打源码归档时一并纳入。
+二、运行时 txiki.js 源码位置
 
-0.1.0-r5 与 r4 的差异：只改 init 的 marker 守卫（data.db 缺失、≤4096 B 或无
-SQLite 头时删 .admin-ready 并重新 probe）与 env 模板注释，bundle 与 tjs 逐字节未变。
+  tjs 由 txiki.js fork 编出：上游 https://github.com/qwtel/txiki-js ，
+  基线 commit a07d6aa19553a61d088bbfbd7ac2ae204d2761a6（v26.9.0），
+  加本项目运行期补丁 patches/txiki/*.patch（p6 流式 body、p6b 断连补全、
+  mbedtls TLS1.2 PSS、lws/mbedtls ALPN UAF、mbedtls QUIC、WAMR、libffi）。
+  构建命令与实测限制见 docs/BUILD.md 第 2 节；该节的「从空树编出同 sha」一项
+  如实标注为未验证（构建路径会进二进制）。运行期完整源码树与构建记录可经下面的
+  联系方式书面索取。
 
-0.1.0-r6 至 r11 与上述归档的差异：bundle 随第 6–20 号补丁变化，当前为
-4a7e3b7e01244b9264c2574d31a6325d838159fafe3554c54cd6755087eea732
-（2,019,512 B，inputs 437）；tjs 在本版新增 p6b 一行修
-（work/txiki-26.9/patches/p6b-abort-incomplete-body.patch，见第一节第 5 条），
-当前 tjs 为 6db0cfcea90f4cff6ed3ff19030f35995afc90fc95fb114aa63347fb2393f746。
-源码归档仍是 r3 版本，待下次源码冻结时重打；逐版改动见仓库 artifacts/p3-*、
-artifacts/p4-*、artifacts/p5-* 的 README 与 REBUILD.md。
-档一（本机自用）状态不变，不对第三方分发。
+三、要约有效期与联系方式
 
-二、档二：对外分发（给朋友、放网盘、公开发布，任一即触发）
-对外分发前必须补齐三条，缺一不得分发：
-1. 可达地址：一个 HTTPS 或 git 地址，指向包含第一节清单全部内容的源码包；
-2. 真实联系人：在下面写明对外联系人邮箱（当前可用 84396@163.com）；
-3. 有效期：自最后一次分发起 ≥3 年，写明起算日。
-三条齐了才在本节末尾追加「对外分发生效：地址 / 联系人 / 起算日」，再重新出包。
-当前没有公开仓库地址，也没有对外发布位置，所以本包按档一分发，
-不得上传公开下载点或转给第三方；要转，先把本节填完。
+  有效期：自 2026-10-28 起至 2029-10-28（3 年）。
+  联系人：84396@163.com（注明包版本，见 build-manifest.json 的 package_version）。
 
-三、重建与获取方式的可检验性
-按归档内 REBUILD.md 的六步，可以从空目录重建出与包内字节相同的 bundle，
-最后一步是与 4a7e3b7e01244b9264c2574d31a6325d838159fafe3554c54cd6755087eea732
-比对。构建入口是 work/build-txiki.mjs；预检对 16 个补丁 sha256、28 条源码指纹、
-注释头与行尾规则逐项 fail-closed，任何不符即中止、不出包。
-「文案齐全但重建不出来」按未履约处理。
+四、组件来源与许可
 
-四、组件来源
-- tjs 26.9：源码与构建脚本在归档 work/txiki-26.9/；本项目只加 mbedtls PSS 补丁
-  （见第一节第 5 条），其余为上游原样。
+- OpenList-Worker 5f53f58：AGPL-3.0，许可证全文见同目录 LICENSE.AGPL-3.0。
+- tjs 26.9（txiki.js fork）：MIT；WAMR 与 mbedtls：Apache-2.0；
+  许可证全文见同目录 LICENSE.Apache-2.0 / LICENSE.MIT。
 - openpgp 6.3.1：bundle 内未修改依赖，LGPL-3.0-or-later，
   上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 ，全文见 LICENSE.LGPL-3.0。
-- WAMR 与 mbedtls：Apache-2.0，许可证全文见同目录 LICENSE.Apache-2.0。
+- 第三方组件清单见同目录 THIRD-PARTY-NOTICES。
 
 分发者：openlist-txiki 维护者（个人开发者，非公司）
-联系邮箱：84396@163.com
-声明日期：2026-10-22
+声明日期：2026-10-28

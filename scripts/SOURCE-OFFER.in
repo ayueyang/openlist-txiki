@@ -1,0 +1,58 @@
+openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
+================================================================
+
+包名与版本：openlist-txiki @@VERSION@@（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
+
+本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js），
+按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本包按对外分发口径发布。
+
+一、源码归档（对外可达地址）
+
+  归档文件名：@@SRC_ARCHIVE@@
+  下载地址：@@SRC_URL@@
+  sha256 与字节数：见同目录 build-manifest.json 的 source_archive_sha256 / source_archive_bytes
+  （打包时现算，与归档文件逐字节一致）。
+
+  归档内容（缺一不可）：
+  1. 上游 OpenListTeam/OpenList-Worker 在 commit
+     5f53f58dd0f5e5d03eb6079da7f637fa151d8dca 的完整树（CRLF 工作区，含浅克隆 .git
+     与 pnpm-lock.yaml，不含 node_modules）；
+  2. 本项目对该上游的 21 个补丁（顺序、sha256 见 work/p2-source-manifest.txt 与包内
+     build-manifest.json 的 patches；本体在 patches/openlist/01..21 与 work/）；
+  3. 适配层 src/backend/txiki/ 全部源码；
+  4. 构建入口 build/build-txiki.mjs、源码指纹清单 build/p2-source-manifest.txt、
+     构建说明 docs/BUILD.md；
+  5. 打包脚本与生命周期钩子 scripts/（apk 打包用）。
+
+  重建口径：按 docs/BUILD.md 第 1 节从零重建，得到与包内逐字节相同的
+  bundle（2,019,788 B，sha256
+  6b3e679f57f97f4d5638efda1f506dc673c201cf594bdaa87cf8807477597908，inputs 437）。
+  预检对 21 个补丁 sha256、32 条源码指纹、注释头与行尾规则逐项 fail-closed，
+  任何不符即中止、不出包。
+
+二、运行时 txiki.js 源码位置
+
+  tjs 由 txiki.js fork 编出：上游 https://github.com/qwtel/txiki-js ，
+  基线 commit a07d6aa19553a61d088bbfbd7ac2ae204d2761a6（v26.9.0），
+  加本项目运行期补丁 patches/txiki/*.patch（p6 流式 body、p6b 断连补全、
+  mbedtls TLS1.2 PSS、lws/mbedtls ALPN UAF、mbedtls QUIC、WAMR、libffi）。
+  构建命令与实测限制见 docs/BUILD.md 第 2 节；该节的「从空树编出同 sha」一项
+  如实标注为未验证（构建路径会进二进制）。运行期完整源码树与构建记录可经下面的
+  联系方式书面索取。
+
+三、要约有效期与联系方式
+
+  有效期：自 2026-10-28 起至 2029-10-28（3 年）。
+  联系人：84396@163.com（注明包版本，见 build-manifest.json 的 package_version）。
+
+四、组件来源与许可
+
+- OpenList-Worker 5f53f58：AGPL-3.0，许可证全文见同目录 LICENSE.AGPL-3.0。
+- tjs 26.9（txiki.js fork）：MIT；WAMR 与 mbedtls：Apache-2.0；
+  许可证全文见同目录 LICENSE.Apache-2.0 / LICENSE.MIT。
+- openpgp 6.3.1：bundle 内未修改依赖，LGPL-3.0-or-later，
+  上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 ，全文见 LICENSE.LGPL-3.0。
+- 第三方组件清单见同目录 THIRD-PARTY-NOTICES。
+
+分发者：openlist-txiki 维护者（个人开发者，非公司）
+声明日期：2026-10-28

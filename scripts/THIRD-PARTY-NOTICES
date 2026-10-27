@@ -7,8 +7,8 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
    上游基线 commit：5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
    修改范围与逐条补丁 sha256 见同目录 build-manifest.json 的 patches 数组
-   （16 个补丁，按序 apply）。许可证全文见 LICENSE.AGPL-3.0。
-   对应源码获取方式见 SOURCE-OFFER（分「本机自用 / 对外分发」两档）。
+   （21 个补丁，按序 apply）。许可证全文见 LICENSE.AGPL-3.0。
+   对应源码获取方式见 SOURCE-OFFER。
 
 2. openpgp 6.3.1（LGPL-3.0-or-later）
    本包 bundle 内包含 openpgp 6.3.1（未修改），
