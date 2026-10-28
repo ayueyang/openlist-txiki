@@ -32,7 +32,7 @@
 ## 安装（OpenWrt，aarch64）
 
 ```sh
-apk add ./openlist-txiki-<版本>-aarch64.apk
+apk add --allow-untrusted ./openlist-txiki-<版本>.apk
 cat /etc/openlist-txiki/admin.pass          # 初始管理员口令，权限 600
 /etc/init.d/openlist-txiki start
 curl -s http://127.0.0.1:5345/api/public/settings
@@ -41,7 +41,7 @@ curl -s http://127.0.0.1:5345/api/public/settings
 升级与卸载：
 
 ```sh
-apk add --upgrade ./openlist-txiki-<新版本>.apk
+apk add --allow-untrusted --upgrade ./openlist-txiki-<新版本>.apk
 apk del openlist-txiki                       # 数据目录 /etc/openlist-txiki 保留
 ```
 

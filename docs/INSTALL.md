@@ -3,7 +3,7 @@
 ## 一、OpenWrt apk（aarch64）
 
 ```sh
-apk add ./openlist-txiki-<版本>-aarch64.apk
+apk add --allow-untrusted ./openlist-txiki-<版本>.apk
 ```
 
 安装后：
@@ -15,7 +15,7 @@ apk add ./openlist-txiki-<版本>-aarch64.apk
 | `/etc/openlist-txiki/openlist-txiki.env` | 运行参数模板（首次安装时复制） |
 | `/etc/openlist-txiki/admin.pass` | 初始管理员口令，`0600 root:root` |
 | `/etc/openlist-txiki/data.db` | SQLite 数据库 |
-| `/etc/openlist-txiki/rollback/` | 升级回滚备份 |
+| `/etc/openlist-txiki/rollback/` | 升级前留下的旧二进制与 `build-manifest.json`（数据库备份不在这里） |
 
 首次启动：
 
@@ -61,6 +61,6 @@ Windows 下建议写成 `.ps1` 或 `.cmd` 包装脚本，把上述变量设好�
 ## 三、注意事项
 
 - 数据目录必须可写，`data.db` 旁边会生成 `-wal` / `-shm`。
-- 升级 apk 不会覆盖你改过的 `openlist-txiki.env`，但会替换 bundle 与 tjs；升级前会自动备份数据库到 `rollback/`。
+- 升级 apk 不会覆盖你改过的 `openlist-txiki.env`，但会替换 bundle 与 tjs。升级前的备份分两处：数据库备份在 `/etc/openlist-txiki/data.db.bak-<旧版本>`（`-wal`、`-shm` 成套备份，主文件超过 32 MiB 时跳过不备份）；旧 `tjs`、旧 bundle 与 `build-manifest.json` 在 `/etc/openlist-txiki/rollback/<旧版本>/`。两处默认都只留最近一份。
 - 卸载（`apk del`）不会删除 `/etc/openlist-txiki`，数据还在；要清干净得手动删目录。
 - 断电可能丢失最近数秒的配置写入（SQLite `synchronous=NORMAL`），数据库本身不会损坏；如需更强保证，可自行改 `DB_SYNC=FULL`（写放大明显）。
