@@ -1,0 +1,99 @@
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 828d213..873f84e 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -723,6 +723,18 @@ fsRouter.post("/get", async (c) => {
+       sign && rawUrl && !/[?&]sign=/.test(rawUrl)
+         ? `${rawUrl}${rawUrl.includes("?") ? "&" : "?"}sign=${sign}`
+         : rawUrl
++    // txiki（r19 F5 A）：/fs/get 的 raw_url 必须是绝对 URL，对齐 Go
++    // server/handles/fsread.go:326-327：
++    //   rawURL = fmt.Sprintf("%s/p%s%s", common.GetApiUrl(c), ..., query)
++    // getItem 给的是 /api/p、/api/d、/api/sd 开头的相对路径；origin 只从
++    // c.req.url 取（tjs.serve 下它已是绝对 URL，origin 由 Host 头推出）。
++    // 只做字符串前缀拼接：encodeDownloadPath 产出的 %xx 逐字保留，不二次
++    // 编码/解码；sign 仍以 query 形式追加。不引入 env.__requestOrigin，
++    // 也不改 storage.ts；/fs/link 与 /api/sd 保持相对。
++    const origin = new URL(c.req.url).origin
++    const rawUrlAbsolute = rawUrlWithSign.startsWith("/")
++      ? `${origin}${rawUrlWithSign}`
++      : rawUrlWithSign
+     // P1-19（X2）：文件的可写性取决于它所在目录。与 put 按 parentPath 判
+     // 保持同一谓词，否则会出现「get 说 write=true、put 却被父目录白名单拒」。
+     const writable =
+@@ -778,7 +790,7 @@ fsRouter.post("/get", async (c) => {
+         sign,
+         thumb: (item as any).thumb || "",
+         type: item.type ?? 0,
+-        raw_url: rawUrlWithSign,
++        raw_url: rawUrlAbsolute,
+         readme: getReadme(meta, reqPath),
+         header: getHeader(meta, reqPath),
+         provider,
+diff --git a/src/backend/server/fs_get_rawurl_sign.test.ts b/src/backend/server/fs_get_rawurl_sign.test.ts
+index 52699c0..9740513 100644
+--- a/src/backend/server/fs_get_rawurl_sign.test.ts
++++ b/src/backend/server/fs_get_rawurl_sign.test.ts
+@@ -96,10 +96,14 @@ test("fs/get: raw_url 自带签名，且该签名能通过 /p 验签（Issue #66
+   assert.equal(body.code, 200, `fs/get failed: ${JSON.stringify(body)}`)
+ 
+   const rawUrl: string = body.data.raw_url
++  // r19 F5（A）：/fs/get 的 raw_url 是绝对 URL（origin + 原相对路径），
++  // 对齐 Go common.GetApiUrl 拼前缀。app.request 的请求 URL 是
++  // http://localhost/…，所以期望同源；端点前缀与编码语义不变。
+   assert.ok(
+-    rawUrl.startsWith("/api/p/local/a.exe"),
+-    `raw_url should stay a proxy url, got ${rawUrl}`,
++    rawUrl.startsWith("http://localhost/api/p/local/a.exe"),
++    `raw_url should be an absolute proxy url, got ${rawUrl}`,
+   )
++  assert.equal(new URL(rawUrl).origin, "http://localhost")
+   // 缺这一条就是 bug 本体：前端直接跳 raw_url，服务器却没拿到签名
+   assert.ok(
+     /[?&]sign=/.test(rawUrl),
+@@ -131,10 +135,11 @@ test("fs/get: 不需要签名时不追加 sign（保持公开直链语义）", a
+   const body: any = await res.json()
+   assert.equal(body.code, 200)
+   assert.equal(body.data.sign, "")
++  // 不签名时仍是「裸」下载地址，但同样带 origin（绝对形态）
+   assert.equal(
+     body.data.raw_url,
+-    "/api/p/local/a.exe",
+-    "public path keeps a bare proxy url",
++    "http://localhost/api/p/local/a.exe",
++    "public path keeps a bare absolute proxy url",
+   )
+ })
+ 
+diff --git a/src/backend/server/sign_go_parity.test.ts b/src/backend/server/sign_go_parity.test.ts
+index d093337..9aac078 100644
+--- a/src/backend/server/sign_go_parity.test.ts
++++ b/src/backend/server/sign_go_parity.test.ts
+@@ -123,10 +123,25 @@ test("fs/get：raw_url 编码后，含 % / # / 中文 的文件名不再被截
+     const body: any = await res.json()
+     assert.equal(body.code, 200, `${name}: ${JSON.stringify(body)}`)
+     const rawUrl: string = body.data.raw_url
+-    assert.ok(
+-      rawUrl.startsWith("/api/p" + encodeDownloadPath(`/local/${name}`)),
++    // r19 F5（A）：raw_url 现在是绝对 URL（origin 取自 c.req.url，测试里
++    // 是 http://localhost）；路径部分仍必须逐字等于 encodeDownloadPath
++    // 的产物（%xx 不二次编码），且 sign 仍在 query 里。
++    const expectedPath = "/api/p" + encodeDownloadPath(`/local/${name}`)
++    const parsedRawUrl = new URL(rawUrl)
++    assert.equal(
++      parsedRawUrl.origin,
++      "http://localhost",
++      `${name}: raw_url origin -> ${rawUrl}`,
++    )
++    assert.equal(
++      parsedRawUrl.pathname,
++      expectedPath,
+       `${name}: raw_url not encoded -> ${rawUrl}`,
+     )
++    assert.ok(
++      /[?&]sign=/.test(parsedRawUrl.search),
++      `${name}: raw_url missing sign -> ${rawUrl}`,
++    )
+     // 关键：这个 http 请求过去会抛 URIError（裸 %）或被 ? 截断成另一个路径
+     const hit = await app.request(rawUrl, { method: "GET" })
+     assert.notEqual(hit.status, 401, `${name}: raw_url rejected -> ${hit.status}`)

@@ -1,24 +1,27 @@
 openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 ================================================================
 
-包名与版本：openlist-txiki 0.1.0-r18（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
+包名与版本：openlist-txiki 0.1.0-r19（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
 
 本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js），
 按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本包按对外分发口径发布。
 
 一、源码归档（对外可达地址）
 
-  归档文件名：openlist-txiki-source-0.1.0-r18.tar.gz
-  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r18/openlist-txiki-source-0.1.0-r18.tar.gz
-  sha256 与字节数：见同目录 build-manifest.json 的 source_archive_sha256 / source_archive_bytes
-  （打包时现算，与归档文件逐字节一致）。
+  归档文件名：openlist-txiki-source-0.1.0-r19.tar.gz
+  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r19/openlist-txiki-source-0.1.0-r19.tar.gz
+  sha256 与字节数：apk 包内 build-manifest.json 有 source_archive_sha256 / source_archive_bytes
+  （打包时现算，与归档文件逐字节一致）。两个二进制归档（Linux tar / Windows zip）内不含该
+  文件；要核源码归档的 sha256 与字节数，看 Release 页 SHA256SUMS.txt（列有该归档一行），
+  补丁表看公开仓 build/p2-source-manifest.txt。
 
   归档内容（缺一不可）：
   1. 上游 OpenListTeam/OpenList-Worker 在 commit
      5f53f58dd0f5e5d03eb6079da7f637fa151d8dca 的完整树（CRLF 工作区，含浅克隆 .git
      与 pnpm-lock.yaml，不含 node_modules）；
-  2. 本项目对该上游的 21 个补丁（顺序、sha256 见 work/p2-source-manifest.txt 与包内
-     build-manifest.json 的 patches；本体在 patches/openlist/01..21 与 work/）；
+  2. 本项目对该上游的 22 个补丁（顺序、sha256 见 work/p2-source-manifest.txt；apk 包内
+     build-manifest.json 的 patches 数组同源，两个二进制归档内不含该文件；补丁本体在
+     patches/openlist/01..22 与 work/）；
   3. 适配层 src/backend/txiki/ 全部源码；
   4. 构建入口 build/build-txiki.mjs、源码指纹清单 build/p2-source-manifest.txt、
      构建说明 docs/BUILD.md；
@@ -30,10 +33,10 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
      渲染模板；发布流水线用的 pack.sh 不在归档内（只做本仓发布编排，与重建无关），
      需要时可按第三节联系方式书面索取。
 
-  重建口径：按 docs/BUILD.md 第 1 节从零重建，得到与包内逐字节相同的
-  bundle（2,019,788 B，sha256
-  6b3e679f57f97f4d5638efda1f506dc673c201cf594bdaa87cf8807477597908，inputs 437）。
-  预检对 21 个补丁 sha256、32 条源码指纹、注释头与行尾规则逐项 fail-closed，
+  重建口径：按 docs/BUILD.md 第 1 节从零重建，得到与发布包逐字节相同的
+  bundle（字节数与 sha256 见 apk 包内 build-manifest.json 的 bundle_bytes / bundle_sha256，
+  inputs_count 同处；两个二进制归档内不含该文件）。
+  预检对 22 个补丁 sha256、32 条源码指纹、注释头与行尾规则逐项 fail-closed，
   任何不符即中止、不出包。
 
 二、运行时 txiki.js 源码位置
@@ -49,15 +52,19 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 三、要约有效期与联系方式
 
   有效期：自 2026-10-28 起至 2029-10-28（3 年）。
-  联系人：84396@163.com（注明包版本，见 build-manifest.json 的 package_version）。
+  联系人：84396@163.com（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
+  两个二进制归档内不含该文件，也可从 Release 页文件名读取）。
 
 四、组件来源与许可
 
-- OpenList-Worker 5f53f58：AGPL-3.0，许可证全文见同目录 LICENSE.AGPL-3.0。
+- OpenList-Worker 5f53f58：AGPL-3.0，许可证全文见 LICENSE.AGPL-3.0（apk 内与本文同目录，
+  源码归档内为根目录 licenses/LICENSE.AGPL-3.0）。
 - tjs 26.9（txiki.js fork）：MIT；WAMR 与 mbedtls：Apache-2.0；
-  许可证全文见同目录 LICENSE.Apache-2.0 / LICENSE.MIT。
+  许可证全文见 LICENSE.Apache-2.0 / LICENSE.MIT（apk 内与本文同目录，
+  源码归档内为 licenses/LICENSE.Apache-2.0 / licenses/LICENSE.MIT）。
 - openpgp 6.3.1：bundle 内未修改依赖，LGPL-3.0-or-later，
-  上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 ，全文见 LICENSE.LGPL-3.0。
+  上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 ；全文见 LICENSE.LGPL-3.0
+  （apk 内与本文同目录，源码归档内为 licenses/LICENSE.LGPL-3.0）。
 - 第三方组件清单见同目录 THIRD-PARTY-NOTICES。
 
 分发者：openlist-txiki 维护者（个人开发者，非公司）

@@ -21,7 +21,7 @@ fail-closed（任一成立即 rc=1，且不留下 zip/tar）：
 两个声明都要在同一件归档内成立。
 
 用法：
-  python3 build/make-archives.py --version 0.1.0-r18 \\
+  python3 build/make-archives.py --version 0.1.0-r19 \\
       --release-dir artifacts/release-r18-HHMM \\
       --bin-dir artifacts/release-r18-HHMM/bin \\
       --legal-dir scripts/apk \\

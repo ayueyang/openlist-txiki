@@ -57,7 +57,7 @@ tjs run openlist-txiki.js
 
 ## 从源码构建
 
-见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、21 个应用补丁、7 个 tjs 补丁（其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
+见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、22 个应用补丁、7 个 tjs 补丁（其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
 
 ## 许可证
 

@@ -198,7 +198,7 @@ function normalizeEol(text, eol) {
  * 源码指纹预检 v2（fail-closed，2026-10-22 P3-1b 补齐三个缺口）。
  *
  * 输入 work/p2-source-manifest.txt（manifest_version 2）：
- *   - 21 个补丁的 sha256 与应用顺序（patch <序号>）；
+ *   - 22 个补丁的 sha256 与应用顺序（patch <序号>）；
  *   - 28 条源码指纹，每条带 src=（upstream/repo/patch/显式路径）、strip_header=、eol=；
  *   - rename-fail-entry.ts 的来源固定为 work/fault/rename-fail-entry.ts。
  *
@@ -276,7 +276,7 @@ function verifySourceManifest() {
   if (!entries.files.length) problems.push("清单缺少 file 条目")
   if (entries.patchCount !== entries.patches.length) problems.push("patch_count " + entries.patchCount + " 与实际 patch 条目 " + entries.patches.length + " 不符")
   if (entries.fileCount !== entries.files.length) problems.push("file_count " + entries.fileCount + " 与实际 file 条目 " + entries.files.length + " 不符")
-  if (entries.patches.length !== 21) problems.push("补丁栈应为 21 个，实际 " + entries.patches.length + " 个")
+  if (entries.patches.length !== 22) problems.push("补丁栈应为 22 个，实际 " + entries.patches.length + " 个")
   entries.patches.forEach((p, idx) => {
     const want = String(idx + 1).padStart(2, "0")
     if (p.seq !== want) problems.push("补丁顺序断档：第 " + (idx + 1) + " 条序号 " + p.seq + "，期望 " + want)
@@ -329,7 +329,7 @@ function verifySourceManifest() {
     const abs = path.join(root, e.rel)
     if (e.src === "patch") {
       if (!fs.existsSync(abs)) {
-        problems.push(e.rel + ": 补丁产物缺失（21 个补丁是否按清单顺序 apply 过？）")
+        problems.push(e.rel + ": 补丁产物缺失（22 个补丁是否按清单顺序 apply 过？）")
         continue
       }
       const before = fs.readFileSync(abs)
@@ -406,7 +406,7 @@ function verifySourceManifest() {
       entries.commit.slice(0, 8) +
       "，补丁 " +
       entries.patches.length +
-      "/21（01..21 顺序与 sha 一致），指纹 " +
+      "/22（01..22 顺序与 sha 一致），指纹 " +
       info.fingerprint_entries +
       " 条（file " +
       info.fingerprint_files +

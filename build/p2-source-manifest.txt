@@ -1,13 +1,13 @@
 # openlist-txiki 源码指纹清单 v2（fail-closed 构建预检输入）
 # 冻版产物：bundle sha256 87a0cfd7a2214631285b8ef67534df6f8b080085391c8f5d41122cd5dd82ef42，2,010,159 B，inputs 435（P2 出口冻结）。
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 21 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 22 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..21> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..22> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -23,7 +23,7 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 21 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 22 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
 #   校验：prepare 之后对 32 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
@@ -32,13 +32,13 @@
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..21 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..22 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
 #   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 32 条指纹后出包）
 manifest_version 2
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 21
+patch_count 22
 file_count 32
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -61,6 +61,7 @@ patch 18 317e0fcac5ab7b875c200e0bb7e79e191f1797e1bb562eb16154db19d488bcfd work/p
 patch 19 62abb149226b45c37017301eed8d06043564412e97e6ddc5d4abfc7295552772 work/p2-19-share-canonical.patch
 patch 20 54d67d3e716cb6ecaa7c5c1540585c3f74d629b383210e97d4c65fed0255b2c1 work/p2-20-upload-stream.patch
 patch 21 ee61340347802f2e716432d111d42ad7a22ad64491623eee9ef8757e75e8d4fc work/p2-21-win-abs-datadir.patch
+patch 22 e1352e76fee60e5972bf9539d4b19c5f1396b36409b79c972773f5262fad6078 work/p2-22-fsget-abs-rawurl.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -75,7 +76,7 @@ file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backen
 file bcc734fd928dc01153cba50a62143c5c53f55822a65d47e70f882f617ea53b16 src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
 file e6940fdae9870b516edcfaed42f05474a2487c5a5795749abc600410cd1c5373 src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file 03743aa80d490988cb5378a471bae9c93e9a06dbf644a59314b3a6e48ef44d57 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file efc9f02f8c1a486369168a1f348173f33c37afa46358884c490972e8241436d6 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file c759e78b7ff27fa41da4fccb66e54e9e1177892a7bb69f2d31ac884d751eb0fc src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
@@ -96,3 +97,8 @@ file fda4eca680ed60c7b78fbb624dee863ae72acb84e278792eda8d6acfbc5c778d src/backen
 # 第 21 条（2026-10-28）：只改适配层 src/backend/txiki/config.ts（Windows 绝对路径
 # 判定与 %LOCALAPPDATA% 默认数据目录）。适配层按上面的 --exclude 口径不进 apply，
 # 其字节由 file src=repo 的 config.ts 条目承载；本条用于补丁链留痕与 sha 校验。
+#
+# 第 22 条（2026-10-28，r19 F5 A）：src/backend/server/fs.ts 的 /fs/get 响应组装
+# 把相对 raw_url 绝对化（origin 只取 c.req.url，路径与 %xx 逐字保留，sign 仍在
+# query）；同步三条会在绝对形态下失败的断言（fs_get_rawurl_sign.test.ts 两处、
+# sign_go_parity.test.ts 一处）。测试文件不是构建输入，不加 file 条目。
