@@ -19,9 +19,9 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
   1. 上游 OpenListTeam/OpenList-Worker 在 commit
      5f53f58dd0f5e5d03eb6079da7f637fa151d8dca 的完整树（CRLF 工作区，含浅克隆 .git
      与 pnpm-lock.yaml，不含 node_modules）；
-  2. 本项目对该上游的 24 个补丁（顺序、sha256 见 work/p2-source-manifest.txt；apk 包内
+  2. 本项目对该上游的 @@PATCH_COUNT@@ 个补丁（顺序、sha256 见 work/p2-source-manifest.txt；apk 包内
      build-manifest.json 的 patches 数组同源，两个二进制归档内不含该文件；补丁本体在
-     patches/openlist/01..24 与 work/）；
+     patches/openlist/01..@@PATCH_COUNT@@ 与 work/）；
   3. 适配层 src/backend/txiki/ 全部源码；
   4. 构建入口 build/build-txiki.mjs、源码指纹清单 build/p2-source-manifest.txt、
      构建说明 docs/BUILD.md；
@@ -36,7 +36,7 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
   重建口径：按 docs/BUILD.md 第 1 节从零重建，得到与发布包逐字节相同的
   bundle（字节数与 sha256 见 apk 包内 build-manifest.json 的 bundle_bytes / bundle_sha256，
   inputs_count 同处；两个二进制归档内不含该文件）。
-  预检对 24 个补丁 sha256、32 条源码指纹、注释头与行尾规则逐项 fail-closed，
+  预检对 @@PATCH_COUNT@@ 个补丁 sha256、@@FILE_COUNT@@ 条源码指纹、注释头与行尾规则逐项 fail-closed，
   任何不符即中止、不出包。
 
 二、运行时 txiki.js 源码位置

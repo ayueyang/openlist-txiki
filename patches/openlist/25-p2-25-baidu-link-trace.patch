@@ -1,0 +1,197 @@
+diff --git a/src/backend/drivers/baidu_netdisk/util.ts b/src/backend/drivers/baidu_netdisk/util.ts
+index b753719..1548c14 100644
+--- a/src/backend/drivers/baidu_netdisk/util.ts
++++ b/src/backend/drivers/baidu_netdisk/util.ts
+@@ -39,6 +39,43 @@ function sleep(ms: number): Promise<void> {
+   return new Promise((r) => setTimeout(r, ms))
+ }
+ 
++// --- 取链日志打点（诊断用，只记录，不改变请求与控制流） ---
++const LINK_LOG_PREFIX = "[baidu_netdisk][link]"
++const linkAttempts = new Map<string, number>()
++
++function errText(e: any): string {
++  return `${e?.name || "Error"}: ${e?.message !== undefined ? e.message : String(e)}`
++}
++
++function linkWarn(e: any): string {
++  const msg = String(e?.message || e || "").toLowerCase()
++  if (msg.includes("read failed")) return "read_failed"
++  if (msg.includes("timed out") || msg.includes("timeout")) return "timeout"
++  return "other"
++}
++
++function logLink(lid: string, fields: Record<string, string | number>): void {
++  if (!lid) return
++  const parts = Object.entries(fields).map(([k, v]) =>
++    k === "err" ? `${k}="${v}"` : `${k}=${v}`,
++  )
++  console.warn(`${LINK_LOG_PREFIX} lid=${lid} ${parts.join(" ")}`)
++}
++
++function linkSummary(
++  lid: string,
++  filemetasMs: number,
++  headMs: number,
++  retries: number,
++  warn: string,
++): void {
++  if (!lid) return
++  linkAttempts.delete(lid)
++  console.warn(
++    `${LINK_LOG_PREFIX} lid=${lid} summary filemetas_ms=${filemetasMs} head_ms=${headMs} retries=${retries} warn=${warn}`,
++  )
++}
++
+ /** Trim a `raw_url` (Baidu dlink) so it can be proxied: keep the base URL and the query params Baidu requires (uk/shareid/method...), dropping access_token if present. */
+ function sanitizeDlink(dlink: string): string {
+   if (!dlink) return dlink
+@@ -237,10 +274,11 @@ export class BaiduClient {
+     method: "GET" | "POST",
+     params?: Record<string, string>,
+     form?: Record<string, string>,
++    lid = "",
+   ): Promise<BaiduRespBody> {
+     await this.ensureToken()
+ 
+-    const doRequest = async (): Promise<BaiduRespBody> => {
++    const doRequest = async (attempt: number): Promise<BaiduRespBody> => {
+       const u = new URL(fullUrl)
+       u.searchParams.set("access_token", this.accessToken)
+       for (const [k, v] of Object.entries(params || {})) {
+@@ -257,8 +295,38 @@ export class BaiduClient {
+         headers["Content-Type"] = "application/x-www-form-urlencoded"
+         init.body = body.toString()
+       }
+-      const res = await fetch(u.toString(), init)
+-      const text = await res.text()
++      linkAttempts.set(lid, attempt)
++      const t0 = Date.now()
++      const res = await fetch(u.toString(), init).catch((e) => {
++        logLink(lid, {
++          stage: "filemetas",
++          attempt,
++          event: "end",
++          ms: Date.now() - t0,
++          status: 0,
++          err: errText(e),
++        })
++        throw e
++      })
++      const text = await res.text().catch((e) => {
++        logLink(lid, {
++          stage: "filemetas",
++          attempt,
++          event: "end",
++          ms: Date.now() - t0,
++          status: res.status,
++          err: errText(e),
++        })
++        throw e
++      })
++      logLink(lid, {
++        stage: "filemetas",
++        attempt,
++        event: "end",
++        ms: Date.now() - t0,
++        status: res.status,
++        err: "",
++      })
+       let body: BaiduRespBody
+       try {
+         body = JSON.parse(text) as BaiduRespBody
+@@ -292,7 +360,7 @@ export class BaiduClient {
+     let lastErr: unknown
+     for (let attempt = 0; attempt < UPLOAD_RETRY_COUNT; attempt++) {
+       try {
+-        return await doRequest()
++        return await doRequest(attempt)
+       } catch (e) {
+         lastErr = e
+         if (attempt < UPLOAD_RETRY_COUNT - 1) {
+@@ -306,8 +374,9 @@ export class BaiduClient {
+   private get(
+     pathname: string,
+     params: Record<string, string>,
++    lid = "",
+   ): Promise<BaiduRespBody> {
+-    return this.request(PAN_API + pathname, "GET", params)
++    return this.request(PAN_API + pathname, "GET", params, undefined, lid)
+   }
+ 
+   private postForm(
+@@ -369,22 +438,69 @@ export class BaiduClient {
+     url: string
+     headers: Record<string, string>
+   }> {
+-    const body = (await this.get("/xpan/multimedia", {
+-      method: "filemetas",
+-      fsids: `[${fsId}]`,
+-      dlink: "1",
++    const lid = Math.random().toString(36).slice(2, 6)
++    const t0 = Date.now()
++    const body = (await this.get(
++      "/xpan/multimedia",
++      {
++        method: "filemetas",
++        fsids: `[${fsId}]`,
++        dlink: "1",
++      },
++      lid,
++    ).catch((e) => {
++      linkSummary(
++        lid,
++        Date.now() - t0,
++        0,
++        linkAttempts.get(lid) || 0,
++        linkWarn(e),
++      )
++      throw e
+     })) as BaiduDownloadResp
++    const fmMs = Date.now() - t0
+     const dlink = body.list?.[0]?.dlink
+-    if (!dlink) throw new Error("no dlink returned from filemetas")
++    if (!dlink) {
++      linkSummary(lid, fmMs, 0, linkAttempts.get(lid) || 0, "no_dlink")
++      throw new Error("no dlink returned from filemetas")
++    }
+ 
+     // Go: NoRedirectClient.Head(dlink+"&access_token=...", UA=pan.baidu.com) → location
+     const u = `${dlink}&access_token=${this.accessToken}`
++    const ht0 = Date.now()
++    logLink(lid, { stage: "head", attempt: 0, event: "start" })
+     const res = await fetch(u, {
+       method: "HEAD",
+       redirect: "manual",
+       headers: { "User-Agent": "pan.baidu.com" },
++    }).catch((e) => {
++      logLink(lid, {
++        stage: "head",
++        attempt: 0,
++        event: "end",
++        ms: Date.now() - ht0,
++        status: 0,
++        err: errText(e),
++      })
++      linkSummary(
++        lid,
++        fmMs,
++        Date.now() - ht0,
++        linkAttempts.get(lid) || 0,
++        linkWarn(e),
++      )
++      throw e
++    })
++    logLink(lid, {
++      stage: "head",
++      attempt: 0,
++      event: "end",
++      ms: Date.now() - ht0,
++      status: res.status,
++      err: "",
+     })
+     const location = res.headers.get("location") || u
++    linkSummary(lid, fmMs, Date.now() - ht0, linkAttempts.get(lid) || 0, "ok")
+     return {
+       url: sanitizeDlink(location),
+       headers: { "User-Agent": "pan.baidu.com" },

@@ -59,10 +59,18 @@ const patchLines = manifestText
     const p = l.split(/\s+/)
     return { seq: p[1], path: p[3], sha256: p[2] }
   })
+const fileLines = manifestText
+  .split(/\r?\n/)
+  .map((l) => l.trim())
+  .filter((l) => l.startsWith("file "))
 const commit = (manifestText.match(/^upstream_commit ([0-9a-f]{40})$/m) || [])[1] || ""
 
 if (!patchLines.length) {
   console.error("FAIL: 源码指纹清单里没有 patch 记录")
+  process.exit(1)
+}
+if (!fileLines.length) {
+  console.error("FAIL: 源码指纹清单里没有 file 记录")
   process.exit(1)
 }
 if (!commit) {
@@ -81,6 +89,8 @@ const out = {
   tjs_sha256: sha256(opt.tjs),
   tjs_bytes: tjsBytes,
   patches: patchLines,
+  patch_count: patchLines.length,
+  file_count: fileLines.length,
   inputs_count: Number(opt.inputs),
   source_manifest_sha256: sha256(opt["source-manifest"]),
   source_archive_path: opt["source-archive-path"] || (archive ? path.basename(path.dirname(archive)) + "/" + path.basename(archive) : ""),

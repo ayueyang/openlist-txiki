@@ -3,13 +3,13 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 24 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 25 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..24> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..25> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -25,7 +25,7 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 24 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 25 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
 #   校验：prepare 之后对 32 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
@@ -34,13 +34,13 @@
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..24 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..25 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
 #   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 32 条指纹后出包）
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 24
+patch_count 25
 file_count 32
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -66,6 +66,7 @@ patch 21 ee61340347802f2e716432d111d42ad7a22ad64491623eee9ef8757e75e8d4fc work/p
 patch 22 e1352e76fee60e5972bf9539d4b19c5f1396b36409b79c972773f5262fad6078 work/p2-22-fsget-abs-rawurl.patch
 patch 23 d3906bfbba5c3d656a9fd8bae8b4a10a7a0f5c18e464f0723f00bf834b0da3c2 work/p2-23-fs-list-refresh.patch
 patch 24 38811e804ae774966e479a40e4ecf18085874914979744cdd6dcfa9a4844afb0 work/p2-24-driver-local-entry.patch
+patch 25 40b5c6c6bd427119e54aa175a803093a37832c680c94b3ef9a9db14af4ee19bb work/p2-25-baidu-link-trace.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -114,3 +115,7 @@ file fda4eca680ed60c7b78fbb624dee863ae72acb84e278792eda8d6acfbc5c778d src/backen
 # 第 24 条（2026-10-29）：server/admin.ts 的 driverConfigs 补 Local（root_folder_path /
 # allow_system_root，common 带参 buildProxyFields("Local")），/driver/names 补 "Local"。
 # admin.ts 是 src=repo：构建树那份由仓库副本剥头生成，两处必须同时改。
+#
+# 第 25 条（2026-10-29，r22 C1）：src/backend/drivers/baidu_netdisk/util.ts 只加取链日志
+# （stage=filemetas/head、attempt、ms、status、err，每次取链一行 summary），重试循环把 attempt
+# 传进 doRequest；重试次数、超时、catch、返回值、请求参数未动。诊断用，不改行为。

@@ -1,87 +1,109 @@
-# 从源码构建
+# 从源码构建（openlist-txiki 0.1.0-r22）
 
-三步：取上游 → 打补丁出 bundle → 编 tjs → 打包。
+本归档是 openlist-txiki 0.1.0-r22 的完整对应源码：
 
-所有脚本都在 `build/` 与 `scripts/`，这里写步骤和约束；脚本里的命令是权威版本。
+    upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
+                              （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
+    patches/openlist/01..25   应用侧补丁，按编号顺序累进应用
+    patches/txiki/            txiki.js 运行时补丁（本归档不包含 txiki.js 源码树，见第 2 节）
+    build/                    build-txiki.mjs、build-merged.sh、p2-source-manifest.txt
+    scripts/                  apk 打包脚本与生命周期钩子
+    src/                      移植层源码（src/backend/txiki/*、src/backend/server/admin.ts）
+    work/                     补丁原文件名（构建脚本按清单里的路径校验 sha256）
+    docs/                     本文件与安装说明
+
+下文命令都在解包后的归档根目录执行，环境为 Linux（WSL 亦可）。
 
 ## 0. 依赖
 
-- Node.js 20+ 与 pnpm（只用于构建 bundle 与跑上游测试）
-- Zig 0.16.0（编 tjs）
-- Linux 或 WSL（tjs 的构建脚本用 Linux 工具链；Windows 侧只用来跑成品）
-- `apk` 工具链：用 OpenWrt SDK 或设备自带的 `apk mkpkg`（不要手工 tar，apk v3 是二进制格式）
+- Node.js 20+、pnpm 9、git、python3
+- tjs 另需 Zig 0.16.0
+- apk 打包需 apk-tools 3.x（带 `mkpkg`）
 
-## 1. 取上游（固定 commit）
+## 1. 出 bundle（已实测可逐字节重建）
 
 ```sh
-git clone https://github.com/OpenListTeam/OpenList-Worker.git upstream
-cd upstream
-git checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
+export PROJ=$PWD
+cp -a upstream tree
+cd tree
+
+# CRLF 检出校验：必须是 2015
+grep -c $'\r' src/backend/server/fs.ts
+
+# 按清单顺序应用 25 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
+while read -r tag seq sha rel; do
+  [ "$tag" = patch ] || continue
+  echo "$sha  $PROJ/$rel" | sha256sum -c - || exit 1
+  git apply --exclude='src/backend/txiki/*' "$PROJ/$rel" || exit 1
+done < <(tr -d '\r' < "$PROJ/work/p2-source-manifest.txt" | grep '^patch ' | sort -k2)
+
+cp "$PROJ/build/build-txiki.mjs" scripts/build-txiki.mjs
+pnpm install --frozen-lockfile
+TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txiki.mjs
+sha256sum dist-txiki/openlist-txiki.js
 ```
 
-**必须是 CRLF 检出**（补丁上下文按 CRLF 写）。若你的 git 配置会自动转换，用：
+期望：预检打印「补丁 25/25（01..25 顺序与 sha 一致），指纹 58 条（file 32 + patch 25 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,021,916 B、
+sha256 `28bab6a9b41f6cd265d592ef7f2fdd105487af61d27b3952d28cc285dabd2fd0`、inputs 437。
+
+第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
+`%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，
+实际字节来自归档根的 `src/`（清单里 `src=repo` 的条目）；补丁本体保留在
+`patches/openlist/21-*` 与 `work/` 中，用于补丁链留痕与 sha256 校验。
+
+`TXIKI_SOURCE_MANIFEST` 指向归档内 `work/` 的清单，构建脚本由此把 `src=` 指向归档根的 `src/`，
+所以构建树 `tree/` 与归档根必须保持这一层的相对位置。
+
+## 2. tjs 运行时
+
+发布的 tjs 二进制由 txiki.js fork（26.9.0 基线，commit a07d6aa）加本轮运行期补丁编出：
+
+- `patches/txiki/p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`：Content-Length 请求体流式化与断连补全
+- `patches/txiki/mbedtls-tls12-pss.patch`：mbedtls TLS 1.2 PSS
+- `patches/txiki/lws-mbedtls-client-alpn-uaf.patch`、`mbedtls-quic.patch`、`wamr-zig.patch`：构建与依赖修补
+- `patches/txiki/libffi-aarch64-windows.patch`：仅 aarch64-windows 目标需要；本版发布的三目标（aarch64-linux-musl / x86_64-linux-musl / x86_64-windows）不打它
+
+构建（aarch64 交叉为例，Zig 0.16.0）：
 
 ```sh
-git -c core.autocrlf=true checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
-```
-
-## 2. 打补丁
-
-按 `patches/openlist/` 文件名编号顺序累进应用：
-
-```sh
-for p in ../patches/openlist/*.patch; do
-  git apply --exclude='src/backend/txiki/*' "$p" || { echo "FAIL $p"; break; }
+git clone https://github.com/qwtel/txiki-js.git txiki
+cd txiki && git checkout a07d6aa19553a61d088bbfbd7ac2ae204d2761a6
+mkdir -p patches && cp ../patches/txiki/*.patch patches/
+# 应用补丁（p6、p6b 改 src/，其余改 deps/ 与构建文件；按上面列出的顺序）
+for p in patches/p6-stream-body.patch patches/p6b-abort-incomplete-body.patch \
+         patches/lws-mbedtls-client-alpn-uaf.patch patches/mbedtls-quic.patch \
+         patches/mbedtls-tls12-pss.patch patches/wamr-zig.patch; do
+  patch -p1 -N < "$p" || exit 1
 done
+zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
+ls -l zig-out/bin/tjs
 ```
 
-`--exclude` 是必须的：`src/backend/txiki/` 这一层由本移植自己提供，补丁里不涉及。
+注意两条实测限制：
 
-校验：`build/p2-source-manifest.txt` 记录了每个补丁的 sha256 与改动后的文件指纹，`build/build-txiki.mjs` 在构建前会逐条校验，不符即中止（fail-closed）。
+1. **构建路径会进二进制**。同一棵树换个绝对路径编出来的 sha256 必变（源码里有约 170 条
+   以自身绝对路径开头的字符串）。要复现发布件的 sha256（aarch64：`4b931f66…f74693`，
+   5,282,808 B），必须把树放在 `/home/admin/txiki-merged`（或用 `unshare -m` + `mount --bind`
+   挂到该路径）。
+2. 本归档给的是**补丁与命令**，不含 txiki.js 的完整前置树（s1a/s1b 两笔服务端流式改动不在
+   上述补丁清单内）。因此「从空树照本节命令编出同 sha 的二进制」**未验证**；已在发布机上
+   验证的是：上述树状态 + `zig build` 冷缓存重建 58 s 得同 sha 同字节。运行期的完整源码与
+   构建记录随源码要约另行提供。
 
-## 3. 出 bundle
+## 3. 打包 apk
 
 ```sh
-node build/build-txiki.mjs
+VERSION=0.1.0-r22
+STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
+  APK=/path/to/apk sh scripts/build-apk.sh
 ```
 
-产物是单文件 `openlist-txiki.js`（约 2MB），同时生成 `build-manifest.json`，记录上游 commit、补丁 sha、指纹条目数与 bundle sha256。
+`scripts/build-apk.sh` 会校验包内 `build-manifest.json` 的 `package_version` 与 `$VERSION` 一致、
+stage 文件集为固定 11 个文件，然后调 `apk mkpkg` 出包。`build-manifest.json` 由
+`scripts/build-manifest.mjs` 生成（参数见该脚本头部注释）。
 
-## 4. 编 tjs
+## 4. 许可
 
-tjs 来自 `qwtel/txiki-js` fork（26.9.0）。`patches/txiki/` 下共 7 个补丁文件：
-
-- 本版发布的三目标（aarch64-linux-musl、x86_64-linux-musl、x86_64-windows）打这 6 个：
-  `p6-stream-body.patch`（Content-Length 请求体流式化）、
-  `p6b-abort-incomplete-body.patch`（断连补全）、
-  `mbedtls-tls12-pss.patch`（TLS 1.2 PSS）、
-  `lws-mbedtls-client-alpn-uaf.patch`（LWS 客户端 ALPN）、
-  `mbedtls-quic.patch`（mbedtls QUIC）、`wamr-zig.patch`（WAMR）；
-- 第 7 个 `libffi-aarch64-windows.patch` 仅 aarch64-windows 目标需要，本版三目标不发它。
-
-```sh
-bash build/build-merged.sh
-```
-
-**关键约束：构建路径会进二进制。** tjs 源码里有约 170 条以自身绝对路径开头的字符串，同一棵树换个路径编出来的 sha 必变。要复现同一个 sha，必须把树放在记录的原路径（或用 `unshare -m` + `mount --bind` 挂到那个路径再编）。
-
-## 5. 打包 apk
-
-```sh
-bash scripts/build-apk.sh <版本号>
-```
-
-脚本会校验 `package_version` 与版本号一致、`fault-inject` 计数为 0，然后调 `apk mkpkg` 出包。
-
-## 6. 验证
-
-出包后至少确认：
-
-```sh
-apk add ./openlist-txiki-<版本>-aarch64.apk
-cat /etc/openlist-txiki/admin.pass
-/etc/init.d/openlist-txiki start
-curl -s http://127.0.0.1:5345/api/public/settings      # 期望 200，version v4.2.3
-```
-
-更完整的回归矩阵（82 条接口用例 + 文件名边界 + WebDAV 方法）不在本仓库内，属内部验收资产。
+上游与依赖的许可证全文见归档根与 `LICENSE`；第三方组件清单见
+`scripts/THIRD-PARTY-NOTICES`。本源码归档对应 AGPL-3.0 源码要约，见 `scripts/SOURCE-OFFER`。
