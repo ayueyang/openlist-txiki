@@ -5,7 +5,7 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
    上游基线 commit：5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
    修改范围与逐条补丁 sha256 见 apk 包内 build-manifest.json 的 patches 数组
-   （22 个补丁，按序 apply；两个二进制归档内不含该文件，补丁表以公开仓
+   （25 个补丁，按序 apply；两个二进制归档内不含该文件，补丁表以公开仓
    build/p2-source-manifest.txt 与源码归档 work/p2-source-manifest.txt 为准）。
    许可证全文见 LICENSE.AGPL-3.0（apk 内与本文同目录，源码归档内为
    licenses/LICENSE.AGPL-3.0）。
