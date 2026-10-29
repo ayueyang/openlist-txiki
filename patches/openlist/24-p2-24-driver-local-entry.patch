@@ -1,0 +1,60 @@
+diff --git a/src/backend/server/admin.ts b/src/backend/server/admin.ts
+index 8409a44..cd2a76c 100644
+--- a/src/backend/server/admin.ts
++++ b/src/backend/server/admin.ts
+@@ -708,6 +708,7 @@ adminRouter.get("/driver/names", (c) => {
+       "SMB",
+       "Crypt",
+       "Virtual",
++      "Local",
+       "AListV3",
+       "UrlTree",
+       "Strm",
+@@ -4758,6 +4759,47 @@ const driverConfigs: Record<string, any> = {
+       default_root: "root",
+     },
+   },
++  Local: {
++    name: "Local",
++    default_mount_path: "/local",
++    // 对齐 Go drivers/local/meta.go：OnlyProxy + NoLinkURL（DRIVER_FORCE_PROXY 含 local）
++    common: [
++      ...BASE_FIELDS,
++      CUSTOM_CACHE_POLICIES_FIELD,
++      ENABLE_SIGN_FIELD,
++      DISABLE_INDEX_FIELD,
++      ...buildProxyFields("Local"),
++      DISABLE_PROXY_SIGN_FIELD,
++      SEED_POLICY_FIELD,
++    ],
++    additional: [
++      {
++        name: "root_folder_path",
++        type: "string",
++        default: "",
++        required: true,
++        help: "绝对路径，如 /tmp/olt-store",
++      },
++      {
++        name: "allow_system_root",
++        type: "bool",
++        default: "false",
++        required: false,
++        help: "只有确实要挂 / 或系统目录时才置 true，会打 WARN",
++      },
++    ],
++    config: {
++      name: "Local",
++      local_sort: true,
++      only_local: false,
++      only_proxy: true,
++      no_cache: true,
++      no_upload: false,
++      need_ms: false,
++      default_root: "/",
++      no_link_url: true,
++    },
++  },
+ }
+ 
+ adminRouter.get("/driver/list", (c) => {

@@ -1,0 +1,53 @@
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 20c1f89..d13b599 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -1423,13 +1423,14 @@ function fsSingleflightKey(
+ export async function listItems(
+   virtualPath: string,
+   requestContext?: StorageRequestContext,
++  options?: { refresh?: boolean },
+ ): Promise<{ content: FileItem[]; provider: string; storage?: any }> {
+   const resolved = await resolvePath(virtualPath, requestContext?.env)
+   // 并发相同的「同一存储 + 同一目录」只向上游发起一次 list。
+   // 键必须在 resolvePath 之后才能确定（需要存储 id），因此去重发生在路径解析之后。
+   return singleflight(
+     fsSingleflightKey("fs.list", resolved, virtualPath),
+-    () => listItemsResolved(resolved, virtualPath, requestContext),
++    () => listItemsResolved(resolved, virtualPath, requestContext, options),
+     { env: requestContext?.env },
+   )
+ }
+@@ -1438,6 +1439,7 @@ async function listItemsResolved(
+   resolved: Awaited<ReturnType<typeof resolvePath>>,
+   virtualPath: string,
+   requestContext?: StorageRequestContext,
++  options?: { refresh?: boolean },
+ ): Promise<{ content: FileItem[]; provider: string; storage?: any }> {
+   let items: FileItem[] = []
+   let driverName = "Virtual"
+@@ -1448,7 +1450,10 @@ async function listItemsResolved(
+     try {
+       // 文件树缓存：命中则完全跳过驱动（对齐 OpenList.ts「浏览只读缓存」）。
+       // 注意缓存的是驱动层原始结果，权限/meta/签名仍在 server 层按请求计算。
+-      const cached = await getCachedFileTree(cacheTarget!, requestContext?.env)
++      // refresh=true 只跳过读缓存（对齐 Go op.List 的 args.Refresh）：回源成功后照常写回。
++      const cached = options?.refresh
++        ? null
++        : await getCachedFileTree(cacheTarget!, requestContext?.env)
+       if (cached) {
+         items = cached
+       } else {
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 873f84e..fabac1e 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -469,6 +469,8 @@ fsRouter.post("/list", async (c) => {
+     const { content, provider, storage } = await listItems(
+       reqPath,
+       requestContext,
++      // refresh=true 只跳过读缓存（对齐 Go op.List 的 args.Refresh），回源后照常写回。
++      { refresh: body.refresh === true || body.refresh === "true" },
+     )
+     // write：用户写权限 + meta.write_users 白名单（对齐 Go common.CanWrite）
+     const writable = canWrite(user) && canWriteMeta(user, meta, reqPath)
