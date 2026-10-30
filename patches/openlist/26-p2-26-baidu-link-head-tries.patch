@@ -1,0 +1,61 @@
+diff --git a/src/backend/drivers/baidu_netdisk/util.ts b/src/backend/drivers/baidu_netdisk/util.ts
+index 1548c14..a7f144a 100644
+--- a/src/backend/drivers/baidu_netdisk/util.ts
++++ b/src/backend/drivers/baidu_netdisk/util.ts
+@@ -47,6 +47,11 @@ function errText(e: any): string {
+   return `${e?.name || "Error"}: ${e?.message !== undefined ? e.message : String(e)}`
+ }
+ 
++/** abort 类错误判定：只用于日志标注与重试判断，不改任何 throw 语义 */
++function isAbortErr(e: any): boolean {
++  return e?.name === "AbortError" || e?.code === 20 || e?.message === "Aborted"
++}
++
+ function linkWarn(e: any): string {
+   const msg = String(e?.message || e || "").toLowerCase()
+   if (msg.includes("read failed")) return "read_failed"
+@@ -68,11 +73,13 @@ function linkSummary(
+   headMs: number,
+   retries: number,
+   warn: string,
++  headTries = 0,
++  headTotalMs = 0,
+ ): void {
+   if (!lid) return
+   linkAttempts.delete(lid)
+   console.warn(
+-    `${LINK_LOG_PREFIX} lid=${lid} summary filemetas_ms=${filemetasMs} head_ms=${headMs} retries=${retries} warn=${warn}`,
++    `${LINK_LOG_PREFIX} lid=${lid} summary filemetas_ms=${filemetasMs} head_ms=${headMs} retries=${retries} warn=${warn} head_tries=${headTries} head_total_ms=${headTotalMs}`,
+   )
+ }
+ 
+@@ -481,6 +488,8 @@ export class BaiduClient {
+         ms: Date.now() - ht0,
+         status: 0,
+         err: errText(e),
++        head_try: 0,
++        ...(isAbortErr(e) ? { aborted: 1 } : {}),
+       })
+       linkSummary(
+         lid,
+@@ -488,6 +497,8 @@ export class BaiduClient {
+         Date.now() - ht0,
+         linkAttempts.get(lid) || 0,
+         linkWarn(e),
++        1,
++        Date.now() - ht0,
+       )
+       throw e
+     })
+@@ -498,9 +509,10 @@ export class BaiduClient {
+       ms: Date.now() - ht0,
+       status: res.status,
+       err: "",
++      head_try: 0,
+     })
+     const location = res.headers.get("location") || u
+-    linkSummary(lid, fmMs, Date.now() - ht0, linkAttempts.get(lid) || 0, "ok")
++    linkSummary(lid, fmMs, Date.now() - ht0, linkAttempts.get(lid) || 0, "ok", 1, Date.now() - ht0)
+     return {
+       url: sanitizeDlink(location),
+       headers: { "User-Agent": "pan.baidu.com" },

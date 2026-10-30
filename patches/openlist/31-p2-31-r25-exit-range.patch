@@ -1,0 +1,351 @@
+diff --git a/src/backend/txiki/response-fixup.ts b/src/backend/txiki/response-fixup.ts
+new file mode 100644
+index 0000000..3d5181f
+--- /dev/null
++++ b/src/backend/txiki/response-fixup.ts
+@@ -0,0 +1,345 @@
++/**
++ * r25 2a：在 entry.ts 的 handle() 返回值上重建 GET 单段 206 的 Response。
++ *
++ * 为什么在这里：Hono 返回的 206 body 是流（bodySize=-1），tjs 的流式分支把
++ * content-length 当 hop-by-hop 过滤掉，206 一律 chunked。entry.ts:245 之后到
++ * tjs.serve 之间没有任何代码再重建 Response，所以在这一处读满字节后重建，tjs 就会走
++ * 缓冲分支按 body_len 补 CL（httpserver.c:1885-1891；机制见
++ * artifacts/arch-r3-verdict-1030/README.md 第 1.4/1.5 节）。
++ *
++ * 判定与上限复用 r24.1 p2-31（range-buffer.ts，已随回退撤出，算法与默认值不变）：
++ * 触发条件是 GET + 206 + 可解析的单段 Content-Range + 跨度不超 cap + 无非 identity 的
++ * content-encoding，任一条不满足原样返回、不打日志。超限回退流式（60 s 去重日志）；
++ * 读满但字节数与跨度不符或超时，回 502 JSON，不带上游的 CR/CL/ETag。
++ */
++
++declare const tjs: any
++
++const FLOOR_KB = 80_000 // MemAvailable 底线；低于它 auto 关缓冲
++const DOWNLINK_BPS = 1_200_000 // 设备下行实测下界 1.20 MB/s
++const TTFB_SECONDS = 1 // 1 s 内读完；1 MiB 在 1.20-2.56 MB/s 下 0.4-0.8 s
++const AMPLIFICATION = 4 // 应用 1 + bufferClone 1 + arrayBuffer 1 + C memcpy 1
++const MAX_INFLIGHT = 8 // 预算允许的并发发数
++const ABS_CAP_BYTES = 8 * 1024 * 1024 // 单发绝对天花板
++const READ_TIMEOUT_MS = 30_000 // 读满整段的上限（安全边界）
++const SKIP_LOG_INTERVAL_MS = 60_000 // 同类 skip 60 s 去重，防拖动刷屏
++
++export type BufferLimits = {
++  capBytes: number
++  budgetBytes: number
++  memAvailableKb: number | null
++  source: "meminfo" | "env" | "off"
++}
++
++type RangeVerdict = { span: number; reason: string; expected: number }
++
++const floorPow2 = (n: number) => (Number.isFinite(n) && n >= 1 ? 2 ** Math.floor(Math.log2(n)) : 0)
++
++/** 十进制字节数；不合法返回 null（不做 Ki/Mi 后缀解析）。 */
++function parseByteEnv(value: unknown): number | null {
++  if (typeof value !== "string" && typeof value !== "number") return null
++  const text = String(value).trim()
++  return /^\d+$/.test(text) ? Number(text) : null
++}
++
++function autoFromMem(memAvailableKb: number): { capBytes: number; budgetBytes: number } {
++  const headroom = memAvailableKb * 1024 - FLOOR_KB * 1024
++  if (headroom <= 0) return { capBytes: 0, budgetBytes: 0 }
++  const cap = Math.min(
++    floorPow2(DOWNLINK_BPS * TTFB_SECONDS),
++    floorPow2(headroom / AMPLIFICATION / MAX_INFLIGHT),
++    ABS_CAP_BYTES,
++  )
++  return { capBytes: cap, budgetBytes: Math.floor(Math.min(headroom / AMPLIFICATION, MAX_INFLIGHT * cap)) }
++}
++
++/**
++ * 本进程的有效上限：p2-31 原样搬入，算法与默认值一字未改。env 若提供
++ * RAW_RANGE_BUFFER_LIMITS 函数（本文件自己给，读 /proc/meminfo + tjs.env），就以它为
++ * 输入；否则只看静态 env，未设即关，不猜内存。budget 缺省取 min(可用/4, 8*cap)；
++ * MAX/BUDGET 写 0 都表示关闭。
++ */
++export function resolveLimits(env: any): BufferLimits {
++  let maxOverride: number | null = null
++  let budgetOverride: number | null = null
++  let memAvailableKb: number | null = null
++  const probe = env && typeof env.RAW_RANGE_BUFFER_LIMITS === "function" ? env.RAW_RANGE_BUFFER_LIMITS : null
++  if (probe) {
++    let got: any = null
++    try {
++      got = probe()
++    } catch {
++      got = null
++    }
++    if (got && typeof got === "object") {
++      maxOverride = parseByteEnv(got.max)
++      budgetOverride = parseByteEnv(got.budget)
++      const mem = got.memAvailableKb
++      memAvailableKb = mem === null || mem === undefined || !Number.isFinite(Number(mem)) ? null : Number(mem)
++    }
++  } else {
++    maxOverride = parseByteEnv(env && env.RAW_RANGE_BUFFER_MAX)
++    budgetOverride = parseByteEnv(env && env.RAW_RANGE_BUFFER_BUDGET)
++  }
++  const off: BufferLimits = { capBytes: 0, budgetBytes: 0, memAvailableKb, source: "off" }
++  if (maxOverride === 0 || budgetOverride === 0) return off
++  const auto = memAvailableKb === null ? { capBytes: 0, budgetBytes: 0 } : autoFromMem(memAvailableKb)
++  const capBytes = maxOverride ?? auto.capBytes
++  if (!(capBytes > 0)) return off
++  const budgetAuto = memAvailableKb === null ? MAX_INFLIGHT * capBytes : auto.budgetBytes
++  const budgetBytes = budgetOverride ?? Math.min(budgetAuto, MAX_INFLIGHT * capBytes)
++  if (!(budgetBytes > 0)) return off
++  const source = maxOverride !== null || budgetOverride !== null ? "env" : "meminfo"
++  return { capBytes, budgetBytes, memAvailableKb, source }
++}
++
++// tjs.readFile 返回 Promise，不能同步取：首次判定前读一次 /proc/meminfo，之后 5 s 后台
++// 刷新（p2-31 同口径）；读不到就给 null，不猜内存。
++let memAvailableKb: number | null = null
++let memLoaded = false
++let memReadAt = 0
++let memLoading: Promise<void> | null = null
++
++function loadMemAvailable(): Promise<void> {
++  if (!memLoading) {
++    memReadAt = Date.now()
++    memLoading = (async () => {
++      try {
++        const raw: any = await tjs.readFile("/proc/meminfo", "utf8")
++        const text = raw instanceof Uint8Array ? new TextDecoder().decode(raw) : String(raw ?? "")
++        const m = /^MemAvailable:\s*(\d+)\s*kB/m.exec(text)
++        memAvailableKb = m ? Number(m[1]) : null
++      } catch {
++        memAvailableKb = null
++      }
++      memLoaded = true
++      memLoading = null
++    })()
++  }
++  return memLoading
++}
++
++function readEnvByte(key: string): number | null {
++  let raw: any = null
++  try {
++    raw = tjs.env ? tjs.env[key] : null
++  } catch {
++    raw = null
++  }
++  const text = String(raw ?? "").trim()
++  return /^\d+$/.test(text) ? Number(text) : null
++}
++
++function limitsProbe(): any {
++  const max = readEnvByte("RAW_RANGE_BUFFER_MAX")
++  const budget = readEnvByte("RAW_RANGE_BUFFER_BUDGET")
++  if (memAvailableKb === null && max === null && budget === null) return null
++  return { max, budget, memAvailableKb }
++}
++
++let limitsLogged = false
++
++async function currentLimits(): Promise<BufferLimits> {
++  if (!memLoaded) await loadMemAvailable()
++  else if (Date.now() - memReadAt >= 5000) void loadMemAvailable()
++  const limits = resolveLimits({ RAW_RANGE_BUFFER_LIMITS: limitsProbe })
++  if (!limitsLogged) {
++    limitsLogged = true
++    console.log(
++      "[txiki] range fixup: cap=" +
++        limits.capBytes +
++        " budget=" +
++        limits.budgetBytes +
++        " memavail_kb=" +
++        (limits.memAvailableKb ?? -1) +
++        " floor_kb=" +
++        FLOOR_KB +
++        " source=" +
++        limits.source,
++    )
++  }
++  return limits
++}
++
++/**
++ * 判定上游 206 能否按已知长度整段缓冲（p2-31 原样）。返回 0 = 不缓冲（非 206、无单段
++ * CR、带非 identity 编码、跨度非正）、-1 = CL 与跨度冲突、>0 = 唯一可信长度。
++ */
++function classifyRange(status: number, headers: Headers): RangeVerdict {
++  if (status !== 206) return { span: 0, reason: "status", expected: 0 }
++  const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec((headers.get("content-range") || "").trim())
++  if (!m) return { span: 0, reason: "no-single-range", expected: 0 }
++  const span = Number(m[2]) - Number(m[1]) + 1
++  const encoding = (headers.get("content-encoding") || "").trim().toLowerCase()
++  if (encoding && encoding !== "identity") return { span: 0, reason: "content-encoding", expected: span }
++  const clRaw = headers.get("content-length")
++  if (clRaw !== null && clRaw !== undefined) {
++    const cl = /^\d+$/.test(clRaw.trim()) ? Number(clRaw.trim()) : Number.NaN
++    if (!Number.isFinite(cl) || cl !== span) return { span: -1, reason: "length-conflict", expected: span }
++  }
++  if (!(span > 0)) return { span: 0, reason: "no-length", expected: 0 }
++  return { span, reason: "ok", expected: span }
++}
++
++let inflightBytes = 0
++
++/** 预留预算；放不下返回 false（调用方回退流式）。 */
++function reserveBytes(bytes: number, budgetBytes: number): boolean {
++  if (!(bytes > 0) || !(budgetBytes > 0) || inflightBytes + bytes > budgetBytes) return false
++  inflightBytes += bytes
++  return true
++}
++
++/** 释放预算。tjs 在 handler 返回后的同一轮微任务里就量 bodySize，0 ms 定时器落在其后。 */
++function releaseBytes(bytes: number): void {
++  const drop = () => {
++    inflightBytes = Math.max(0, inflightBytes - bytes)
++  }
++  if (typeof setTimeout === "function") setTimeout(drop, 0)
++  else drop()
++}
++
++class RangeBodyError extends Error {
++  read: number
++  code: string
++  constructor(read: number, code: string) {
++    super(code)
++    this.name = "RangeBodyError"
++    this.read = read
++    this.code = code
++  }
++}
++
++/** 读满整段，带期限：每次 read 按剩余期限设表，到期抛 RangeBodyError(<已读>, "timeout")，
++ * 随即 await reader.cancel() 把上游读停掉——此前 Promise.race(arrayBuffer, timeout) 只让 race
++ * 拒绝，arrayBuffer 仍在后台把上游 body 读完（502 之后上游还在被消费）。 */
++async function readBodyWithin(res: Response, span: number, ms: number): Promise<ArrayBuffer> {
++  const body: any = res.body
++  if (!body || typeof setTimeout !== "function") return res.arrayBuffer()
++  const reader: any = body.getReader()
++  const out = new Uint8Array(span)
++  const deadline = Date.now() + ms
++  let offset = 0
++  try {
++    while (offset < span) {
++      const remain = deadline - Date.now()
++      if (remain <= 0) throw new RangeBodyError(offset, "timeout")
++      const step: any = await new Promise((resolve, reject) => {
++        const timer = setTimeout(() => reject(new RangeBodyError(offset, "timeout")), remain)
++        reader.read().then(
++          (result: any) => {
++            clearTimeout(timer)
++            resolve(result)
++          },
++          (err: any) => {
++            clearTimeout(timer)
++            reject(err)
++          },
++        )
++      })
++      if (step.done) break
++      const chunk: any = step.value
++      if (!chunk || !chunk.byteLength) continue
++      if (offset + chunk.byteLength > span) throw new RangeBodyError(offset + chunk.byteLength, "long")
++      out.set(chunk, offset)
++      offset += chunk.byteLength
++    }
++    if (offset !== span) throw new RangeBodyError(offset, "short")
++    return out.buffer
++  } catch (err: any) {
++    try {
++      await reader.cancel()
++    } catch {}
++    if (err instanceof RangeBodyError) throw err
++    throw new RangeBodyError(offset, err && err.code ? err.code : "error")
++  }
++}
++
++function reqPath(req: Request): string {
++  try {
++    return new URL(req.url).pathname
++  } catch {
++    return ""
++  }
++}
++
++const lastSkipLog = new Map<string, number>()
++
++/** 限额相关的拒绝才打日志，60 s 按 path+reason 去重；触发条件不满足的静默返回。 */
++function skipLimitLog(path: string, reason: string, detail: string): void {
++  const key = reason + "|" + path
++  const now = Date.now()
++  if (now - (lastSkipLog.get(key) || 0) >= SKIP_LOG_INTERVAL_MS) {
++    lastSkipLog.set(key, now)
++    if (lastSkipLog.size > 512) {
++      for (const [k, at] of lastSkipLog) if (now - at >= SKIP_LOG_INTERVAL_MS) lastSkipLog.delete(k)
++    }
++    console.log("[txiki] range fixup skip: path='" + path + "' " + detail + "reason=" + reason)
++  }
++}
++
++/** 502 只带自己的头：上游的 content-range / content-length / etag 一个都不转发。 */
++function badGateway(path: string, span: number, read: number, code: string): Response {
++  console.warn(
++    "[txiki] range fixup integrity failure: path='" +
++      path +
++      "' expected=" +
++      span +
++      " read=" +
++      read +
++      " err=" +
++      code +
++      " action=502",
++  )
++  return new Response(JSON.stringify({ code: 502, message: "upstream range body length mismatch", data: null }), {
++    status: 502,
++    headers: { "content-type": "application/json" },
++  })
++}
++
++/**
++ * handle() 返回前调用。命中就把单段 206 读满并重建 Response（删掉 content-length，
++ * 让 tjs 按 body_len 补）；不命中一律原样返回。
++ */
++export async function fixup(res: Response, req: Request): Promise<Response> {
++  if (req.method !== "GET") return res
++  const verdict = classifyRange(res.status, res.headers)
++  if (!(verdict.span > 0)) return res
++  if (!res.body) return res
++
++  const limits = await currentLimits()
++  const path = reqPath(req)
++  if (!(limits.capBytes > 0)) {
++    skipLimitLog(
++      path,
++      limits.memAvailableKb === null ? "disabled" : "memavail",
++      "memavail_kb=" + (limits.memAvailableKb ?? -1) + " ",
++    )
++    return res
++  }
++  if (verdict.span > limits.capBytes) {
++    skipLimitLog(path, "cap", "len=" + verdict.span + " cap=" + limits.capBytes + " ")
++    return res
++  }
++  if (!reserveBytes(verdict.span, limits.budgetBytes)) {
++    skipLimitLog(path, "budget", "len=" + verdict.span + " inflight=" + inflightBytes + " budget=" + limits.budgetBytes + " ")
++    return res
++  }
++
++  let buf: ArrayBuffer
++  try {
++    buf = await readBodyWithin(res, verdict.span, READ_TIMEOUT_MS)
++  } catch (err: any) {
++    releaseBytes(verdict.span)
++    return badGateway(path, verdict.span, err && err.read ? err.read : 0, err && err.code ? err.code : "error")
++  }
++  if (buf.byteLength !== verdict.span) {
++    releaseBytes(verdict.span)
++    return badGateway(path, verdict.span, buf.byteLength, buf.byteLength < verdict.span ? "short" : "long")
++  }
++  releaseBytes(verdict.span)
++
++  const headers = new Headers(res.headers)
++  headers.delete("content-length")
++  return new Response(buf, { status: res.status, headers })
++}

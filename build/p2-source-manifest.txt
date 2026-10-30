@@ -3,13 +3,30 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 25 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 31 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
+#   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
+#   与 27（HEAD 单发 10 s 超时、只发一次不重试）；patch_count 25->27，file_count 32 不变。
+#   2026-10-30 r24：新增 28（entry.ts 注入 CACHE_DOWNLOAD_LINK 默认 true / CACHE_LINK_TTL 默认 5，
+#   src=repo 不进 apply）、29（baidu util.ts 的 LINK_HEAD_TIMEOUT_MS 10_000->1_900，只改常量；r24.1 由 2_500 收紧）、
+#   30（raw.ts 空 raw_url 的 404 文本改 502 JSON，目录/其它分支不动）；patch_count 27->30，file_count 32 不变。
+#   2026-10-30 r24.1：第 29 条就地把 LINK_HEAD_TIMEOUT_MS 由 2_500 收紧到 1_900（文件改名 -1900），
+#   只改常量与注释，补丁数仍 30、执行顺序 01..30 不变。
+#   2026-10-30 r24.1 回退：设备门 V1 不成立，第 31 条撤出（conductor 判停 F2），patch_count 31->30，
+#   raw.ts/entry.ts 回到 30 条补丁的字节，执行顺序 01..30；补丁文件与 p31 交件原样保留在 work/ 作历史。
+#   2026-10-30 r25 2a：第 31 条重新落地（与 r24.1 那条 range-buffer 方案不同：本次只在 entry.ts 的
+#   handle() 出口对 GET 单段 206 读满并重建 Response，不动 raw.ts、不改 Hono、不改 tjs）；
+#   新增 src/backend/txiki/response-fixup.ts（src=repo，file_count 32->33），entry.ts 加 1 行 import
+#   与 1 处调用；patch_count 30->31，执行顺序 01..31。
+#   28 同批还改仓库内 work/conductor-r347/init.d（ENV_ARGS 白名单）与
+#   usr/share/openlist-txiki/openlist-txiki.env.default（注释+默认值），两件不在构建树、不进 apply，
+#   与第 21 条对 config.ts 的留痕口径相同。
+#
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..25> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..31> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -25,7 +42,7 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 25 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 31 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
 #   校验：prepare 之后对 32 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
@@ -34,14 +51,14 @@
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..25 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..31 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
-#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 32 条指纹后出包）
+#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 33 条指纹后出包）
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 25
-file_count 32
+patch_count 31
+file_count 33
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -67,6 +84,12 @@ patch 22 e1352e76fee60e5972bf9539d4b19c5f1396b36409b79c972773f5262fad6078 work/p
 patch 23 d3906bfbba5c3d656a9fd8bae8b4a10a7a0f5c18e464f0723f00bf834b0da3c2 work/p2-23-fs-list-refresh.patch
 patch 24 38811e804ae774966e479a40e4ecf18085874914979744cdd6dcfa9a4844afb0 work/p2-24-driver-local-entry.patch
 patch 25 40b5c6c6bd427119e54aa175a803093a37832c680c94b3ef9a9db14af4ee19bb work/p2-25-baidu-link-trace.patch
+patch 26 03fb7e38a8bf78025848918de96e357b3228db323b8386b00dc23dba863ee330 work/p2-26-baidu-link-head-tries.patch
+patch 27 7c625406a32397bcc2c034bbec2c1a4bacd732699833d05f525da5c25a5aa9fb work/p2-27-baidu-link-head-timeout.patch
+patch 28 e6ffdb7110aae13450e86c9c4a9741576e6c0335388c341917a306794150e459 work/p2-28-r24-link-cache.patch
+patch 29 73d7a19c596b6cddd40aaf251f34e761ee6bfada30bae9f79f64906428b77f3c work/p2-29-r24-head-timeout-1900.patch
+patch 30 e29d6ee1c1e94a0a62e3b2d9e8842cf02a6eae527e369aaa586aa380ad65b046 work/p2-30-r24-empty-link-502.patch
+patch 31 ed693ca5a5ae9357ba3031cf550d911cc88754f651bf782a880fb2a3cad18fa1 work/p2-31-r25-exit-range.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -83,15 +106,16 @@ file e6940fdae9870b516edcfaed42f05474a2487c5a5795749abc600410cd1c5373 src/backen
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
 file eb8e80d3f609573965bd74ef2ec955e16a4c26f4789bd6b23de056e5e1c2ba22 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
-file c759e78b7ff27fa41da4fccb66e54e9e1177892a7bb69f2d31ac884d751eb0fc src/backend/server/raw.ts src=patch strip_header=no eol=lf
+file 082feb3a1a3ac4e209ae903a079994342254e3bfb473c6a86eda31b982997d46 src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file f68f7b149c6b9026461b710468698269dce2bf2d060daf031153355dea4a4888 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file e33d4b17aa0769cae10e3d8a3ececc81290ec29e6ce09825cf2c3ba829a705b0 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file 17d48573b11291e04e895bc08170e6d8db3feaf2aea28fe4f5a916b00432a35d src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
+file 56b6db1ba869952db9bf5453a5615348b84a58efe4579d758d373d4d7bec10f7 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
 file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
@@ -119,3 +143,41 @@ file fda4eca680ed60c7b78fbb624dee863ae72acb84e278792eda8d6acfbc5c778d src/backen
 # 第 25 条（2026-10-29，r22 C1）：src/backend/drivers/baidu_netdisk/util.ts 只加取链日志
 # （stage=filemetas/head、attempt、ms、status、err，每次取链一行 summary），重试循环把 attempt
 # 传进 doRequest；重试次数、超时、catch、返回值、请求参数未动。诊断用，不改行为。
+#
+# 第 26 条（2026-10-29，r23 P1）：同文件，只加日志字段——head event=end 行尾追加 head_try（0/1）
+# 与被 abort 时的 aborted=1，summary 行尾追加 head_tries/head_total_ms；既有字段与顺序不动。
+# 控制流零改动：没有超时、没有重试、没有新增请求分支。
+#
+# 第 27 条（2026-10-29，r23 P2）：同文件，HEAD 段搬进私有方法 headDlink，加 AbortController +
+# 10 s 超时（LINK_HEAD_TIMEOUT_MS 常量），只发一次、不重试、不退避；
+# filemetas 段、request() 的 3 次重试、其它驱动与上传路径未动。
+#
+# 第 28 条（2026-10-30，r24 A1）：src/backend/txiki/entry.ts 的 env 增加两个键——
+# CACHE_DOWNLOAD_LINK 默认 "true"、CACHE_LINK_TTL 默认 "5"，都允许 tjs.env 覆盖；另加一行启动日志。
+# 适配层按 --exclude 口径不进 apply，字节由 file src=repo 承载；本条用于补丁链留痕与 sha 校验。
+# 同批仓库内改动（不在构建树）：work/conductor-r347/init.d 的 ENV_ARGS 白名单、
+# usr/share/openlist-txiki/openlist-txiki.env.default 的注释与默认值。
+#
+# 第 29 条（2026-10-30，r24 C1）：src/backend/drivers/baidu_netdisk/util.ts 的 LINK_HEAD_TIMEOUT_MS
+# 由 10_000 改 1_900（r24 曾为 2_500，r24.1 收紧），只改常量与上一行注释；控制流、重试、filemetas 段未动。
+#
+# 第 30 条（2026-10-30，r24 C2）：src/backend/server/raw.ts 的「raw_url 为空」分支由 404 文本改
+# 502 JSON（code/message/data/detail）；目录分支与其它错误分支不动，Local 走 rangeBody 不受影响。
+#
+# 第 31 条已撤出（2026-10-30 r24.1 回退，原文保留作历史）：新增 src/backend/server/range-buffer.ts（已知长度的单段 206 读满
+# 后以 Uint8Array 返回，运行时按 body_len 补 Content-Length）；raw.ts 三处（import、385 之后插判定、
+# 402 缓冲分支不转发上游 CL、426 三目返回）；entry.ts 注入 RAW_RANGE_BUFFER_LIMITS 函数与一行启动日志。
+# 上限自适应：cap=min(floorPow2(1.20 MB), floorPow2((MemAvailable-80,000 kB)/4/8), 8 MiB)，
+# budget=min((MemAvailable-80,000 kB)/4, 8*cap)，均可用 RAW_RANGE_BUFFER_MAX/BUDGET 覆盖（0 关闭）。
+# 任何拒绝都回退原流式；读取失败回 502 JSON，不带上游 CL/CR。
+# entry.ts 是 src=repo：构建树那份由仓库副本复制（strip_header=no），本条用于补丁链留痕与 sha 校验。
+# 本条不在清单内：work/p2-31-r24.1-range-buffer.patch 与 artifacts/porter-r24.1-p31-0829/、
+# artifacts/aud-r24.1-p31-audit-0930/ 原样保留；清单第 31 条现由 r25 2a 的 p2-31-r25-exit-range.patch 占用，上面这段是历史。
+#
+# 第 31 条（2026-10-30，r25 2a）：新增 src/backend/txiki/response-fixup.ts——GET + 206 + 可解析单段
+# Content-Range + 跨度不超 cap + 无非 identity content-encoding 时，在 entry.ts 的 handle() 出口
+# await res.arrayBuffer() 读满并按字节重建 Response（删 content-length 让 tjs 按 body_len 补，
+# 保留 content-range/content-type/accept-ranges）；字节数与跨度不符或超时回 502 JSON（不带上游
+# CR/CL/ETag）；cap/budget 与 resolveLimits 沿用 p2-31 的算法、默认值与 RAW_RANGE_BUFFER_MAX/BUDGET
+# 口径。raw.ts、Hono、tjs 均未改。entry.ts 是 src=repo：构建树那份由仓库副本复制（strip_header=no），
+# 本条只承载 response-fixup.ts 的新文件字节；entry.ts 的改动由 file 条目 sha 校验。

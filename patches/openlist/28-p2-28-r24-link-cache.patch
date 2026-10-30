@@ -1,0 +1,26 @@
+diff --git a/src/backend/txiki/entry.ts b/src/backend/txiki/entry.ts
+index f474828..c9828ec 100644
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -53,6 +53,10 @@ const env: Record<string, any> = {
+   JWT_SECRET: cfg.jwtSecret,
+   ADMIN_PASS: cfg.adminPass,
+   TZ: (tjs.env || {}).TZ || "UTC",
++  // r24 A1：链接缓存默认开（上游默认关）。TTL 5 分钟是暂定值，
++  // 设备上可用 CACHE_LINK_TTL 覆盖，无需重打 bundle。
++  CACHE_DOWNLOAD_LINK: (tjs.env || {}).CACHE_DOWNLOAD_LINK || "true",
++  CACHE_LINK_TTL: (tjs.env || {}).CACHE_LINK_TTL || "5",
+ }
+ 
+ const ctx = {
+@@ -248,6 +252,10 @@ console.log(
+   `[txiki] sqlite: journal=${pragmas.journal_mode} synchronous=${pragmas.synchronous} busy_timeout=${pragmas.busy_timeout}`,
+ )
+ 
++console.log(
++  `[txiki] link cache: download_link=${env.CACHE_DOWNLOAD_LINK} ttl_min=${env.CACHE_LINK_TTL}`,
++)
++
+ tjs.serve({
+   port: cfg.port,
+   listenIp: cfg.hostname,

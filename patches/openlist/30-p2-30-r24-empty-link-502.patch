@@ -1,0 +1,28 @@
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index 0775ac7..dd1b46b 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -762,6 +762,23 @@ rawRouter.get("/*", async (c) => {
+               resolved.physical,
+             )
+             return c.body(stream as any)
++          } else if (fileItem && !fileItem.is_dir && !fileItem.raw_url) {
++            // 上游取链失败时驱动会把错误吞成空 raw_url；这是上游/网络故障，
++            // 不是文件不存在，回 502 JSON 让客户端区分「稍后重试」。
++            console.warn(
++              `[rawRouter] Link acquisition failed for '${reqPath}': ${
++                fileItem.raw_url_error || "empty raw_url"
++              }`,
++            )
++            return c.json(
++              {
++                code: 502,
++                message: "upstream link acquisition failed",
++                data: null,
++                detail: reqPath,
++              },
++              502,
++            )
+           } else {
+             const detail =
+               fileItem?.raw_url_error ||

@@ -212,7 +212,7 @@ start_service() {
 	procd_open_instance openlist-txiki
 	procd_set_param command "$PKG_DIR/tjs" run "$PKG_DIR/openlist-txiki.js"
 	# 固定转发 7 个键（第 7 个是 TJS_ADMIN_PASS：空值也传，应用侧读空等于没设，行为可预期）；
-	# 后面 5 个可选键只在用户于 env 文件里显式设置时才传，
+	# 后面 7 个可选键只在用户于 env 文件里显式设置时才传，
 	# 不设就不传，应用侧走自己的默认值（upload-limit.ts 的 25MB/16MB）。
 	ENV_ARGS="TJS_HOST=$LISTEN_ADDR TJS_PORT=$LISTEN_PORT TJS_DATA_DIR=$DATA_DIR TJS_JWT_SECRET=$JWT_SECRET TJS_ADMIN_PASS=${TJS_ADMIN_PASS:-} OPENLIST_TXIKI_READONLY=$READONLY TMPDIR=$TMP_DIR"
 	[ -n "${MAX_UPLOAD:-}" ] && ENV_ARGS="$ENV_ARGS MAX_UPLOAD=$MAX_UPLOAD"
@@ -221,6 +221,13 @@ start_service() {
 	[ -n "${OPENLIST_TXIKI_SWEEP_MS:-}" ] && ENV_ARGS="$ENV_ARGS OPENLIST_TXIKI_SWEEP_MS=$OPENLIST_TXIKI_SWEEP_MS"
 	# DB_SYNC 只在显式设置时才传（r9 起 B1 开关，不传=应用侧默认 NORMAL）
 	[ -n "${DB_SYNC:-}" ] && ENV_ARGS="$ENV_ARGS DB_SYNC=$DB_SYNC"
+	# 下载链接缓存（r24 A1）：应用侧默认 true/5 分钟，这里只在用户显式设置时覆盖
+	[ -n "${CACHE_DOWNLOAD_LINK:-}" ] && ENV_ARGS="$ENV_ARGS CACHE_DOWNLOAD_LINK=$CACHE_DOWNLOAD_LINK"
+	[ -n "${CACHE_LINK_TTL:-}" ] && ENV_ARGS="$ENV_ARGS CACHE_LINK_TTL=$CACHE_LINK_TTL"
+	# Range 缓冲（r25 2a）：单段 206 读满后重建 Response，让 tjs 按已知长度补 content-length；
+	# 只认十进制字节数，0=关闭，不设=按 MemAvailable 自适应（算法与默认值见 response-fixup.ts）
+	[ -n "${RAW_RANGE_BUFFER_MAX:-}" ] && ENV_ARGS="$ENV_ARGS RAW_RANGE_BUFFER_MAX=$RAW_RANGE_BUFFER_MAX"
+	[ -n "${RAW_RANGE_BUFFER_BUDGET:-}" ] && ENV_ARGS="$ENV_ARGS RAW_RANGE_BUFFER_BUDGET=$RAW_RANGE_BUFFER_BUDGET"
 	# 故意不加引号：procd_set_param 要的是逐个 KEY=VALUE 参数；上面这些值都是数字或路径，不含空白。
 	procd_set_param env $ENV_ARGS
 	procd_set_param respawn 3600 5 5
