@@ -1,9 +1,10 @@
 # openlist-txiki 源码指纹清单 v3（fail-closed 构建预检输入）
-# 冻版产物：bundle sha256 87a0cfd7a2214631285b8ef67534df6f8b080085391c8f5d41122cd5dd82ef42，2,010,159 B，inputs 435（P2 出口冻结）。
+# 历史（2026-10-22 P2 出口冻结）：bundle sha256 87a0cfd7a2214631285b8ef67534df6f8b080085391c8f5d41122cd5dd82ef42，2,010,159 B，inputs 435。
+# 当前冻版以 REBUILD.md 与构建清单为准（r26：c257a811d3268a0bbb9c009a4bddc3c4f392ef39ebd166ab330c2df66f6aa525，2,027,726 B，inputs 438）。
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 31 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 33 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -19,6 +20,17 @@
 #   handle() 出口对 GET 单段 206 读满并重建 Response，不动 raw.ts、不改 Hono、不改 tjs）；
 #   新增 src/backend/txiki/response-fixup.ts（src=repo，file_count 32->33），entry.ts 加 1 行 import
 #   与 1 处调用；patch_count 30->31，执行顺序 01..31。
+#   2026-10-30 r27：新增 32（response-fixup.ts 尾部收口：上游 206 + 单段 CR + 无 content-length 时读满 span 后
+#   再探一次 done，探到字节保留 206 前缀 + cancel + 记 tail=long，超时记 tail=stall；有 content-length 时
+#   不探不 cancel，V1 热路径与 r26 逐字相同；同批在 reserveBytes 成功预留后只在创新高时打一行 inflight hwm）；
+#   patch_count 31->32，file_count 33 不变，执行顺序 01..32。**第 32 条不参与构建**：本条只改
+#   src/backend/txiki/response-fixup.ts，构建时按 --exclude='src/backend/txiki/*' 跳过（与第 31 条同口径），
+#   构建树里的字节由下面的 file 条目 sha 承载；后来人别以为它生效了。
+#   2026-10-30 r28：新增 33（S1 不对称收口：readBodyWithin 在 probeTail 返回 long 时抛
+#   RangeBodyError(span+extra,"long")，同一请求形状不再按分块边界在 502 与 206 之间翻转；stall / error
+#   仍是 206 + 日志；framed 分支与 fixup 函数体 0 改动，热路径与 r27 逐字相同；同批只改注释）；
+#   patch_count 32->33，file_count 33 不变，执行顺序 01..33。**第 33 条同第 31/32 条不进 apply**：
+#   本条只改 src/backend/txiki/response-fixup.ts，构建树字节由下面的 file 条目 sha 承载。
 #   28 同批还改仓库内 work/conductor-r347/init.d（ENV_ARGS 白名单）与
 #   usr/share/openlist-txiki/openlist-txiki.env.default（注释+默认值），两件不在构建树、不进 apply，
 #   与第 21 条对 config.ts 的留痕口径相同。
@@ -26,7 +38,7 @@
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..31> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..33> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -42,22 +54,22 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 31 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 33 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
-#   校验：prepare 之后对 32 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
+#   校验：prepare 之后对 33 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
 # 缺口 3：rename-fail-entry.ts 是测试专用入口（生产 bundle 不引用），不在 src/ 下；
 #   唯一来源 work/fault/rename-fail-entry.ts，sha256 a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23，与构建树字节相同。
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..31 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..33 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
 #   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 33 条指纹后出包）
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 31
+patch_count 33
 file_count 33
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -90,6 +102,8 @@ patch 28 e6ffdb7110aae13450e86c9c4a9741576e6c0335388c341917a306794150e459 work/p
 patch 29 73d7a19c596b6cddd40aaf251f34e761ee6bfada30bae9f79f64906428b77f3c work/p2-29-r24-head-timeout-1900.patch
 patch 30 e29d6ee1c1e94a0a62e3b2d9e8842cf02a6eae527e369aaa586aa380ad65b046 work/p2-30-r24-empty-link-502.patch
 patch 31 ed693ca5a5ae9357ba3031cf550d911cc88754f651bf782a880fb2a3cad18fa1 work/p2-31-r25-exit-range.patch
+patch 32 92ee0b208b147a77d34a82ccc4f28dcfd9d77731c6b298b93d0c33a8a6578919 work/p2-32-r27-tail-close.patch
+patch 33 e087532169e3b532080599679c5d856c2f2ebee3119a06ab94347cac26fc0949 work/p2-33-r28-s1-close.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -115,7 +129,7 @@ file 17d48573b11291e04e895bc08170e6d8db3feaf2aea28fe4f5a916b00432a35d src/backen
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
-file 56b6db1ba869952db9bf5453a5615348b84a58efe4579d758d373d4d7bec10f7 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
+file f7ec348dd5c0ffe7710c38c139df41b28f1d1a21f5709adc4cef4ea2937938b9 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
 file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
@@ -181,3 +195,21 @@ file fda4eca680ed60c7b78fbb624dee863ae72acb84e278792eda8d6acfbc5c778d src/backen
 # CR/CL/ETag）；cap/budget 与 resolveLimits 沿用 p2-31 的算法、默认值与 RAW_RANGE_BUFFER_MAX/BUDGET
 # 口径。raw.ts、Hono、tjs 均未改。entry.ts 是 src=repo：构建树那份由仓库副本复制（strip_header=no），
 # 本条只承载 response-fixup.ts 的新文件字节；entry.ts 的改动由 file 条目 sha 校验。
+#
+# 第 32 条（2026-10-30，r27 S1+S3 插桩）：response-fixup.ts 的尾部收口与 inflight hwm 一行。
+#   触发面：GET + 206 + 单段 Content-Range + 无非 identity content-encoding + 跨度可缓冲，且上游没给
+#   content-length（有 CL 且等于跨度时 HTTP 帧已封口，不探测、不 cancel，V1 热路径与 r26 逐字相同）。
+#   读满 span 后再探一次 done（TAIL_PROBE_MS=500，行为参数不是判据常量）：探到字节 → 保留 206 前缀 +
+#   cancel + tail=long；期限内无后续 → cancel + tail=stall；探测抛错 → cancel + tail=error；尾部正常结束 →
+#   静默。日志 `[txiki] range fixup tail <kind>: path= span= extra= probe_ms= action=cancel`，60 s 按
+#   path+kind 去重，extra 只记首块字节数（下界）。reserveBytes 成功预留后只在 inflight 创新高时打
+#   `[txiki] range fixup inflight hwm=<n> budget=<n> span=<n>`，一个实例最多 budget/span 行。
+#   本条与第 31 条一样不进 apply：字节由 file src=repo 的 response-fixup.ts 条目承载。
+#
+# 第 33 条（2026-10-30，r28 S1 收口）：response-fixup.ts 的尾部 long 由 206 改判 502。
+#   改动 1 行：readBodyWithin 在 probeTail 返回后加 `if (tail.kind === "long") throw
+#   RangeBodyError(span + tail.extra, "long")`；外层 catch 已有 cancel 与 RangeBodyError 原样抛，
+#   经 fixup 的 catch 转 badGateway 回 502（read=span+首块字节数）。stall / error 仍回 206，由 tailLog 记一行。
+#   同批把 r27 两处带绝对行号的注释改成函数名 + 错误码的相对描述，tailLog 文档改为只接 stall / error；
+#   两处跨文件行号引用（entry.ts / httpserver.c）同步改成符号名，使注释里不再出现绝对行号。
+#   本条与第 31/32 条一样不进 apply：字节由 file src=repo 的 response-fixup.ts 条目承载。

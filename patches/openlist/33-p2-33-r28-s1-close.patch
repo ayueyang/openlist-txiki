@@ -1,0 +1,62 @@
+diff --git a/src/backend/txiki/response-fixup.ts b/src/backend/txiki/response-fixup.ts
+index 1cce8fc..ab650bc 100644
+--- a/src/backend/txiki/response-fixup.ts
++++ b/src/backend/txiki/response-fixup.ts
+@@ -2,9 +2,9 @@
+  * r25 2a：在 entry.ts 的 handle() 返回值上重建 GET 单段 206 的 Response。
+  *
+  * 为什么在这里：Hono 返回的 206 body 是流（bodySize=-1），tjs 的流式分支把
+- * content-length 当 hop-by-hop 过滤掉，206 一律 chunked。entry.ts:245 之后到
++ * content-length 当 hop-by-hop 过滤掉，206 一律 chunked。entry.ts 的 handle() 出口之后到
+  * tjs.serve 之间没有任何代码再重建 Response，所以在这一处读满字节后重建，tjs 就会走
+- * 缓冲分支按 body_len 补 CL（httpserver.c:1885-1891；机制见
++ * 缓冲分支按 body_len 补 CL（httpserver.c 的 buffered 分支；机制见
+  * artifacts/arch-r3-verdict-1030/README.md 第 1.4/1.5 节）。
+  *
+  * 判定与上限复用 r24.1 p2-31（range-buffer.ts，已随回退撤出，算法与默认值不变）：
+@@ -287,13 +287,15 @@ async function readBodyWithin(
+       offset += chunk.byteLength
+     }
+     if (offset !== span) throw new RangeBodyError(offset, "short")
+-    // r27 不对称（第382轮裁决，只记现状，行号为基线）：本支读满 span 后只探一次尾巴，探到就记 tail=long，
+-    // 收口（:404-421）照旧回 206；而跨块越界（:289 抛 RangeBodyError "long"）经 :409/:414 回 502。
+-    // r27 不统一这两种长度异常，技术对错由 architect 在 r28 定；本注释只记现状，不作修复承诺。
++    // r28：读满 span 后只探一次尾巴。
++    //   - 有 CL（framed）时帧已封口，不探、不 cancel，V1 热路径与 r26 逐字相同；
++    //   - 无 CL 时探一次：探到任何字节抛 RangeBodyError(span+extra,"long")，回 502；
++    //     探不到（stall）或探测出错（error）回 206 并记日志。
+     // r27：CL==span 时帧已封口，不探不 cancel（V1 热路径与 r26 逐字相同）。
+     if (framed) return { buf: out.buffer, tail: null }
+     const tail = await probeTail(reader)
+     if (!tail) return { buf: out.buffer, tail: null }
++    if (tail.kind === "long") throw new RangeBodyError(span + tail.extra, "long")
+     try {
+       await reader.cancel()
+     } catch {}
+@@ -317,7 +319,7 @@ function reqPath(req: Request): string {
+ 
+ const lastSkipLog = new Map<string, number>()
+ 
+-/** r27：尾部异常单独一行，warn 级，按 path+kind 60 s 去重（与 skip 日志共用同一张表）。 */
++/** r28：尾部异常只接 stall / error，单独一行，warn 级，按 path+kind 60 s 去重（与 skip 日志共用同一张表）。 */
+ function tailLog(path: string, span: number, tail: { kind: string; extra: number }): void {
+   const key = "tail-" + tail.kind + "|" + path
+   const now = Date.now()
+@@ -400,12 +402,11 @@ export async function fixup(res: Response, req: Request): Promise<Response> {
+     return res
+   }
+ 
+-  // r27 不对称（第382轮裁决，只记现状）：读完 span 之后有两支，处置不同——下文行号均为 r27 基线。
+-  // 其一，跨块越界：readBodyWithin 里 offset+byteLength>span（:289）抛 RangeBodyError "long"，
+-  //   在这里 catch 到，经 :409/:414 的 badGateway 回 502。
+-  // 其二，无 CL 的 206 尾部多余字节：readBodyWithin 探到 tail=long，走到 :417 只打一行日志，
+-  //   响应照旧 206，多余字节不进 body（收口在 :404-421）。
+-  // 第382轮裁决：r27 不统一这两支，技术对错由 architect 在 r28 定；本注释只记现状，不作修复承诺。
++  // r28 裁决（S1 不对称收口）：同一请求形状（GET + 206 + 单段 CR + 无 CL + body 比 span 长）不再按分块边界分叉。
++  //   其一，跨块越界：readBodyWithin 里 offset+byteLength>span 抛 RangeBodyError("long")，由本函数 catch 转 badGateway，回 502。
++  //   其二，读满 span 后 probeTail 探到多余字节：readBodyWithin 内抛同一错误（read=span+首块字节数），同样经 catch 转 badGateway，回 502。
++  //   探不到（stall）或探测自身出错（error）不构成证据，仍回 206，由 tailLog 记一行。
++  //   定位用函数名与错误码，不写行号：改一次代码行号就挪一次。
+   let got: { buf: ArrayBuffer; tail: { kind: string; extra: number } | null }
+   try {
+     got = await readBodyWithin(res, verdict.span, READ_TIMEOUT_MS, framed)

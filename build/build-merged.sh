@@ -14,14 +14,21 @@
 #   A1_PATCH=     0 表示不应用 A1；<路径> 指定别的补丁。
 #                 默认 /mnt/c/Users/admin/Desktop/openlist-txiki/work/txiki-wasm-module.patch
 #   DEPS=         esbuild 与两个 polyfill 包的缓存目录，默认 /home/admin/txiki-build-deps
-#   DEVICE=       tjsc 远程执行设备（tjsc 是 aarch64，x86 构建机跑不了），默认 root@192.168.7.1
+#   DEVICE=       tjsc 远程执行设备（tjsc 是 aarch64，x86 构建机跑不了）；必须显式设置，
+#                 未设即打印用法并非零退出，脚本不内置任何地址
 #   TJSC_REMOTE=  设备上的 tjsc 路径，默认 /tmp/tjs-p2/tjsc
 #   LOG=          构建日志路径，默认 /home/admin/txiki-build-logs/build-<UTC 时间>.log
 set -eu
 
 TREE=${TREE:-/home/admin/txiki-merged}
 DEPS=${DEPS:-/home/admin/txiki-build-deps}
-DEVICE=${DEVICE:-root@192.168.7.1}
+# r27（S3 修复）：DEVICE 必须显式给，脚本不内置任何地址；未设即打印用法并非零退出。
+DEVICE=${DEVICE:-}
+if [ -z "$DEVICE" ]; then
+  echo "usage: DEVICE=user@host [TREE=...] [DEPS=...] [TJSC_REMOTE=...] $0" >&2
+  echo "error: DEVICE 未设置；tjsc 是 aarch64 工具，x86 构建机必须显式指定远程设备。" >&2
+  exit 2
+fi
 TJSC_REMOTE=${TJSC_REMOTE:-/tmp/tjs-p2/tjsc}
 ESBUILD_VER=0.28.1
 WSP_VER=4.3.0

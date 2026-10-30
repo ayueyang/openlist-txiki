@@ -1,0 +1,164 @@
+diff --git a/src/backend/txiki/response-fixup.ts b/src/backend/txiki/response-fixup.ts
+index 3d5181f..1cce8fc 100644
+--- a/src/backend/txiki/response-fixup.ts
++++ b/src/backend/txiki/response-fixup.ts
+@@ -22,6 +22,7 @@ const AMPLIFICATION = 4 // 应用 1 + bufferClone 1 + arrayBuffer 1 + C memcpy 1
+ const MAX_INFLIGHT = 8 // 预算允许的并发发数
+ const ABS_CAP_BYTES = 8 * 1024 * 1024 // 单发绝对天花板
+ const READ_TIMEOUT_MS = 30_000 // 读满整段的上限（安全边界）
++const TAIL_PROBE_MS = 500 // r27：无 CL 的 206 读满后再探一次 done 的期限
+ const SKIP_LOG_INTERVAL_MS = 60_000 // 同类 skip 60 s 去重，防拖动刷屏
+ 
+ export type BufferLimits = {
+@@ -182,11 +183,17 @@ function classifyRange(status: number, headers: Headers): RangeVerdict {
+ }
+ 
+ let inflightBytes = 0
++let inflightHwm = 0
+ 
+ /** 预留预算；放不下返回 false（调用方回退流式）。 */
+ function reserveBytes(bytes: number, budgetBytes: number): boolean {
+   if (!(bytes > 0) || !(budgetBytes > 0) || inflightBytes + bytes > budgetBytes) return false
+   inflightBytes += bytes
++  // r27：只在创新高时打一行（一个实例最多 budget/span 行），给 S3 顶满预算做直接读数
++  if (inflightBytes > inflightHwm) {
++    inflightHwm = inflightBytes
++    console.log("[txiki] range fixup inflight hwm=" + inflightHwm + " budget=" + budgetBytes + " span=" + bytes)
++  }
+   return true
+ }
+ 
+@@ -210,12 +217,47 @@ class RangeBodyError extends Error {
+   }
+ }
+ 
++/**
++ * r27：读满 span 后探一次尾部，只对没有 content-length 的 206 调用（有 CL 时 HTTP 帧已封口，
++ * 多出的字节不属于本响应）。返回 null=流已结束（正常）；{kind:"long"}=还有多余字节；
++ * {kind:"stall"}=期限内没有后续；{kind:"error"}=探测自身抛错。只取一块，不拷贝、不累加，
++ * extra 是该块字节数（下界），不是尾长。
++ */
++async function probeTail(reader: any): Promise<{ kind: string; extra: number } | null> {
++  let timer: any = null
++  try {
++    const step: any = await new Promise((resolve, reject) => {
++      timer = setTimeout(() => resolve({ done: true, value: null, probeTimeout: true }), TAIL_PROBE_MS)
++      reader.read().then(
++        (r: any) => resolve(r),
++        (e: any) => reject(e),
++      )
++    })
++    if (timer) {
++      clearTimeout(timer)
++      timer = null
++    }
++    if (step.probeTimeout) return { kind: "stall", extra: 0 }
++    if (step.done) return null
++    const chunk: any = step.value
++    return { kind: "long", extra: chunk && chunk.byteLength ? chunk.byteLength : 0 }
++  } catch {
++    if (timer) clearTimeout(timer)
++    return { kind: "error", extra: 0 }
++  }
++}
++
+ /** 读满整段，带期限：每次 read 按剩余期限设表，到期抛 RangeBodyError(<已读>, "timeout")，
+  * 随即 await reader.cancel() 把上游读停掉——此前 Promise.race(arrayBuffer, timeout) 只让 race
+  * 拒绝，arrayBuffer 仍在后台把上游 body 读完（502 之后上游还在被消费）。 */
+-async function readBodyWithin(res: Response, span: number, ms: number): Promise<ArrayBuffer> {
++async function readBodyWithin(
++  res: Response,
++  span: number,
++  ms: number,
++  framed: boolean,
++): Promise<{ buf: ArrayBuffer; tail: { kind: string; extra: number } | null }> {
+   const body: any = res.body
+-  if (!body || typeof setTimeout !== "function") return res.arrayBuffer()
++  if (!body || typeof setTimeout !== "function") return { buf: await res.arrayBuffer(), tail: null }
+   const reader: any = body.getReader()
+   const out = new Uint8Array(span)
+   const deadline = Date.now() + ms
+@@ -245,7 +287,17 @@ async function readBodyWithin(res: Response, span: number, ms: number): Promise<
+       offset += chunk.byteLength
+     }
+     if (offset !== span) throw new RangeBodyError(offset, "short")
+-    return out.buffer
++    // r27 不对称（第382轮裁决，只记现状，行号为基线）：本支读满 span 后只探一次尾巴，探到就记 tail=long，
++    // 收口（:404-421）照旧回 206；而跨块越界（:289 抛 RangeBodyError "long"）经 :409/:414 回 502。
++    // r27 不统一这两种长度异常，技术对错由 architect 在 r28 定；本注释只记现状，不作修复承诺。
++    // r27：CL==span 时帧已封口，不探不 cancel（V1 热路径与 r26 逐字相同）。
++    if (framed) return { buf: out.buffer, tail: null }
++    const tail = await probeTail(reader)
++    if (!tail) return { buf: out.buffer, tail: null }
++    try {
++      await reader.cancel()
++    } catch {}
++    return { buf: out.buffer, tail }
+   } catch (err: any) {
+     try {
+       await reader.cancel()
+@@ -265,6 +317,27 @@ function reqPath(req: Request): string {
+ 
+ const lastSkipLog = new Map<string, number>()
+ 
++/** r27：尾部异常单独一行，warn 级，按 path+kind 60 s 去重（与 skip 日志共用同一张表）。 */
++function tailLog(path: string, span: number, tail: { kind: string; extra: number }): void {
++  const key = "tail-" + tail.kind + "|" + path
++  const now = Date.now()
++  if (now - (lastSkipLog.get(key) || 0) < SKIP_LOG_INTERVAL_MS) return
++  lastSkipLog.set(key, now)
++  console.warn(
++    "[txiki] range fixup tail " +
++      tail.kind +
++      ": path='" +
++      path +
++      "' span=" +
++      span +
++      " extra=" +
++      tail.extra +
++      " probe_ms=" +
++      TAIL_PROBE_MS +
++      " action=cancel",
++  )
++}
++
+ /** 限额相关的拒绝才打日志，60 s 按 path+reason 去重；触发条件不满足的静默返回。 */
+ function skipLimitLog(path: string, reason: string, detail: string): void {
+   const key = reason + "|" + path
+@@ -303,6 +376,7 @@ function badGateway(path: string, span: number, read: number, code: string): Res
+  */
+ export async function fixup(res: Response, req: Request): Promise<Response> {
+   if (req.method !== "GET") return res
++  const framed = res.headers.get("content-length") !== null
+   const verdict = classifyRange(res.status, res.headers)
+   if (!(verdict.span > 0)) return res
+   if (!res.body) return res
+@@ -326,18 +400,26 @@ export async function fixup(res: Response, req: Request): Promise<Response> {
+     return res
+   }
+ 
+-  let buf: ArrayBuffer
++  // r27 不对称（第382轮裁决，只记现状）：读完 span 之后有两支，处置不同——下文行号均为 r27 基线。
++  // 其一，跨块越界：readBodyWithin 里 offset+byteLength>span（:289）抛 RangeBodyError "long"，
++  //   在这里 catch 到，经 :409/:414 的 badGateway 回 502。
++  // 其二，无 CL 的 206 尾部多余字节：readBodyWithin 探到 tail=long，走到 :417 只打一行日志，
++  //   响应照旧 206，多余字节不进 body（收口在 :404-421）。
++  // 第382轮裁决：r27 不统一这两支，技术对错由 architect 在 r28 定；本注释只记现状，不作修复承诺。
++  let got: { buf: ArrayBuffer; tail: { kind: string; extra: number } | null }
+   try {
+-    buf = await readBodyWithin(res, verdict.span, READ_TIMEOUT_MS)
++    got = await readBodyWithin(res, verdict.span, READ_TIMEOUT_MS, framed)
+   } catch (err: any) {
+     releaseBytes(verdict.span)
+     return badGateway(path, verdict.span, err && err.read ? err.read : 0, err && err.code ? err.code : "error")
+   }
++  const buf = got.buf
+   if (buf.byteLength !== verdict.span) {
+     releaseBytes(verdict.span)
+     return badGateway(path, verdict.span, buf.byteLength, buf.byteLength < verdict.span ? "short" : "long")
+   }
+   releaseBytes(verdict.span)
++  if (got.tail) tailLog(path, verdict.span, got.tail)
+ 
+   const headers = new Headers(res.headers)
+   headers.delete("content-length")
