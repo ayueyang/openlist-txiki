@@ -65,6 +65,12 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 - openpgp 6.3.1：bundle 内未修改依赖，LGPL-3.0-or-later，
   上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 ；全文见 LICENSE.LGPL-3.0
   （apk 内与本文同目录，源码归档内为 licenses/LICENSE.LGPL-3.0）。
+- OpenList-Frontend v4.2.7（MIT，仅静态前端产物，不是 AGPL 派生、也不属于本包
+  「对应源码」范围）：官方 asset openlist-frontend-dist-lite-v4.2.7.tar.gz，
+  获取地址 https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.7/openlist-frontend-dist-lite-v4.2.7.tar.gz ，
+  commit d82d950c，asset sha256 6679861e3726305434f5de665a06880bd9a74aeab5ffc4c4150accef00e1c42d。
+  包内 build-manifest.json 的 web_dist 记录了解开后的 file_count / bytes / tree_sha256 / index_sha256，
+  可离线复算；全文见 licenses/LICENSE.MIT-OpenList-Frontend。
 - 第三方组件清单见同目录 THIRD-PARTY-NOTICES。
 
 分发者：openlist-txiki 维护者（个人开发者，非公司）

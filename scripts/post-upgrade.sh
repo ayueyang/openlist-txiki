@@ -8,11 +8,28 @@ PKG_DIR=/usr/libexec/openlist-txiki
 BUNDLE=$PKG_DIR/openlist-txiki.js
 TJS=$PKG_DIR/tjs
 DATA_DIR=/etc/openlist-txiki
+DIST=/usr/share/openlist-txiki/dist
 
 log() { logger -t openlist-txiki "$*"; }
 
 manifest_sha() {
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1
+}
+
+# r29：升级后就地校验包内 dist（前端 v4.2.7）的 tree sha 与文件数；不符只记 ERROR，不阻断升级。
+check_web_dist() {
+	[ -d "$DIST" ] || { log "web dist: 缺 $DIST（前端不可用，后端照常启动）"; return 0; }
+	want=$(manifest_sha tree_sha256)
+	[ -n "$want" ] || { log "web dist: manifest 没有 web_dist.tree_sha256，跳过校验"; return 0; }
+	got=$(cd "$DIST" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | \
+		while IFS= read -r f; do printf '%s	%s\n' "$f" "$(sha256sum "$f" | awk '{print $1}')"; done | \
+		sha256sum | awk '{print $1}')
+	n=$(find "$DIST" -type f | wc -l | tr -d ' ')
+	if [ "$got" = "$want" ]; then
+		log "web dist ok: $n files tree=$got"
+	else
+		log "ERROR: web dist tree mismatch files=$n got=$got want=$want"
+	fi
 }
 
 # 升级不覆盖已有 admin.pass；r1/r2 升上来没有这个文件时补一个。
@@ -40,6 +57,7 @@ if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -f "$TJS" ]; then
 	got_t=$(sha256sum "$TJS" | cut -d' ' -f1)
 	if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ] && [ -n "$want_t" ] && [ "$got_t" = "$want_t" ]; then
 		log "post-upgrade: sha256 ok (bundle $got_b, tjs $got_t)"
+		check_web_dist
 	else
 		log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b tjs=$got_t want=$want_t; not enabling, 等人工处置"
 		[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null

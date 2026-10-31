@@ -43,9 +43,9 @@ TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txi
 sha256sum dist-txiki/openlist-txiki.js
 ```
 
-期望：预检打印「补丁 33/33（01..33 顺序与 sha 一致），指纹 67 条（file 33 + patch 33 + commit 1），
-checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,028,720 B、
-sha256 `ef776565d7fe4307292e9db3db8763ed47234d43da53f88de50df6bd90621319`、inputs 438。
+期望：预检打印「补丁 33/33（01..33 顺序与 sha 一致），指纹 68 条（file 34 + patch 33 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,034,857 B、
+sha256 `6c22e4f5a2250f901464f3b7a489f22efcb28000352728c5ca31bd02adec8f9f`、inputs 439。
 
 第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
 `%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，

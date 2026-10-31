@@ -9,6 +9,7 @@ rem No admin rights needed. Listens on loopback by default.
 rem ASCII-only on purpose: cmd.exe re-reads batch files in the console codepage,
 rem and non-ASCII text can break line parsing after a codepage switch.
 set "HERE=%~dp0"
+if not defined TJS_WEB_DIST set "TJS_WEB_DIST=%HERE%dist"
 
 if "%~1"=="" goto :usage
 if /i "%~1"=="start" goto :start

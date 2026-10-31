@@ -74,6 +74,9 @@ fi
 chmod 600 "$DATA_DIR/jwt.secret" 2>/dev/null || true
 export TJS_JWT_SECRET
 
+TJS_WEB_DIST=${TJS_WEB_DIST:-$HERE/dist}
+export TJS_WEB_DIST
+
 TJS_PORT=${TJS_PORT:-15244}
 TJS_HOST=${TJS_HOST:-127.0.0.1}
 export TJS_PORT TJS_HOST

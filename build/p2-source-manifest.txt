@@ -34,6 +34,9 @@
 #   28 同批还改仓库内 work/conductor-r347/init.d（ENV_ARGS 白名单）与
 #   usr/share/openlist-txiki/openlist-txiki.env.default（注释+默认值），两件不在构建树、不进 apply，
 #   与第 21 条对 config.ts 的留痕口径相同。
+#   2026-10-31 r29：新增 src/backend/txiki/static-site.ts（精简前端 v4.2.7 lite 静态层，src=repo，
+#   strip_header=yes / eol=lf），file_count 33->34；entry.ts 加 1 行 import + 静态层调用（src=repo，
+#   strip_header=no / eol=crlf，sha 随之重算）。patch_count 仍 33：本条不改补丁链，只加仓库自有文件。
 #
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
@@ -70,7 +73,7 @@ manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
 patch_count 33
-file_count 33
+file_count 34
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -125,7 +128,7 @@ file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backen
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file f68f7b149c6b9026461b710468698269dce2bf2d060daf031153355dea4a4888 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file 17d48573b11291e04e895bc08170e6d8db3feaf2aea28fe4f5a916b00432a35d src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file eb8b0134e751f857de6ec99586d61f173b6ba7f0199dd367c0ba071f7736d68c src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
@@ -134,6 +137,7 @@ file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backen
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
 file c15a27dac45238029a945fe2e692915dffb62887a291d49383fa16a76e32512d src/backend/txiki/sqlite-d1.ts src=repo strip_header=yes eol=lf
+file bf3b415cb81fa4ad79d4174aaef7faf9d866879c5ee3761f73d817f7f9855f2c src/backend/txiki/static-site.ts src=repo strip_header=yes eol=lf
 file 8c597387887f53129e45c45f112ac187d4fa06787f89873e339e20b943b64909 src/backend/txiki/upload-sweep.ts src=repo strip_header=yes eol=lf
 file f04d15cc749fe3c16169995a034c9f7e1f050ed93f4f1b9c82619721d83dc68c src/backend/pkg/upload-stream.ts src=patch strip_header=no eol=lf
 file fda4eca680ed60c7b78fbb624dee863ae72acb84e278792eda8d6acfbc5c778d src/backend/server/s3.ts src=patch strip_header=no eol=crlf

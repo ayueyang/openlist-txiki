@@ -1,6 +1,6 @@
-# 从源码构建（openlist-txiki 0.1.0-r28）
+# 从源码构建（openlist-txiki 0.1.0-r29）
 
-本归档是 openlist-txiki 0.1.0-r28 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r29 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
@@ -43,9 +43,9 @@ TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txi
 sha256sum dist-txiki/openlist-txiki.js
 ```
 
-期望：预检打印「补丁 33/33（01..33 顺序与 sha 一致），指纹 67 条（file 33 + patch 33 + commit 1），
-checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,028,720 B、
-sha256 `ef776565d7fe4307292e9db3db8763ed47234d43da53f88de50df6bd90621319`、inputs 438。
+期望：预检打印「补丁 33/33（01..33 顺序与 sha 一致），指纹 68 条（file 34 + patch 33 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,034,857 B、
+sha256 `6c22e4f5a2250f901464f3b7a489f22efcb28000352728c5ca31bd02adec8f9f`、inputs 439。
 
 第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
 `%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，
@@ -94,7 +94,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r28
+VERSION=0.1.0-r29
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```

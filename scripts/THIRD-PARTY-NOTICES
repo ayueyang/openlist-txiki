@@ -29,10 +29,21 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    该修改的源码与构建方式见 SOURCE-OFFER；运行期完整源码树与构建记录按
    SOURCE-OFFER 第三节的联系方式书面索取。
 
-4. 许可证全文（apk 内 /usr/share/openlist-txiki/；源码归档内 licenses/）
+4. OpenList-Frontend v4.2.7（MIT，仅静态前端产物）
+   本包包含 OpenListTeam/OpenList-Frontend 的官方发布件 openlist-frontend-dist-lite-v4.2.7.tar.gz
+   （解开后装在 /usr/share/openlist-txiki/dist，222 个文件，9,384,554 B），未修改源码。
+   上游 https://github.com/OpenListTeam/OpenList-Frontend/tree/v4.2.7 （commit d82d950c）。
+   asset sha256：6679861e3726305434f5de665a06880bd9a74aeab5ffc4c4150accef00e1c42d，
+   与包内 build-manifest.json 的 web_dist 字段同源（archive_sha256 / tree_sha256 / file_count）。
+   许可证全文见 licenses/LICENSE.MIT-OpenList-Frontend（apk 内与本文同目录）。
+   前端是 MIT，不是 AGPL 派生：不要并入 OpenList-Worker 的对应源码清单。
+
+5. 许可证全文（apk 内 /usr/share/openlist-txiki/；源码归档内 licenses/）
    LICENSE.AGPL-3.0    AGPL-3.0（OpenList-Worker 修改版）
    LICENSE.LGPL-3.0    LGPL-3.0（openpgp）
    LICENSE.Apache-2.0  Apache-2.0 全文，含 WAMR 的 LLVM Exceptions 段
    LICENSE.MIT         MIT 原文（txiki.js、libwebsockets、QuickJS、libuv、libffi、mimalloc）
+   licenses/LICENSE.MIT-OpenList-Frontend
+                       MIT 原文（OpenList-Frontend v4.2.7 静态产物）
    sqlite3 与 tweetnacl 为 Public Domain，不要求附许可证全文。
 

@@ -43,7 +43,9 @@ if [ "$manifest_version" != "$VERSION" ]; then
 	exit 1
 fi
 
-# 包内文件集必须精确等于规格 §2 的 11 个文件，多一个少一个都失败
+# r29：固定文件 12 个（原 11 个 + 前端 MIT license）；其余文件只允许在 dist 下。
+# 规则：固定名单逐个必须在；不在固定名单的，路径必须以 usr/share/openlist-txiki/dist/ 开头；
+# dist 里必须有 index.html，且文件数等于 manifest 的 web_dist.file_count；多一个少一个都失败。
 EXPECTED='etc/init.d/openlist-txiki
 usr/libexec/openlist-txiki/openlist-txiki.js
 usr/libexec/openlist-txiki/tjs
@@ -51,15 +53,29 @@ usr/share/openlist-txiki/LICENSE.AGPL-3.0
 usr/share/openlist-txiki/LICENSE.Apache-2.0
 usr/share/openlist-txiki/LICENSE.LGPL-3.0
 usr/share/openlist-txiki/LICENSE.MIT
+usr/share/openlist-txiki/licenses/LICENSE.MIT-OpenList-Frontend
 usr/share/openlist-txiki/SOURCE-OFFER
 usr/share/openlist-txiki/THIRD-PARTY-NOTICES
 usr/share/openlist-txiki/build-manifest.json
 usr/share/openlist-txiki/openlist-txiki.env.default'
+DIST_PREFIX='usr/share/openlist-txiki/dist/'
 GOT=$(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort)
-if [ "$GOT" != "$(printf '%s\n' "$EXPECTED" | sort)" ]; then
-	echo "FAIL: staging 文件集不符" >&2
-	echo "--- 期望 ---" >&2; printf '%s\n' "$EXPECTED" | sort >&2
-	echo "--- 实际 ---" >&2; printf '%s\n' "$GOT" >&2
+printf '%s\n' "$EXPECTED" | sort > /tmp/expected.$$
+printf '%s\n' "$GOT" > /tmp/got.$$
+missing=$(comm -23 /tmp/expected.$$ /tmp/got.$$)
+extra=$(comm -13 /tmp/expected.$$ /tmp/got.$$ | grep -v "^$DIST_PREFIX" || true)
+rm -f /tmp/expected.$$ /tmp/got.$$
+if [ -n "$missing" ] || [ -n "$extra" ]; then
+	echo "FAIL: staging 文件集不符（缺固定文件或出现 dist 外的额外文件）" >&2
+	echo "--- 缺 ---" >&2; printf '%s\n' "$missing" >&2
+	echo "--- 多（不在固定名单且不在 dist 下）---" >&2; printf '%s\n' "$extra" >&2
+	exit 1
+fi
+[ -f "$STAGE/usr/share/openlist-txiki/dist/index.html" ] || { echo "FAIL: dist 里没有 index.html" >&2; exit 1; }
+want_dist_files=$(sed -n 's/.*"file_count"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$MANIFEST" | tail -n 1)
+got_dist_files=$(cd "$STAGE" && find "usr/share/openlist-txiki/dist" -type f | wc -l | tr -d ' ')
+if [ -z "$want_dist_files" ] || [ "$got_dist_files" != "$want_dist_files" ]; then
+	echo "FAIL: dist 文件数 $got_dist_files 与 manifest web_dist.file_count=${want_dist_files:-读不到} 不符" >&2
 	exit 1
 fi
 
@@ -70,7 +86,15 @@ chown -R 0:0 "$STAGE"
 chmod 755 "$STAGE/usr/libexec/openlist-txiki/tjs"
 chmod 755 "$STAGE/etc/init.d/openlist-txiki"
 chmod 644 "$STAGE/usr/libexec/openlist-txiki/openlist-txiki.js"
-for f in "$STAGE"/usr/share/openlist-txiki/*; do chmod 644 "$f"; done
+# 只对文件 chmod：r29 起 usr/share/openlist-txiki 下有 licenses/ 与 dist/ 两个子目录，
+# 对目录 chmod 644 会去掉执行位，包内目录就进不去。
+for f in "$STAGE"/usr/share/openlist-txiki/*; do [ -f "$f" ] && chmod 644 "$f"; done
+if [ -d "$STAGE/usr/share/openlist-txiki/licenses" ]; then
+	find "$STAGE/usr/share/openlist-txiki/licenses" -type f -exec chmod 644 {} \;
+fi
+if [ -d "$STAGE/usr/share/openlist-txiki/dist" ]; then
+	find "$STAGE/usr/share/openlist-txiki/dist" -type f -exec chmod 644 {} \;
+fi
 # 目录权限固定 0755：Windows/MSYS 拷进来的目录常是 0777，mkpkg 会照抄进包
 # （本轮负向对照实测：0777 staging 用旧脚本打出来的包内目录就是 0777，见
 # artifacts/p4-apk-r7-*/README.md）。chmod 后回读，任何目录不是 0755 就中止。
@@ -80,6 +104,10 @@ bad_dirs=$(find "$STAGE" -type d ! -perm 755)
 [ -z "$bad_dirs" ] || { echo "FAIL: 目录权限不是 0755:" >&2; echo "$bad_dirs" >&2; exit 1; }
 
 rm -f "$OUT"
+# r29：installed-size 记录。历史口径是「包内所有文件字节和」（r15 已核）；这里先现算，
+# 打包后再从 adbdump 读实际值比对，不等就说明 staging 与包内文件集不一致。
+STAGE_BYTES=$(find "$STAGE" -type f -printf '%s\n' | awk '{s+=$1} END{print s}')
+echo "STAGE_BYTES=$STAGE_BYTES"
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \
 	-I "version:$VERSION" \
@@ -99,5 +127,22 @@ rm -f "$OUT"
 echo "APK=$OUT"
 echo "BYTES=$(wc -c < "$OUT" | tr -d ' ')"
 echo "SHA256=$(sha256sum "$OUT" | cut -d' ' -f1)"
+# r29：dist tree 现算，与 manifest 的 web_dist.tree_sha256 比对（算法与 CRITERIA G3 一致）。
+if [ -d "$STAGE/usr/share/openlist-txiki/dist" ]; then
+	DIST_TREE=$(cd "$STAGE/usr/share/openlist-txiki/dist" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | \
+		while IFS= read -r f; do printf '%s\t%s\n' "$f" "$(sha256sum "$f" | awk '{print $1}')"; done | \
+		sha256sum | awk '{print $1}')
+	WANT_TREE=$(sed -n 's/.*"tree_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1)
+	echo "DIST_TREE=$DIST_TREE"
+	echo "DIST_TREE_WANT=$WANT_TREE"
+	[ "$DIST_TREE" = "$WANT_TREE" ] || { echo "FAIL: dist tree 与 manifest 不符" >&2; exit 1; }
+fi
 echo "--- adbdump（前 40 行）---"
-apk adbdump "$OUT" 2>/dev/null | head -40 || "$APK" adbdump "$OUT" | head -40
+ADB=$("$APK" adbdump "$OUT" 2>/dev/null || apk adbdump "$OUT" 2>/dev/null || true)
+printf '%s\n' "$ADB" | head -40
+ISIZE=$(printf '%s\n' "$ADB" | sed -n 's/.*installed-size:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)
+echo "INSTALLED_SIZE=${ISIZE:-unread}"
+echo "STAGE_BYTES=$STAGE_BYTES"
+if [ -n "${ISIZE:-}" ]; then
+	[ "$ISIZE" = "$STAGE_BYTES" ] || echo "WARN: adbdump installed-size=$ISIZE 与 staging 字节和 $STAGE_BYTES 不等"
+fi
