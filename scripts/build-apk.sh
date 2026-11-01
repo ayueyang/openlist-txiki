@@ -1,8 +1,8 @@
 #!/bin/sh
 # openlist-txiki apk 打包脚本。
 #
-# 运行环境：有 apk-tools 3.0.x（带 mkpkg）的机器。本项目的实际做法是把
-# Alpine edge 的 apk-tools-static 解包到设备 /tmp/apkstatic，在设备 /tmp 里打包：
+# 运行环境：有 apk-tools 3.0.x（带 mkpkg）的容器（alpine:edge）或等价 GNU 环境构建；
+# 设备精简 BusyBox 缺 comm/stat/find -printf，不支持就地重打（r30 preflight 直接拒跑）。
 #   wget -O /tmp/ats.apk https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/apk-tools-static-3.0.8-r0.apk
 #   cd /tmp/apkstatic && apk extract --allow-untrusted /tmp/ats.apk   # 得到 sbin/apk.static
 # 设备自带 apk-tools 3.0.5 没有 mkpkg 子命令（实测），所以必须用这个静态包。
@@ -12,6 +12,9 @@
 #   OUT=/tmp/p3-build/openlist-txiki-<版本>.apk APK=/tmp/apkstatic/sbin/apk.static \
 #   VERSION=<版本> sh scripts/apk/build-apk.sh
 #
+# mtime 归一（r423）：包内 mtime 取 SOURCE_DATE_EPOCH（纯数字非空）或 build-manifest.json
+# 的 build_date（YYYY-MM-DD，按 UTC 零点换算）；两者都缺直接失败退出。NORMALIZE_MTIME=0
+# 跳过归一（输出带 NORMALIZE_MTIME=0），其它值只接受 1。
 # STAGE 是解包后的文件树（只含包内 11 个文件）；SCRIPTS 是 5 个生命周期脚本所在目录。
 # VERSION 必须显式给出，OUT 默认 /tmp/p3-build/openlist-txiki-$VERSION.apk：
 # 直接重打不会再产出比线上低的包（2026-10-22 实测降级陷阱）。
@@ -22,6 +25,12 @@ STAGE=${STAGE:-/tmp/p3-build/stage}
 SCRIPTS=${SCRIPTS:-/tmp/p3-build/scripts}
 OUT=${OUT:-/tmp/p3-build/openlist-txiki-$VERSION.apk}
 APK=${APK:-/tmp/apkstatic/sbin/apk.static}
+
+# r30 C6：设备精简 BusyBox 缺 comm/stat，早失败早说清楚（不做 BusyBox 兼容层）。
+command -v comm >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || {
+  echo "FAIL: 需要 comm 与 stat（GNU coreutils 或 alpine BusyBox）。设备精简 BusyBox 不支持，请在容器里构建" >&2
+  exit 1
+}
 
 [ -x "$APK" ] || { echo "FAIL: $APK 不可执行（需要 apk-tools 3.0.x 的 mkpkg）" >&2; exit 1; }
 [ -d "$STAGE" ] || { echo "FAIL: staging 目录不存在 $STAGE" >&2; exit 1; }
@@ -60,6 +69,8 @@ usr/share/openlist-txiki/build-manifest.json
 usr/share/openlist-txiki/openlist-txiki.env.default'
 DIST_PREFIX='usr/share/openlist-txiki/dist/'
 GOT=$(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort)
+# r30 C5：失败路径清理。中间任一步非零退出（如 comm 缺失 rc=127）都不留 /tmp 残留文件。
+trap 'rm -f /tmp/expected.$$ /tmp/got.$$' EXIT INT TERM HUP
 printf '%s\n' "$EXPECTED" | sort > /tmp/expected.$$
 printf '%s\n' "$GOT" > /tmp/got.$$
 missing=$(comm -23 /tmp/expected.$$ /tmp/got.$$)
@@ -103,10 +114,55 @@ find "$STAGE" -type d -exec chown 0:0 {} \;
 bad_dirs=$(find "$STAGE" -type d ! -perm 755)
 [ -z "$bad_dirs" ] || { echo "FAIL: 目录权限不是 0755:" >&2; echo "$bad_dirs" >&2; exit 1; }
 
+# r423 C2：mtime 归一（依据 work/architect-mtime-dec-2206/DECISION.md，commit 2bbb7f4f）。
+# 目的：同一 staging 内容换时间打包，apk 字节会因包内 mtime 不同而不同；这里把 mtime 钉死。
+# 取值优先级：SOURCE_DATE_EPOCH（纯数字、非空）> manifest 的 build_date（YYYY-MM-DD，UTC 零点）。
+# 两者都缺就失败退出，不回退到「现在」。NORMALIZE_MTIME=0 跳过归一（输出带 NORMALIZE_MTIME=0），
+# NORMALIZE_MTIME 空等同 1，其它值失败退出。归一后逐条回读，任何一条不等就失败退出。
+NORMALIZE_MTIME=${NORMALIZE_MTIME:-1}
+case "$NORMALIZE_MTIME" in
+	0)
+		echo "NORMALIZE_MTIME=0：跳过 mtime 归一（SOURCE_DATE_EPOCH/build_date 均不读取）"
+		;;
+	1)
+		if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+			case "$SOURCE_DATE_EPOCH" in
+				*[!0-9]*) echo "FAIL: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH 不是纯数字" >&2; exit 1 ;;
+			esac
+			MTIME_EPOCH=$SOURCE_DATE_EPOCH
+			MTIME_SRC="SOURCE_DATE_EPOCH"
+		else
+			mtime_build_date=$(sed -n 's/.*"build_date"[[:space:]]*:[[:space:]]*"\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)".*/\1/p' "$MANIFEST" | head -n 1)
+			[ -n "$mtime_build_date" ] || { echo "FAIL: 没有 SOURCE_DATE_EPOCH，$MANIFEST 里也没有 build_date（YYYY-MM-DD），拒绝打包" >&2; exit 1; }
+			if ! MTIME_EPOCH=$(date -u -d "$mtime_build_date 00:00:00" +%s 2>/dev/null); then
+				echo "FAIL: build_date=$mtime_build_date 换算 UTC epoch 失败" >&2
+				exit 1
+			fi
+			MTIME_SRC="manifest build_date=$mtime_build_date"
+		fi
+		case "$MTIME_EPOCH" in
+			''|*[!0-9]*) echo "FAIL: mtime epoch 不是纯数字：$MTIME_EPOCH（来源 $MTIME_SRC）" >&2; exit 1 ;;
+		esac
+		# cd 进 $STAGE 后只用 find . 的相对路径：归一范围锁死，路径不可能逃出 $STAGE。
+		# find . 的输出含根目录 .（对应 C1 清单的根行）；-depth 让目录排在其内容之后。
+		# 遍历顺序不影响结果（touch 子项不改父目录 mtime），加 -depth 与 C1 复原口径一致。
+		( cd "$STAGE" && find . -depth -exec touch -h -d "@$MTIME_EPOCH" {} + ) || { echo "FAIL: mtime 归一 touch 失败（STAGE=$STAGE epoch=$MTIME_EPOCH）" >&2; exit 1; }
+		mtime_lines=$( cd "$STAGE" && find . -exec stat -c '%Y %n' {} + ) || { echo "FAIL: mtime 回读命令失败" >&2; exit 1; }
+		[ -n "$mtime_lines" ] || { echo "FAIL: mtime 回读为空" >&2; exit 1; }
+		bad_mtime=$(printf '%s\n' "$mtime_lines" | awk -v want="$MTIME_EPOCH" '$1 != want {print}')
+		[ -z "$bad_mtime" ] || { echo "FAIL: mtime 回读与目标 epoch=$MTIME_EPOCH 不等（来源 $MTIME_SRC）:" >&2; echo "$bad_mtime" >&2; exit 1; }
+		echo "MTIME_EPOCH=$MTIME_EPOCH（来源 $MTIME_SRC）"
+		;;
+	*)
+		echo "FAIL: NORMALIZE_MTIME=$NORMALIZE_MTIME 非法（只接受 0 或 1）" >&2
+		exit 1
+		;;
+esac
+
 rm -f "$OUT"
 # r29：installed-size 记录。历史口径是「包内所有文件字节和」（r15 已核）；这里先现算，
 # 打包后再从 adbdump 读实际值比对，不等就说明 staging 与包内文件集不一致。
-STAGE_BYTES=$(find "$STAGE" -type f -printf '%s\n' | awk '{s+=$1} END{print s}')
+STAGE_BYTES=$(find "$STAGE" -type f -exec stat -c %s {} + | awk '{s+=$1} END{print s}')
 echo "STAGE_BYTES=$STAGE_BYTES"
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \

@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 33 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 35 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -37,11 +37,25 @@
 #   2026-10-31 r29：新增 src/backend/txiki/static-site.ts（精简前端 v4.2.7 lite 静态层，src=repo，
 #   strip_header=yes / eol=lf），file_count 33->34；entry.ts 加 1 行 import + 静态层调用（src=repo，
 #   strip_header=no / eol=crlf，sha 随之重算）。patch_count 仍 33：本条不改补丁链，只加仓库自有文件。
+
+# 第 34 条（2026-11-01，r30 F1）：guest 默认停用（新库腿）。
+#   internal/model/db.ts:836 与 server/auth.ts:336 的 guest 块 disabled: false 改 true；
+#   admin 的 :824 与 :350 不动。patch_count 33->34；file_count 不变（db.ts 未登记，
+#   auth.ts 条目 sha 重算）。
+#
+# 第 35 条（2026-11-01，r30 F4）：分享错密码状态码。
+#   internal/op/share.ts:159 的密码错分支补 status: 403；raw.ts 的 (shareRes.status || 404)
+#   直接透传，不需要改。fs.ts 的 shareErrorResponse 已按「密码错 403、其他 400」实现，未改。
+#   patch_count 34->35；internal/op/share.ts 未登记 file 条目（同 db.ts，靠补丁 sha 校验）。
+#
+# 2026-11-01 r30 适配层：新增 src/backend/txiki/guest-default.ts（已装库 guest 一次性迁移，
+#   src=repo，strip_header=yes / eol=lf），file_count 34->35；entry.ts 加 import 与启动调用
+#   （src=repo，strip_header=no / eol=crlf，sha 重算）。执行顺序 01..35。
 #
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..33> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..35> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -53,27 +67,27 @@
 #      "上游基线：OpenListTeam/OpenList-Worker 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca"、第 3 行含 "本地维护："、第 4 行 */）。
 #      strip_header=yes 的条目必须存在这 4 行并在写入构建树前剥掉；缺头即失败，不做兜底猜测。
 #   2) 构建树里 config.ts 是 CRLF；globals.ts、shims/fs.ts、shims/fs-promises.ts、shims/path.ts、
-#      sqlite-d1.ts、upload-sweep.ts、fetch-host.ts、rename-fail-entry.ts 是 LF；
+#      sqlite-d1.ts、upload-sweep.ts、fetch-host.ts、rename-fail-entry.ts、guest-default.ts 是 LF；
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 33 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 35 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
-#   校验：prepare 之后对 33 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
+#   校验：prepare 之后对 35 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
 # 缺口 3：rename-fail-entry.ts 是测试专用入口（生产 bundle 不引用），不在 src/ 下；
 #   唯一来源 work/fault/rename-fail-entry.ts，sha256 a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23，与构建树字节相同。
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..33 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..35 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
-#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 33 条指纹后出包）
+#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 35 条指纹后出包）
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 33
-file_count 34
+patch_count 35
+file_count 35
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -107,6 +121,8 @@ patch 30 e29d6ee1c1e94a0a62e3b2d9e8842cf02a6eae527e369aaa586aa380ad65b046 work/p
 patch 31 ed693ca5a5ae9357ba3031cf550d911cc88754f651bf782a880fb2a3cad18fa1 work/p2-31-r25-exit-range.patch
 patch 32 92ee0b208b147a77d34a82ccc4f28dcfd9d77731c6b298b93d0c33a8a6578919 work/p2-32-r27-tail-close.patch
 patch 33 e087532169e3b532080599679c5d856c2f2ebee3119a06ab94347cac26fc0949 work/p2-33-r28-s1-close.patch
+patch 34 cea431a4bba116cf3bc64cb295ac7e84fc50419ffcb62f3ce9886eb9326d8588 work/p2-34-guest-default-disabled.patch
+patch 35 8ab0c06e4722b3c2776b6d9b800f40776866738a5d95a629e0b21b8c84cb550f work/p2-35-share-wrong-password-status.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -119,7 +135,7 @@ file 7efe4b23569f8458439d00bce562f5c3aaec6afebdb51c00bae7b7648e741907 src/backen
 file 3b0bc05837d6676e6adac59ebe03d708899f519e73163c712b42eb420ae6ff26 src/backend/pkg/password.ts src=patch strip_header=no eol=crlf
 file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backend/pkg/xml.ts src=patch strip_header=no eol=crlf
 file 88ba989d03bdb0cf93affb328d7e030f861c0b34a559c04cb7f0c528230f7a1a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
-file e6940fdae9870b516edcfaed42f05474a2487c5a5795749abc600410cd1c5373 src/backend/server/auth.ts src=patch strip_header=no eol=crlf
+file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
 file eb8e80d3f609573965bd74ef2ec955e16a4c26f4789bd6b23de056e5e1c2ba22 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
@@ -128,8 +144,9 @@ file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backen
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file f68f7b149c6b9026461b710468698269dce2bf2d060daf031153355dea4a4888 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file eb8b0134e751f857de6ec99586d61f173b6ba7f0199dd367c0ba071f7736d68c src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file cd37c8fe865201fab6f0bc64cce3e61f08d9e3599a9f236846e569e89a81056e src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
+file d50868832ba8764c755732669b7514e975b3fee1ddded29308012b834e9a79ce src/backend/txiki/guest-default.ts src=repo strip_header=yes eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
 file f7ec348dd5c0ffe7710c38c139df41b28f1d1a21f5709adc4cef4ea2937938b9 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf

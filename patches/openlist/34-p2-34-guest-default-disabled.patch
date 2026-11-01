@@ -1,0 +1,26 @@
+diff --git a/src/backend/internal/model/db.ts b/src/backend/internal/model/db.ts
+index 283acba..e505343 100644
+--- a/src/backend/internal/model/db.ts
++++ b/src/backend/internal/model/db.ts
+@@ -833,7 +833,7 @@ export const defaultDb = {
+       role: 1,
+       permission: 0,
+       base_path: "/",
+-      disabled: false,
++      disabled: true,
+       sso_id: "",
+       allow_ldap: false,
+       pwd_update_at: new Date().toISOString(),
+diff --git a/src/backend/server/auth.ts b/src/backend/server/auth.ts
+index f71df54..b94fb03 100644
+--- a/src/backend/server/auth.ts
++++ b/src/backend/server/auth.ts
+@@ -333,7 +333,7 @@ export async function getOrInitUsers(envCtx: any) {
+       role: 1,
+       permission: 0,
+       base_path: "/",
+-      disabled: false,
++      disabled: true,
+       sso_id: "",
+       allow_ldap: false,
+       pwd_update_at: new Date().toISOString(),
