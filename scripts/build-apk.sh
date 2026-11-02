@@ -1,16 +1,18 @@
 #!/bin/sh
 # openlist-txiki apk 打包脚本。
 #
-# 运行环境：有 apk-tools 3.0.x（带 mkpkg）的容器（alpine:edge）或等价 GNU 环境构建；
-# 设备精简 BusyBox 缺 comm/stat/find -printf，不支持就地重打（r30 preflight 直接拒跑）。
-#   wget -O /tmp/ats.apk https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/apk-tools-static-3.0.8-r0.apk
-#   cd /tmp/apkstatic && apk extract --allow-untrusted /tmp/ats.apk   # 得到 sbin/apk.static
-# 设备自带 apk-tools 3.0.5 没有 mkpkg 子命令（实测），所以必须用这个静态包。
+# 运行环境：钉死镜像 alpine@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000
+# （2026-11-02 现测 apk-tools 3.0.7-r0, compiled for x86_64；容器内直接用 /sbin/apk）。
+# 出包与解包校验固定 apk-tools 3.0.7-r0；3.0.8 的 extract 在带根级硬链接的树上 rc=1、9 件只落 5 件。
+# 3.0.7-r0 的静态包在 Alpine edge 已下架（2026-11-02 现测 404），所以用上面的容器，不下载静态包。
+# 设备精简 BusyBox 缺 comm/stat/find -printf，不支持就地重打（r30 preflight 直接拒跑）；
+# 设备自带 apk-tools 3.0.5 没有 mkpkg 子命令（实测），所以必须在容器里打。
 #
-# 用法（本地构建，apk-tools 3.0.x 带 mkpkg 的 Linux；默认值见下）：
+# 用法（钉死镜像内，默认值见下）：
 #   STAGE=/tmp/p3-build/stage SCRIPTS=/tmp/p3-build/scripts \
-#   OUT=/tmp/p3-build/openlist-txiki-<版本>.apk APK=/tmp/apkstatic/sbin/apk.static \
+#   OUT=/tmp/p3-build/openlist-txiki-<版本>.apk \
 #   VERSION=<版本> sh scripts/apk/build-apk.sh
+# APK 默认 /sbin/apk（就是钉死镜像里 apk-tools 3.0.7-r0 自带的那份），容器内不用显式给。
 #
 # mtime 归一（r423）：包内 mtime 取 SOURCE_DATE_EPOCH（纯数字非空）或 build-manifest.json
 # 的 build_date（YYYY-MM-DD，按 UTC 零点换算）；两者都缺直接失败退出。NORMALIZE_MTIME=0
@@ -24,7 +26,7 @@ VERSION=${VERSION:?必须显式给出 VERSION（0.1.0 加 -r 序号）}
 STAGE=${STAGE:-/tmp/p3-build/stage}
 SCRIPTS=${SCRIPTS:-/tmp/p3-build/scripts}
 OUT=${OUT:-/tmp/p3-build/openlist-txiki-$VERSION.apk}
-APK=${APK:-/tmp/apkstatic/sbin/apk.static}
+APK=${APK:-/sbin/apk}
 
 # r30 C6：设备精简 BusyBox 缺 comm/stat，早失败早说清楚（不做 BusyBox 兼容层）。
 command -v comm >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || {
@@ -32,7 +34,14 @@ command -v comm >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || {
   exit 1
 }
 
-[ -x "$APK" ] || { echo "FAIL: $APK 不可执行（需要 apk-tools 3.0.x 的 mkpkg）" >&2; exit 1; }
+[ -x "$APK" ] || { echo "FAIL: $APK 不可执行。出包要在钉死镜像 alpine@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000 里跑，容器内直接用 /sbin/apk（apk-tools 3.0.7-r0）；完整步骤见仓库根 REBUILD.md「打 apk：钉死镜像与 apk-tools 口径」" >&2; exit 1; }
+# B7：apk --version 进构建日志；不是 3.0.7-r0 只 WARN 不 exit（别在别人机器上直接卡死）。
+apk_version_line=$("$APK" --version 2>&1 || true)
+echo "apk --version: $apk_version_line"
+case "$apk_version_line" in
+	*"apk-tools 3.0.7-r0"*) : ;;
+	*) echo "WARN: apk-tools 不是 3.0.7-r0（实测：${apk_version_line:-读不到}）；r30 字节身份只在 3.0.7-r0 上验证过，出包前请核对" >&2 ;;
+esac
 [ -d "$STAGE" ] || { echo "FAIL: staging 目录不存在 $STAGE" >&2; exit 1; }
 for s in pre-deinstall post-install pre-upgrade post-upgrade post-deinstall; do
 	[ -f "$SCRIPTS/$s.sh" ] || { echo "FAIL: 缺少脚本 $SCRIPTS/$s.sh" >&2; exit 1; }
@@ -49,6 +58,63 @@ if [ -z "$manifest_version" ]; then
 fi
 if [ "$manifest_version" != "$VERSION" ]; then
 	echo "FAIL: manifest package_version=$manifest_version 与包版本 VERSION=$VERSION 不一致，拒绝打包" >&2
+	exit 1
+fi
+
+# B5 fail-closed：包内 SOURCE-OFFER 是把 SOURCE-OFFER.in 渲染进 stage 的成品，本脚本既不渲染也不改写它，
+# 所以这里逐条核对它确实是本次 $VERSION 的成品。三条任一不满足就中止，不带着旧版本或未替换占位符出门。
+# 历史事故：工作树里另有一份未渲染的 0.1.0-r28 残留，与包内成品并存，肉眼看不出。
+# r446 D1：两条版本断言从子串匹配改成精确相等。子串会让 VERSION=0.1.0-r3 命中 0.1.0-r30，
+# 旧版本号打新模板会被放过；现在版本串必须整串相等。
+OFFER=$STAGE/usr/share/openlist-txiki/SOURCE-OFFER
+[ -f "$OFFER" ] || { echo "FAIL: 缺 $OFFER" >&2; exit 1; }
+offer_ver_line=$(grep '^包名与版本：' "$OFFER" | head -n 1)
+if [ -z "$offer_ver_line" ]; then
+	echo "FAIL: 判据=版本行：$OFFER 里找不到「包名与版本：」行，无法核对版本（期望完全等于 VERSION=$VERSION）" >&2
+	exit 1
+fi
+# 判据=版本行：取「包名与版本：」行的包名 openlist-txiki 之后、「（」之前的版本串，必须与 $VERSION 整串相等。
+offer_rest=${offer_ver_line#*包名与版本：}
+case "$offer_rest" in
+	"openlist-txiki "*)
+		offer_tail=${offer_rest#openlist-txiki }
+		case "$offer_tail" in
+			*"（"*) offer_ver=${offer_tail%%（*} ;;
+			*) echo "FAIL: 判据=版本行：版本行里 openlist-txiki 之后找不到「（」分隔，取不出版本串（期望 VERSION=$VERSION；原文：$offer_ver_line）" >&2; exit 1 ;;
+		esac
+		;;
+	*)
+		echo "FAIL: 判据=版本行：版本行里「包名与版本：」之后不是 openlist-txiki 开头，取不出版本串（期望 VERSION=$VERSION；原文：$offer_ver_line）" >&2
+		exit 1
+		;;
+esac
+if [ "$offer_ver" != "$VERSION" ]; then
+	echo "FAIL: 判据=版本行：SOURCE-OFFER 版本串=$offer_ver 与 VERSION=$VERSION 不完全相等（原文：$offer_ver_line）" >&2
+	exit 1
+fi
+offer_url_line=$(grep '下载地址：' "$OFFER" | head -n 1)
+if [ -z "$offer_url_line" ]; then
+	echo "FAIL: 判据=下载地址：$OFFER 里找不到「下载地址：」行，无法核对源码归档地址（期望版本段 v$VERSION）" >&2
+	exit 1
+fi
+# 判据=下载地址：取 URL 里 /releases/download/ 之后、下一个 / 之前的路径段，必须与 v$VERSION 整串相等。
+case "$offer_url_line" in
+	*"/releases/download/"*)
+		offer_tag=${offer_url_line#*/releases/download/}
+		offer_tag=${offer_tag%%/*}
+		;;
+	*)
+		echo "FAIL: 判据=下载地址：下载地址行里没有 /releases/download/ 路径，取不出版本段（期望 v$VERSION；原文：$offer_url_line）" >&2
+		exit 1
+		;;
+esac
+if [ "$offer_tag" != "v$VERSION" ]; then
+	echo "FAIL: 判据=下载地址：SOURCE-OFFER 下载地址版本段=$offer_tag 与 v$VERSION 不完全相等（原文：$offer_url_line）" >&2
+	exit 1
+fi
+if grep -q '@@' "$OFFER"; then
+	echo "FAIL: 判据=占位符：SOURCE-OFFER 仍有未渲染占位符（含 @@），.in 模板没替换干净（期望 VERSION=$VERSION 的成品）：" >&2
+	grep -n '@@' "$OFFER" | head -n 5 >&2
 	exit 1
 fi
 
