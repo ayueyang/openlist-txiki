@@ -185,6 +185,11 @@ if (!commit) {
 
 const bundleBytes = fs.statSync(opt.bundle).size
 const tjsBytes = fs.statSync(opt.tjs).size
+const runtime = opt.runtime || "bundled"
+if (runtime !== "bundled" && runtime !== "shared") {
+  console.error("FAIL: --runtime 只接受 bundled 或 shared（现为 " + runtime + "）")
+  process.exit(1)
+}
 const out = {
   package: "openlist-txiki",
   package_version: opt.version,
@@ -207,6 +212,10 @@ const out = {
   build_date: new Date().toISOString().slice(0, 10),
 }
 if (webDist) out.web_dist = webDist
+if (runtime === "shared") {
+  out.runtime = "shared"
+  out.tjs_min_version = opt["tjs-min-version"] || "26.9.0"
+}
 fs.mkdirSync(path.dirname(opt.out), { recursive: true })
 fs.writeFileSync(opt.out, JSON.stringify(out, null, 2) + "\n")
-console.log(JSON.stringify({ out: opt.out, bundle_sha256: out.bundle_sha256, bundle_bytes: bundleBytes, tjs_sha256: out.tjs_sha256, tjs_bytes: tjsBytes, patches: patchLines.length }, null, 2))
+console.log(JSON.stringify({ out: opt.out, runtime, bundle_sha256: out.bundle_sha256, bundle_bytes: bundleBytes, tjs_sha256: out.tjs_sha256, tjs_bytes: tjsBytes, patches: patchLines.length }, null, 2))

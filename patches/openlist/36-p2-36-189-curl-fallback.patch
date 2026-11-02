@@ -1,0 +1,175 @@
+diff --git a/src/backend/drivers/189/curl-fallback.ts b/src/backend/drivers/189/curl-fallback.ts
+new file mode 100644
+index 0000000..c9bbf23
+--- /dev/null
++++ b/src/backend/drivers/189/curl-fallback.ts
+@@ -0,0 +1,130 @@
++/**
++ * 189 登录首跳的 curl 兜底。
++ *
++ * 背景（conductor 2026-11-03 05:13-05:14 设备只读实验，H1 成立）：同一个
++ * loginUrl.action，txiki.js 的 TLS 栈拿到 200 + Tengine 静态页（etag
++ * "69a4ee78-4f88"、20,360 B），同一节点同一时间 curl 拿到 302。命中静态页时
++ * 用子进程 curl 重新取一次跳转地址。
++ *
++ * 边界：只兜首跳。curl 不存在 / 非 0 退出 / 超时一律返回 null，由调用方回到
++ * 原错误路径（「登录跳转参数不完整」）；只有 curl 跑成功但两次都拿不到
++ * lt+reqId 才抛 189_EDGE_STATIC_PAGE，不静默降级。
++ */
++
++/** 边缘静态页的 etag（比较时去掉两端引号）。 */
++const EDGE_STATIC_ETAG = "69a4ee78-4f88"
++/** 边缘静态页的 content-length。 */
++const EDGE_STATIC_BYTES = "20360"
++/** 设备现测：curl 8.21.0 在 /usr/bin/curl。 */
++const CURL_PATH = "/usr/bin/curl"
++/** 与 curl 自己的 --max-time 同值；多留 5 s 作为子进程硬超时余量。 */
++const CURL_MAX_TIME_S = 15
++const CURL_HARD_TIMEOUT_MS = (CURL_MAX_TIME_S + 5) * 1000
++
++/** 兜底失败的错误码：两次 curl 都只拿到不含 lt/reqId 的地址。 */
++export const EDGE_STATIC_PAGE_CODE = "189_EDGE_STATIC_PAGE"
++
++declare const tjs: any
++
++/**
++ * 命中边缘静态页的判据：200 且（etag 命中 或 content-length 命中）且没有 location。
++ * 只看响应本身，不缓存「该主机给静态页」的判断。
++ */
++export function isEdgeStaticPageResponse(response: Response): boolean {
++  if (response.status !== 200) return false
++  if (response.headers.get("location")) return false
++  const etag = (response.headers.get("etag") || "").trim().replace(/^"|"$/g, "")
++  if (etag === EDGE_STATIC_ETAG) return true
++  const length = (response.headers.get("content-length") || "").trim()
++  return length === EDGE_STATIC_BYTES
++}
++
++function hasLoginParams(value: string): boolean {
++  try {
++    const url = new URL(value, "https://open.e.189.cn")
++    return Boolean(url.searchParams.get("lt")) && Boolean(url.searchParams.get("reqId"))
++  } catch {
++    return false
++  }
++}
++
++/**
++ * 跑一次 curl，返回 %{url_effective}；curl 不可用 / 非 0 退出 / 超时返回 null。
++ * 每次调用都是新进程，即新连接。
++ */
++async function runCurlOnce(url: string, userAgent: string): Promise<string | null> {
++  let proc: any
++  try {
++    proc = tjs.spawn(
++      [
++        CURL_PATH,
++        "-sS",
++        "-L",
++        "--max-redirs",
++        "5",
++        "--max-time",
++        String(CURL_MAX_TIME_S),
++        "-A",
++        userAgent,
++        "-o",
++        "/dev/null",
++        "-w",
++        "%{url_effective}",
++        url,
++      ],
++      { stdout: "pipe", stderr: "pipe" },
++    )
++  } catch {
++    // ENOENT：curl 不存在。
++    return null
++  }
++
++  // 先挂上读取，避免子进程写满管道后卡死。
++  const stdoutText = new Response(proc.stdout).text()
++  const stderrText = new Response(proc.stderr).text()
++  let timer: any
++  const hardTimeout = new Promise<null>((resolve) => {
++    timer = setTimeout(() => {
++      try {
++        proc.kill("SIGKILL")
++      } catch {
++        // 进程已经退出。
++      }
++      resolve(null)
++    }, CURL_HARD_TIMEOUT_MS)
++  })
++  const finished = (async (): Promise<string | null> => {
++    const rc = await proc.wait()
++    const out = await stdoutText
++    await stderrText
++    // 设备现测：rc 是对象 {exit_status, term_signal}，不是数字。
++    if (!rc || rc.exit_status !== 0) return null
++    const trimmed = String(out).trim()
++    return trimmed || null
++  })().catch(() => null)
++
++  const result = await Promise.race([finished, hardTimeout])
++  clearTimeout(timer)
++  return result
++}
++
++/**
++ * 用 curl 取一次登录跳转地址。
++ *
++ * 返回含 lt+reqId 的地址；curl 不可用 / 非 0 退出 / 超时返回 null（调用方回原
++ * 错误路径）；两次都不满足则抛 189_EDGE_STATIC_PAGE。
++ */
++export async function resolveLoginUrlViaCurl(
++  loginUrl: string,
++  headers: Record<string, string>,
++): Promise<string | null> {
++  const userAgent = headers["User-Agent"] || ""
++  for (let attempt = 0; attempt < 2; attempt++) {
++    const resolved = await runCurlOnce(loginUrl, userAgent)
++    if (resolved === null) return null
++    if (hasLoginParams(resolved)) return resolved
++  }
++  throw new Error(
++    `[189Cloud] ${EDGE_STATIC_PAGE_CODE}: 边缘节点返回静态页，curl 两次都未拿到 lt/reqId`,
++  )
++}
+diff --git a/src/backend/drivers/189/util.ts b/src/backend/drivers/189/util.ts
+index 5a6227f..5182aae 100644
+--- a/src/backend/drivers/189/util.ts
++++ b/src/backend/drivers/189/util.ts
+@@ -19,6 +19,10 @@ import {
+   randomNoCache,
+   md5Base64,
+ } from "./crypto"
++import {
++  isEdgeStaticPageResponse,
++  resolveLoginUrlViaCurl,
++} from "./curl-fallback"
+ 
+ /** Cookie 辅助函数 */
+ function getCookieValue(cookieStr: string, key: string): string | null {
+@@ -254,6 +258,8 @@ export class Pan189Client {
+     headers: Record<string, string>,
+   ): Promise<string> {
+     let lastUrl = loginUrl
++    // 兜底每次登录最多试一次（三次 fetch 重试共用），不跨登录缓存判断。
++    let curlFallbackTried = false
+     for (let attempt = 0; attempt < 3; attempt++) {
+       const requestUrl = new URL(loginUrl)
+       requestUrl.searchParams.set("noCache", randomNoCache())
+@@ -275,6 +281,14 @@ export class Pan189Client {
+         return oauthUrl
+       }
+ 
++      // 边缘节点按 TLS 栈分流：txiki 的 TLS 指纹拿到 200 静态页，curl 拿到 302。
++      // 命中静态页时用子进程 curl 重取一次；curl 不可用则回原错误路径（不静默降级）。
++      if (!curlFallbackTried && isEdgeStaticPageResponse(result.response)) {
++        curlFallbackTried = true
++        const curlUrl = await resolveLoginUrlViaCurl(loginUrl, headers)
++        if (curlUrl) return curlUrl
++      }
++
+       if (attempt < 2) {
+         await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+       }

@@ -17,11 +17,19 @@ set -u
 PKG_DIR=/usr/libexec/openlist-txiki
 log() { logger -t openlist-txiki "$*" 2>/dev/null; }
 
-# 只列本包目录下的 tjs（按 exe 真实指向过滤），alist-encrypt 的 /usr/bin/tjs 不算
+# 只列本包进程：
+# - 自带版：exe 指向 $PKG_DIR/tjs；
+# - shared-tjs 变体：exe 是共用的 /usr/bin/tjs，按 cmdline 里是否带本包 bundle 区分，
+#   不能只看 exe（alist-encrypt 也用 /usr/bin/tjs）。
 ours() {
-	local p
+	local p exe
 	for p in $(pidof tjs 2>/dev/null); do
-		[ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$PKG_DIR/tjs" ] && printf '%s ' "$p"
+		exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+		if [ "$exe" = "$PKG_DIR/tjs" ]; then
+			printf '%s ' "$p"
+		elif [ "$exe" = /usr/bin/tjs ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "$PKG_DIR/openlist-txiki.js"; then
+			printf '%s ' "$p"
+		fi
 	done
 }
 

@@ -12,8 +12,32 @@ DATA_DIR=/etc/openlist-txiki
 ENV_FILE=$DATA_DIR/openlist-txiki.env
 MANIFEST=/usr/share/openlist-txiki/build-manifest.json
 TMP_DIR=/tmp/openlist-txiki
+# 运行时二进制。默认用包内私有 tjs（自带版）；shared-tjs 变体打包时把下面两行的
+# 默认值改成 /usr/bin/tjs 与 0（build 脚本只改这两行，其余字节与自带版相同）。
+# TJS_BIN 允许调用环境覆盖，仅用于测试；正常安装不需要设。
+TJS_BIN=${TJS_BIN:-$PKG_DIR/tjs}
+BUNDLED_TJS=${BUNDLED_TJS:-1}
 
 log() { logger -t openlist-txiki "$*"; }
+
+# 从 build-manifest.json 取一个字符串字段（不引 jq）
+manifest_str() {
+	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1
+}
+
+# 版本比较：$1 实际版本（可带 v 前缀）>= $2 最低版本（major.minor 起）。
+version_ge() {
+	local av mv a_maj a_min m_maj m_min
+	av=${1#v}; mv=${2#v}
+	a_maj=${av%%.*}; av=${av#*.}; a_min=${av%%.*}
+	m_maj=${mv%%.*}; mv=${mv#*.}; m_min=${mv%%.*}
+	case "$a_maj$a_min$m_maj$m_min" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$a_maj" -gt "$m_maj" ] && return 0
+	[ "$a_maj" -eq "$m_maj" ] && [ "$a_min" -ge "$m_min" ] && return 0
+	return 1
+}
 
 # 从 build-manifest.json 取一个 64 位 sha 字段，不引 jq
 manifest_sha() {
@@ -95,7 +119,7 @@ probe_admin_ready() {
 	TJS_HOST=127.0.0.1 TJS_PORT=$probe_port TJS_DATA_DIR="$DATA_DIR" \
 		TJS_JWT_SECRET="$JWT_SECRET" TJS_ADMIN_PASS="${TJS_ADMIN_PASS:-}" \
 		OPENLIST_TXIKI_READONLY=1 TMPDIR="$TMP_DIR" \
-		"$PKG_DIR/tjs" run "$PKG_DIR/openlist-txiki.js" >>"$TMP_DIR/probe.log" 2>&1 &
+		"$TJS_BIN" run "$PKG_DIR/openlist-txiki.js" >>"$TMP_DIR/probe.log" 2>&1 &
 	probe_pid=$!
 	probe_ok=1
 	probe_i=0
@@ -139,26 +163,42 @@ db_looks_initialized() {
 }
 
 start_service() {
-	[ -x "$PKG_DIR/tjs" ] || { log "missing $PKG_DIR/tjs"; exit 1; }
+	[ -x "$TJS_BIN" ] || { log "missing $TJS_BIN"; exit 1; }
 	[ -f "$PKG_DIR/openlist-txiki.js" ] || { log "missing $PKG_DIR/openlist-txiki.js"; exit 1; }
 	[ -f "$MANIFEST" ] || { log "missing $MANIFEST"; exit 1; }
 	[ -f "$ENV_FILE" ] || { log "missing $ENV_FILE (post-install should create it)"; exit 1; }
 
 	want_bundle=$(manifest_sha bundle_sha256)
-	want_tjs=$(manifest_sha tjs_sha256)
-	if [ -z "$want_bundle" ] || [ -z "$want_tjs" ]; then
-		log "build-manifest.json 缺少 bundle_sha256/tjs_sha256，拒绝启动"
+	if [ -z "$want_bundle" ]; then
+		log "build-manifest.json 缺少 bundle_sha256，拒绝启动"
 		exit 1
 	fi
 	got_bundle=$(sha256sum "$PKG_DIR/openlist-txiki.js" | cut -d' ' -f1)
-	got_tjs=$(sha256sum "$PKG_DIR/tjs" | cut -d' ' -f1)
 	if [ "$got_bundle" != "$want_bundle" ]; then
 		log "bundle sha256 不符：包内 $got_bundle 期望 $want_bundle，拒绝启动"
 		exit 1
 	fi
-	if [ "$got_tjs" != "$want_tjs" ]; then
-		log "tjs sha256 不符：包内 $got_tjs 期望 $want_tjs，拒绝启动"
-		exit 1
+	if [ "$BUNDLED_TJS" = 1 ]; then
+		want_tjs=$(manifest_sha tjs_sha256)
+		if [ -z "$want_tjs" ]; then
+			log "build-manifest.json 缺少 tjs_sha256，拒绝启动"
+			exit 1
+		fi
+		got_tjs=$(sha256sum "$TJS_BIN" | cut -d' ' -f1)
+		if [ "$got_tjs" != "$want_tjs" ]; then
+			log "tjs sha256 不符：包内 $got_tjs 期望 $want_tjs，拒绝启动"
+			exit 1
+		fi
+	else
+		# shared-tjs 变体：运行时不随包，按 manifest 记录的最低版本做启动前闸。
+		tjs_min=$(manifest_str tjs_min_version)
+		tjs_min=${tjs_min:-26.9.0}
+		tjs_ver=$("$TJS_BIN" --version 2>/dev/null | head -n 1)
+		if ! version_ge "$tjs_ver" "$tjs_min"; then
+			log "系统 tjs 版本 ${tjs_ver:-读不到} 低于要求 $tjs_min（$TJS_BIN），拒绝启动；请升级 txiki-js 包"
+			exit 1
+		fi
+		log "runtime: shared $TJS_BIN version=$tjs_ver (min $tjs_min)"
 	fi
 
 	. "$ENV_FILE"
@@ -210,7 +250,7 @@ start_service() {
 	chmod 700 "$TMP_DIR"
 
 	procd_open_instance openlist-txiki
-	procd_set_param command "$PKG_DIR/tjs" run "$PKG_DIR/openlist-txiki.js"
+	procd_set_param command "$TJS_BIN" run "$PKG_DIR/openlist-txiki.js"
 	# 固定转发 7 个键（第 7 个是 TJS_ADMIN_PASS：空值也传，应用侧读空等于没设，行为可预期）；
 	# 后面 7 个可选键只在用户于 env 文件里显式设置时才传，
 	# 不设就不传，应用侧走自己的默认值（upload-limit.ts 的 25MB/16MB）。

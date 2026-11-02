@@ -16,6 +16,15 @@ manifest_sha() {
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1
 }
 
+manifest_str() {
+	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1
+}
+
+# 变体：manifest 没有 runtime 字段时按自带版处理（与旧包兼容）。
+RUNTIME=$(manifest_str runtime)
+RUNTIME=${RUNTIME:-bundled}
+[ "$RUNTIME" = shared ] && TJS=/usr/bin/tjs
+
 # r29：升级后就地校验包内 dist（前端 v4.2.7）的 tree sha 与文件数；不符只记 ERROR，不阻断升级。
 check_web_dist() {
 	[ -d "$DIST" ] || { log "web dist: 缺 $DIST（前端不可用，后端照常启动）"; return 0; }
@@ -50,18 +59,30 @@ ensure_admin_pass() {
 	fi
 }
 
-if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -f "$TJS" ]; then
+if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -x "$TJS" ]; then
 	want_b=$(manifest_sha bundle_sha256)
-	want_t=$(manifest_sha tjs_sha256)
 	got_b=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
-	got_t=$(sha256sum "$TJS" | cut -d' ' -f1)
-	if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ] && [ -n "$want_t" ] && [ "$got_t" = "$want_t" ]; then
-		log "post-upgrade: sha256 ok (bundle $got_b, tjs $got_t)"
-		check_web_dist
+	if [ "$RUNTIME" = shared ]; then
+		# shared-tjs：包内没有 tjs，不校验 tjs sha；只校验 bundle 与系统运行时存在。
+		if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ]; then
+			log "post-upgrade: bundle sha256 ok ($got_b), runtime=shared tjs=$TJS $("$TJS" --version 2>/dev/null | head -n 1)"
+			check_web_dist
+		else
+			log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b (runtime=shared); not enabling, 等人工处置"
+			[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null
+			exit 0
+		fi
 	else
-		log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b tjs=$got_t want=$want_t; not enabling, 等人工处置"
-		[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null
-		exit 0
+		want_t=$(manifest_sha tjs_sha256)
+		got_t=$(sha256sum "$TJS" | cut -d' ' -f1)
+		if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ] && [ -n "$want_t" ] && [ "$got_t" = "$want_t" ]; then
+			log "post-upgrade: sha256 ok (bundle $got_b, tjs $got_t)"
+			check_web_dist
+		else
+			log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b tjs=$got_t want=$want_t; not enabling, 等人工处置"
+			[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null
+			exit 0
+		fi
 	fi
 else
 	log "post-upgrade: 缺 build-manifest 或包内文件，跳过 sha 校验，不 enable"

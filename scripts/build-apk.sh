@@ -27,6 +27,14 @@ STAGE=${STAGE:-/tmp/p3-build/stage}
 SCRIPTS=${SCRIPTS:-/tmp/p3-build/scripts}
 OUT=${OUT:-/tmp/p3-build/openlist-txiki-$VERSION.apk}
 APK=${APK:-/sbin/apk}
+# shared-tjs 变体（r34）：包内不放 tjs，init 调 /usr/bin/tjs，apk 依赖系统 txiki-js。
+# 默认 0 = 现在的自带版，行为与旧脚本逐字节一致（除了新增的 OFFER_VERSION 变量）。
+SHARED_TJS=${SHARED_TJS:-0}
+case "$SHARED_TJS" in
+	0|1) : ;;
+	*) echo "FAIL: SHARED_TJS 只接受 0 或 1（现为 $SHARED_TJS）" >&2; exit 1 ;;
+esac
+TJS_MIN_VERSION=${TJS_MIN_VERSION:-26.9.0}
 
 # r30 C6：设备精简 BusyBox 缺 comm/stat，早失败早说清楚（不做 BusyBox 兼容层）。
 command -v comm >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || {
@@ -66,50 +74,57 @@ fi
 # 历史事故：工作树里另有一份未渲染的 0.1.0-r28 残留，与包内成品并存，肉眼看不出。
 # r446 D1：两条版本断言从子串匹配改成精确相等。子串会让 VERSION=0.1.0-r3 命中 0.1.0-r30，
 # 旧版本号打新模板会被放过；现在版本串必须整串相等。
+# shared-tjs 变体：包内 SOURCE-OFFER 仍指向同一个源码归档（本包按 0.1.0-r33 源码重打），
+# 版本串必须由调用方显式给 OFFER_VERSION，脚本不猜；自带版 OFFER_VERSION 等于 VERSION。
+if [ "$SHARED_TJS" = 1 ]; then
+	OFFER_VERSION=${OFFER_VERSION:?shared 变体必须显式给 OFFER_VERSION（本包对应的源码归档版本，如 0.1.0-r33）}
+else
+	OFFER_VERSION=$VERSION
+fi
 OFFER=$STAGE/usr/share/openlist-txiki/SOURCE-OFFER
 [ -f "$OFFER" ] || { echo "FAIL: 缺 $OFFER" >&2; exit 1; }
 offer_ver_line=$(grep '^包名与版本：' "$OFFER" | head -n 1)
 if [ -z "$offer_ver_line" ]; then
-	echo "FAIL: 判据=版本行：$OFFER 里找不到「包名与版本：」行，无法核对版本（期望完全等于 VERSION=$VERSION）" >&2
+	echo "FAIL: 判据=版本行：$OFFER 里找不到「包名与版本：」行，无法核对版本（期望完全等于 OFFER_VERSION=$OFFER_VERSION）" >&2
 	exit 1
 fi
-# 判据=版本行：取「包名与版本：」行的包名 openlist-txiki 之后、「（」之前的版本串，必须与 $VERSION 整串相等。
+# 判据=版本行：取「包名与版本：」行的包名 openlist-txiki 之后、「（」之前的版本串，必须与 $OFFER_VERSION 整串相等。
 offer_rest=${offer_ver_line#*包名与版本：}
 case "$offer_rest" in
 	"openlist-txiki "*)
 		offer_tail=${offer_rest#openlist-txiki }
 		case "$offer_tail" in
 			*"（"*) offer_ver=${offer_tail%%（*} ;;
-			*) echo "FAIL: 判据=版本行：版本行里 openlist-txiki 之后找不到「（」分隔，取不出版本串（期望 VERSION=$VERSION；原文：$offer_ver_line）" >&2; exit 1 ;;
+			*) echo "FAIL: 判据=版本行：版本行里 openlist-txiki 之后找不到「（」分隔，取不出版本串（期望 OFFER_VERSION=$OFFER_VERSION；原文：$offer_ver_line）" >&2; exit 1 ;;
 		esac
 		;;
 	*)
-		echo "FAIL: 判据=版本行：版本行里「包名与版本：」之后不是 openlist-txiki 开头，取不出版本串（期望 VERSION=$VERSION；原文：$offer_ver_line）" >&2
+		echo "FAIL: 判据=版本行：版本行里「包名与版本：」之后不是 openlist-txiki 开头，取不出版本串（期望 OFFER_VERSION=$OFFER_VERSION；原文：$offer_ver_line）" >&2
 		exit 1
 		;;
 esac
-if [ "$offer_ver" != "$VERSION" ]; then
-	echo "FAIL: 判据=版本行：SOURCE-OFFER 版本串=$offer_ver 与 VERSION=$VERSION 不完全相等（原文：$offer_ver_line）" >&2
+if [ "$offer_ver" != "$OFFER_VERSION" ]; then
+	echo "FAIL: 判据=版本行：SOURCE-OFFER 版本串=$offer_ver 与 OFFER_VERSION=$OFFER_VERSION 不完全相等（原文：$offer_ver_line）" >&2
 	exit 1
 fi
 offer_url_line=$(grep '下载地址：' "$OFFER" | head -n 1)
 if [ -z "$offer_url_line" ]; then
-	echo "FAIL: 判据=下载地址：$OFFER 里找不到「下载地址：」行，无法核对源码归档地址（期望版本段 v$VERSION）" >&2
+	echo "FAIL: 判据=下载地址：$OFFER 里找不到「下载地址：」行，无法核对源码归档地址（期望版本段 v$OFFER_VERSION）" >&2
 	exit 1
 fi
-# 判据=下载地址：取 URL 里 /releases/download/ 之后、下一个 / 之前的路径段，必须与 v$VERSION 整串相等。
+# 判据=下载地址：取 URL 里 /releases/download/ 之后、下一个 / 之前的路径段，必须与 v$OFFER_VERSION 整串相等。
 case "$offer_url_line" in
 	*"/releases/download/"*)
 		offer_tag=${offer_url_line#*/releases/download/}
 		offer_tag=${offer_tag%%/*}
 		;;
 	*)
-		echo "FAIL: 判据=下载地址：下载地址行里没有 /releases/download/ 路径，取不出版本段（期望 v$VERSION；原文：$offer_url_line）" >&2
+		echo "FAIL: 判据=下载地址：下载地址行里没有 /releases/download/ 路径，取不出版本段（期望 v$OFFER_VERSION；原文：$offer_url_line）" >&2
 		exit 1
 		;;
 esac
-if [ "$offer_tag" != "v$VERSION" ]; then
-	echo "FAIL: 判据=下载地址：SOURCE-OFFER 下载地址版本段=$offer_tag 与 v$VERSION 不完全相等（原文：$offer_url_line）" >&2
+if [ "$offer_tag" != "v$OFFER_VERSION" ]; then
+	echo "FAIL: 判据=下载地址：SOURCE-OFFER 下载地址版本段=$offer_tag 与 v$OFFER_VERSION 不完全相等（原文：$offer_url_line）" >&2
 	exit 1
 fi
 if grep -q '@@' "$OFFER"; then
@@ -133,6 +148,9 @@ usr/share/openlist-txiki/SOURCE-OFFER
 usr/share/openlist-txiki/THIRD-PARTY-NOTICES
 usr/share/openlist-txiki/build-manifest.json
 usr/share/openlist-txiki/openlist-txiki.env.default'
+if [ "$SHARED_TJS" = 1 ]; then
+	EXPECTED=$(printf '%s\n' "$EXPECTED" | grep -v '^usr/libexec/openlist-txiki/tjs$')
+fi
 DIST_PREFIX='usr/share/openlist-txiki/dist/'
 GOT=$(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort)
 # r30 C5：失败路径清理。中间任一步非零退出（如 comm 缺失 rc=127）都不留 /tmp 残留文件。
@@ -159,8 +177,12 @@ fi
 # 权限位逐项固定（owner 必须 root:root；staging 由 Windows 侧打包上传时会带上
 # MSYS 的 uid，mkpkg 会照抄成 nobody，所以这里强制归零，归零失败就中止）
 chown -R 0:0 "$STAGE"
-[ "$(ls -ln "$STAGE/usr/libexec/openlist-txiki/tjs" | awk '{print $3":"$4}')" = "0:0" ] || { echo "FAIL: chown 后 owner 不是 0:0" >&2; exit 1; }
-chmod 755 "$STAGE/usr/libexec/openlist-txiki/tjs"
+if [ "$SHARED_TJS" = 1 ]; then
+	[ ! -e "$STAGE/usr/libexec/openlist-txiki/tjs" ] || { echo "FAIL: shared 变体 stage 里不应有 tjs" >&2; exit 1; }
+else
+	[ "$(ls -ln "$STAGE/usr/libexec/openlist-txiki/tjs" | awk '{print $3":"$4}')" = "0:0" ] || { echo "FAIL: chown 后 owner 不是 0:0" >&2; exit 1; }
+	chmod 755 "$STAGE/usr/libexec/openlist-txiki/tjs"
+fi
 chmod 755 "$STAGE/etc/init.d/openlist-txiki"
 chmod 644 "$STAGE/usr/libexec/openlist-txiki/openlist-txiki.js"
 # 只对文件 chmod：r29 起 usr/share/openlist-txiki 下有 licenses/ 与 dist/ 两个子目录，
@@ -230,6 +252,12 @@ rm -f "$OUT"
 # 打包后再从 adbdump 读实际值比对，不等就说明 staging 与包内文件集不一致。
 STAGE_BYTES=$(find "$STAGE" -type f -exec stat -c %s {} + | awk '{s+=$1} END{print s}')
 echo "STAGE_BYTES=$STAGE_BYTES"
+if [ "$SHARED_TJS" = 1 ]; then
+	set -- -I "depends:txiki-js>=$TJS_MIN_VERSION"
+	echo "DEPENDS=txiki-js>=$TJS_MIN_VERSION"
+else
+	set --
+fi
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \
 	-I "version:$VERSION" \
@@ -238,6 +266,7 @@ echo "STAGE_BYTES=$STAGE_BYTES"
 	-I "license:AGPL-3.0-only AND LGPL-3.0-or-later AND MIT AND Apache-2.0" \
 	-I "origin:openlist-txiki" \
 	-I "maintainer:openlist-txiki maintainers" \
+	"$@" \
 	--files "$STAGE" \
 	-s "pre-deinstall:$SCRIPTS/pre-deinstall.sh" \
 	-s "post-install:$SCRIPTS/post-install.sh" \

@@ -1,10 +1,10 @@
-# 从源码构建（openlist-txiki 0.1.0-r33）
+# 从源码构建（openlist-txiki 0.1.0-r35）
 
-本归档是 openlist-txiki 0.1.0-r33 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r35 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
-    patches/openlist/01..35   应用侧补丁，按编号顺序累进应用
+    patches/openlist/01..36   应用侧补丁，按编号顺序累进应用
     patches/txiki/            txiki.js 运行时补丁（本归档不包含 txiki.js 源码树，见第 2 节）
     build/                    build-txiki.mjs、p2-source-manifest.txt
     scripts/                  apk 打包脚本与生命周期钩子
@@ -30,7 +30,7 @@ cd tree
 # CRLF 检出校验：必须是 2015
 grep -c $'\r' src/backend/server/fs.ts
 
-# 按清单顺序应用 35 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
+# 按清单顺序应用 36 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
 while read -r tag seq sha rel; do
   [ "$tag" = patch ] || continue
   echo "$sha  $PROJ/$rel" | sha256sum -c - || exit 1
@@ -43,9 +43,9 @@ TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txi
 sha256sum dist-txiki/openlist-txiki.js
 ```
 
-期望：预检打印「补丁 35/35（01..35 顺序与 sha 一致），指纹 71 条（file 35 + patch 35 + commit 1），
-checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,038,090 B、
-sha256 `49ba24b7e9e07e1305c2c3242619cf42175a8b03007b3f9734a0b6922a210924`、inputs 440。
+期望：预检打印「补丁 36/36（01..36 顺序与 sha 一致），指纹 72 条（file 35 + patch 36 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,039,440 B、
+sha256 `03cb143fa99b5149b5059617de43f54374a98c55a98d1f556b293b65fb050407`、inputs 441。
 
 第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
 `%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，
@@ -94,7 +94,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r33
+VERSION=0.1.0-r35
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```

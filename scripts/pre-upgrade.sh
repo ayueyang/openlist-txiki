@@ -12,15 +12,37 @@
 # 备份内容所属版本），改用升级前已安装 manifest 的 package_version；读不到时用时间戳。
 # 保留份数由 KEEP_DB_BACKUPS 控制：默认 1（与 A4 的 1+1 一致）；0 = 一份都不删；
 # N = 保留最近 N 份。db 备份与 rollback/<旧版本> 目录同受此变量控制，每次删除逐条记日志。
+#
+# r34（2026-11-03）：apk-tools 3.x 起钩子环境被清空，只留 APK_PACKAGE/APK_SCRIPT/PATH/PWD/SHLVL，
+# 调用者的 `KEEP_DB_BACKUPS=0 apk add` 传不进脚本（3.0.7 容器实测；3.0.5 源码 context.c 同一分支）。
+# 所以开关改从设备上的 /etc/openlist-txiki/openlist-txiki.env 读，不依赖 apk 调用环境。
+# 该文件由 post-install 只在缺失时生成、升级不覆盖，也不在包文件清单里，apk 升级不会动它。
+# 钩子环境里若有显式值（apk --preserve-env 时才可能）仍优先，便于临时覆盖。
 set -u
 DATA_DIR=/etc/openlist-txiki
-KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS:-1}
+ENV_FILE=$DATA_DIR/openlist-txiki.env
 MANIFEST=/usr/share/openlist-txiki/build-manifest.json
+
+KEEP_SRC=env
+KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS:-}
+if [ -z "$KEEP_DB_BACKUPS" ]; then
+	KEEP_SRC=env-file
+	KEEP_DB_BACKUPS=$(sed -n 's/^[[:space:]]*KEEP_DB_BACKUPS[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS%%#*}
+	KEEP_DB_BACKUPS=$(printf '%s' "$KEEP_DB_BACKUPS" | tr -d '[:space:]')
+	KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS#\"}; KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS%\"}
+	KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS#\'}; KEEP_DB_BACKUPS=${KEEP_DB_BACKUPS%\'}
+fi
+if [ -z "$KEEP_DB_BACKUPS" ]; then
+	KEEP_DB_BACKUPS=1
+	[ "$KEEP_SRC" = env-file ] && KEEP_SRC=default
+fi
 
 # 非数字（含空串）回退默认 1，避免下面的 -eq/-gt 在升级钩子里报错中断。
 case "$KEEP_DB_BACKUPS" in
-''|*[!0-9]*) KEEP_DB_BACKUPS=1 ;;
+''|*[!0-9]*) KEEP_DB_BACKUPS=1; KEEP_SRC=invalid-fallback ;;
 esac
+logger -t openlist-txiki "pre-upgrade: KEEP_DB_BACKUPS=$KEEP_DB_BACKUPS (source=$KEEP_SRC)"
 
 # 旧版本只读一次：db 备份名与下面的 rollback/<旧版本> 共用。
 OLDVER=
@@ -68,12 +90,16 @@ if [ -f "$DATA_DIR/data.db" ]; then
 	fi
 fi
 
-if [ -f "$MANIFEST" ] && [ -f /usr/libexec/openlist-txiki/tjs ]; then
+if [ -f "$MANIFEST" ] && [ -f /usr/libexec/openlist-txiki/openlist-txiki.js ]; then
 	R="$DATA_DIR/rollback/${OLDVER:-$TAG}"
 	mkdir -p "$R"
-	cp -a /usr/libexec/openlist-txiki/tjs "$R/tjs" 2>/dev/null
+	# 自带版才有包内 tjs；shared-tjs 变体不复制系统运行时，改为记录版本与 sha 供回滚核对。
+	[ -f /usr/libexec/openlist-txiki/tjs ] && cp -a /usr/libexec/openlist-txiki/tjs "$R/tjs" 2>/dev/null
 	cp -a /usr/libexec/openlist-txiki/openlist-txiki.js "$R/openlist-txiki.js" 2>/dev/null
 	cp -a "$MANIFEST" "$R/build-manifest.json" 2>/dev/null
+	if [ ! -f /usr/libexec/openlist-txiki/tjs ] && [ -x /usr/bin/tjs ]; then
+		{ /usr/bin/tjs --version 2>&1; sha256sum /usr/bin/tjs; } > "$R/system-tjs.txt" 2>/dev/null
+	fi
 	if [ "$KEEP_DB_BACKUPS" -eq 0 ]; then
 		:
 	else
