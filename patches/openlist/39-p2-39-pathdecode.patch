@@ -1,0 +1,216 @@
+diff --git a/src/backend/pkg/canonical-path.ts b/src/backend/pkg/canonical-path.ts
+index f370536..8155aae 100644
+--- a/src/backend/pkg/canonical-path.ts
++++ b/src/backend/pkg/canonical-path.ts
+@@ -55,6 +55,32 @@ export function decodeWirePath(
+   }
+ }
+ 
++/**
++ * 取传输层收到的原始路径：运行时在进 fetch 前已经解码一次，本函数不再解码。
++ *
++ * tjs 的 HTTP 层在交给 JS 之前会对 URL 路径解码一次（实测 `/100%25.txt`
++ * 到 `req.url` 已是 `/100%.txt`、`%E4%B8%AD` 已是 `中`）。所以这里只做
++ * `c.req.url` 的字符串切片：
++ *  - 不能调 decodeURIComponent：对残留字面 `%`（如合法文件名 `100%.txt`）
++ *    会抛 URIError，把正常文件判成 400；
++ *  - 不能用 new URL(...).pathname：WHATWG 解析会把 `%2e%2e` 折成 `..`、
++ *    把中文/空格重新百分号编码，丢掉进 fetch 时的原样字符。
++ *
++ * 返回的字符串就是上游路由看到的形态：裸 `%`、`%2e`、`%2F`、空格、中文
++ * 都保持不变；url 没有路径部分时返回 "/"。
++ */
++export function wirePath(c: { req: { url: string } }): string {
++  const url = String(c.req.url || "")
++  const start = url.indexOf("/", url.indexOf(":") + 4)
++  if (start < 0) return "/"
++  let end = url.length
++  const q = url.indexOf("?", start)
++  if (q >= 0) end = q
++  const h = url.indexOf("#", start)
++  if (h >= 0 && h < end) end = h
++  return url.slice(start, end) || "/"
++}
++
+ /** 唯一规范化函数：不解码、不抛错。 */
+ export function canonicalizePath(
+   input: string,
+diff --git a/src/backend/server/canonical-path.test.ts b/src/backend/server/canonical-path.test.ts
+index 9013837..a381634 100644
+--- a/src/backend/server/canonical-path.test.ts
++++ b/src/backend/server/canonical-path.test.ts
+@@ -7,6 +7,7 @@ import {
+   parentPath,
+   PathRejectedError,
+   isPathRejected,
++  wirePath,
+ } from "../pkg/canonical-path"
+ 
+ /**
+@@ -114,3 +115,17 @@ test("assertCanonicalPath：非规范形必须抛错（raw_url 生成侧用）",
+     assert.throws(() => assertCanonicalPath(p), PathRejectedError, `assertCanonicalPath(${p})`)
+   }
+ })
++
++test("wirePath：只切字符串、不再解码", () => {
++  const table: Array<[string, string]> = [
++    ["http://h/dav/t/pub/100%.txt", "/dav/t/pub/100%.txt"],
++    ["http://h/100%25.txt", "/100%25.txt"],
++    ["http://h/a%2Fb.txt", "/a%2Fb.txt"],
++    ["http://h/中文 x.txt", "/中文 x.txt"],
++    ["http://h/x?a=1#f", "/x"],
++    ["http://h", "/"],
++  ]
++  for (const [url, want] of table) {
++    assert.equal(wirePath({ req: { url } }), want, `wirePath(${url})`)
++  }
++})
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index dd1b46b..3ce2514 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -21,7 +21,7 @@ import { safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
+ import {
+   canonicalizePath,
+-  decodeWirePath,
++  wirePath,
+   isPathRejected,
+ } from "../pkg/canonical-path"
+ import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
+@@ -488,20 +488,18 @@ rawRouter.get("/*", async (c) => {
+     c.req.path.startsWith("/p") || c.req.path.startsWith("/api/p")
+ 
+   // Strip the route prefix once, preserving mount names such as /pikpak_webdav.
+-  const rawPath = c.req.path.replace(
++  // r39：用 wirePath(c) 取运行时这一次解码后的原样路径，不再走 c.req.path
++  // （Hono getPath 会再 decodeURI 一次）也不再 decodeWirePath。
++  const rawPath = wirePath(c).replace(
+     /^\/(?:api\/)?(?:raw|sd|d|p)(?=\/|$)/,
+     "",
+   )
+ 
+-  // 非法百分号转义（如手工拼出的 `/api/p/100%.txt`）会让 decodeURIComponent
+-  // 抛 URIError。Go 侧因为 raw_url 走 EncodePath 编码过 `%`，正常流程不会出现；
+-  // 但外部/手工 URL 仍可能出现，这里按 400 处理而不是冒泡成 500。
+-  // P1-18：解码是传输边界动作，恰好一次（decodeWirePath）
+-  const decodedPath = decodeWirePath(rawPath)
+-  if (!decodedPath.ok) {
+-    return c.text("Bad Request: malformed path encoding", 400)
+-  }
+-  const reqPath0 = decodedPath.path
++  // r39：运行时已经在进 fetch 前解码一次，rawPath 就是最终形态，这里不再解码。
++  // 原来的 decodeWirePath(rawPath) 会对字面 `%`（合法文件名 `100%.txt`）抛
++  // URIError 并回 400 `malformed path encoding`；`%252e%252e` 这类二次编码
++  // 残留交给下面的 canonicalizePath 判 403。
++  const reqPath0 = rawPath
+   // P1-18：raw 是公开下载端点，不经过 getActualPath，规范化必须在这一层收口。
+   // 含 ".." 或二次编码残留一律 403 —— 旧实现把这类路径直接交给 resolvePath
+   // 再解一次码，`%252e%252e` 就是这样复活成 `..` 越界读到根外的。
+diff --git a/src/backend/server/s3.ts b/src/backend/server/s3.ts
+index 68215db..cd76e30 100644
+--- a/src/backend/server/s3.ts
++++ b/src/backend/server/s3.ts
+@@ -24,7 +24,7 @@ import {
+   getNearestMeta,
+ } from "../pkg/meta"
+ import type { Meta } from "../pkg/meta"
+-import { canonicalizePath, decodeWirePath } from "../pkg/canonical-path"
++import { canonicalizePath, wirePath } from "../pkg/canonical-path"
+ 
+ /**
+  * S3 网关（简化版，挂载于 /s3/*）。
+@@ -71,15 +71,14 @@ function s3Error(code: string, message: string, status: number) {
+ 
+ /** 从 pathname 剥离 /s3 前缀，解析 { bucket, key } */
+ function parseS3Path(c: any): { bucket: string; key: string } | null {
+-  const pathname = new URL(c.req.url).pathname
++  // r39：运行时已解码一次，wirePath 只切片；new URL() 会重新编码/折点段
++  const pathname = wirePath(c)
+   const p = pathname.replace(/^\/s3\/?/, "")
+   const parts = p.split("/").filter(Boolean)
+   const bucket = parts[0] || ""
+-  // P1-18：key 整体解码恰好一次（原来逐段 map(decodeURIComponent)，非法转义
+-  // 会直接抛；现在返回 null，由调用方回 400）
+-  const decodedKey = decodeWirePath(parts.slice(1).join("/"))
+-  if (!decodedKey.ok) return null
+-  return { bucket, key: decodedKey.path }
++  // P1-18/r39：运行时在进 fetch 前已经解码一次，这里不再解码（再解会对字面
++  // `%` 抛 URIError，也会把 `%2525` 多解一层）。null 返回契约保留给调用方。
++  return { bucket, key: parts.slice(1).join("/") }
+ }
+ 
+ /**
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index ed078e5..2f53bdb 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -23,6 +23,7 @@ import {
+   canonicalizePath,
+   decodeWirePath,
+   isPathRejected,
++  wirePath,
+ } from "../pkg/canonical-path"
+ import { getUploadSizeLimit } from "../pkg/upload-limit"
+ import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+@@ -126,33 +127,6 @@ async function webdavAuth(
+ /** WebDAV 挂载前缀。必须与 index.ts 里 `app.route("/dav", webdavRouter)` 一致。 */
+ const DAV_MOUNT = "/dav"
+ 
+-/**
+- * 取请求路径（已百分号编码），作为 href 的基准。
+- *
+- * RFC 4918 §8.3：href 要么是相对引用（客户端按 Request-URI 解析），要么是完整
+- * URI；§8.3.1 的示例里两者都合法。用相对引用时 href 必须与 Request-URI 前缀
+- * 一致，因此基准取真实请求路径而非硬编码的挂载前缀 —— 挂在子路径下
+- * （/list/dav）时也自动正确，且不回显 Host 头。
+- */
+-function davRequestPath(c: any): string {
+-  // P1-18 复验 D1/D2/D3/D6：必须用**字符串切片**取原始 pathname，不能走
+-  // `new URL(c.req.url).pathname`。WHATWG 解析会把 `%2e%2e` 当成 ".." 折叠掉
+-  // 整个前一段（实测 `/dav/%2e%2e/victim/x` 的 pathname 是 `/victim/x`），
+-  // 于是 DAV 挂载前缀被吃掉，路径变成「用户根内的合法路径」，PUT/MKCOL/
+-  // DELETE/PROPFIND 全被 2xx 接受——钳制后成功，正是裁定 D 不接受的那一类。
+-  // 这里与 Hono 路由取 path 的方式（字符串切片，不规范化）保持一致，
+-  // 由下游 canonicalizePath 统一判拒绝（应用侧不解码，见 davPathOf）。
+-  const url = String(c.req.url || "")
+-  const start = url.indexOf("/", url.indexOf(":") + 4)
+-  if (start < 0) return "/"
+-  let end = url.length
+-  const q = url.indexOf("?", start)
+-  if (q >= 0) end = q
+-  const h = url.indexOf("#", start)
+-  if (h >= 0 && h < end) end = h
+-  return url.slice(start, end) || "/"
+-}
+-
+ /**
+  * 从 URL pathname 中剥离挂载前缀，得到虚拟文件路径（仅用于存储层寻址）。
+  *
+@@ -163,7 +137,7 @@ function davRequestPath(c: any): string {
+  * 由 canonicalizePath 决定取舍：`%2e/%2f/%5c` 残留仍按 encoded-residue 回 403。
+  */
+ function davPathOf(c: any): string | null {
+-  const pathname = davRequestPath(c)
++  const pathname = wirePath(c)
+   let p = pathname
+   // 只在前缀真正匹配时才剥离：不能像 slice(DAV_MOUNT.length) 那样无条件截断，
+   // 否则挂在子路径下会把 /list/dav/x 截成 /t/dav/x。
+@@ -341,7 +315,7 @@ const metaForbidden = (c: any) =>
+  * PROPFIND 返回的 href 必须与本请求的 URL 结构一致，客户端才能匹配上。
+  */
+ function davPrefixOf(c: any, davPath: string): string {
+-  const pathname = new URL(c.req.url).pathname
++  const pathname = wirePath(c)
+   const stripped = davPath === "/" ? "" : davPath
+   return pathname.endsWith(stripped)
+     ? pathname.slice(0, pathname.length - stripped.length)
+@@ -481,7 +455,7 @@ webdavRouter.all("/*", async (c) => {
+         // davPathOf 已剥掉挂载前缀，那是给存储层寻址用的；href 必须反映真实请求
+         // 路径。少了挂载前缀，rclone / Windows 资源管理器会因「返回的 href 与请求
+         // 路径对不上」丢弃全部记录（能下载但列不出目录）。见 Issue #104。
+-        const xml = buildWebDavPropfindResponse(davRequestPath(c), items, {
++        const xml = buildWebDavPropfindResponse(wirePath(c), items, {
+           isFolder,
+           size: item.size || 0,
+           modified: item.modified,
