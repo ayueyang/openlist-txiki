@@ -1,0 +1,381 @@
+diff --git a/src/backend/drivers/189/curl-http.ts b/src/backend/drivers/189/curl-http.ts
+new file mode 100644
+index 0000000..65ef5ce
+--- /dev/null
++++ b/src/backend/drivers/189/curl-http.ts
+@@ -0,0 +1,176 @@
++/**
++ * 189 驱动走子进程 curl 的 HTTP 传输层。
++ *
++ * 背景（conductor 2026-11-03 设备实测，证据 work/cond-r35-189repro/）：
++ * cloud.189.cn 的会话按 TLS 客户端栈分流——curl（OpenSSL/HTTP2）取得的 Cookie
++ * 交给 txiki fetch（mbedtls/HTTP1.1）带走会被判 InvalidSessionKey；登录首跳同理
++ * （tjs 拿 200 + Tengine 静态页，curl 拿 302 + Set-Cookie）。
++ *
++ * 边界：不跟随重定向（调用方逐跳跟，便于逐跳收 Set-Cookie）；curl 不存在、非 0
++ * 退出、超时、响应头解析失败一律返回 null，由调用方回落 fetch。
++ */
++
++/** 设备现测：curl 8.21.0 在 /usr/bin/curl。 */
++const CURL_PATH = "/usr/bin/curl"
++const DEFAULT_MAX_TIME_S = 20
++/** 与 curl 自己的 --max-time 之外多留的余量，到点 SIGKILL。 */
++const HARD_TIMEOUT_MARGIN_MS = 5_000
++
++export interface CurlHttpResponse {
++  status: number
++  /** 响应头（名转小写；set-cookie 逐条放在 setCookies 里，不在这里合并）。 */
++  headers: Headers
++  /** 全部 Set-Cookie 原文，按出现顺序。 */
++  setCookies: string[]
++  body: string
++}
++
++export interface CurlHttpOptions {
++  method?: "GET" | "POST"
++  headers?: Record<string, string>
++  body?: string
++  maxTimeS?: number
++  /** 默认 https 就走 HTTP/2（与设备实测通过的 curl 口径一致）。 */
++  http2?: boolean
++}
++
++declare const tjs: any
++
++interface ParsedCurlOutput {
++  status: number
++  headerPairs: Array<[string, string]>
++  body: string
++}
++
++/**
++ * 解析 `curl -D -` 的输出：一个或多个头块 + body。
++ *
++ * 不跟随重定向时只有一个头块；1xx（100-continue）与紧接的状态行会继续往后找，
++ * 取最后一个头块作为最终响应。
++ */
++function parseCurlOutput(raw: string): ParsedCurlOutput | null {
++  let offset = 0
++  for (let guard = 0; guard < 10; guard++) {
++    const crlfEnd = raw.indexOf("\r\n\r\n", offset)
++    const lfEnd = raw.indexOf("\n\n", offset)
++    let end = -1
++    let sep = 0
++    if (crlfEnd !== -1 && (lfEnd === -1 || crlfEnd <= lfEnd)) {
++      end = crlfEnd
++      sep = 4
++    } else if (lfEnd !== -1) {
++      end = lfEnd
++      sep = 2
++    }
++    if (end === -1) return null
++
++    const lines = raw.slice(offset, end).split(/\r?\n/)
++    const statusLine = lines.shift() || ""
++    const match = statusLine.match(/^HTTP\/[0-9.]+\s+(\d{3})/)
++    if (!match) return null
++    const status = Number(match[1])
++
++    const headerPairs: Array<[string, string]> = []
++    for (const line of lines) {
++      const colon = line.indexOf(":")
++      if (colon <= 0) continue
++      headerPairs.push([
++        line.slice(0, colon).trim().toLowerCase(),
++        line.slice(colon + 1).trim(),
++      ])
++    }
++
++    const rest = raw.slice(end + sep)
++    const isInterim = status >= 100 && status < 200
++    const hasAnotherBlock = /^HTTP\/[0-9.]+\s+\d{3}/.test(rest)
++    if (isInterim || hasAnotherBlock) {
++      offset = end + sep
++      continue
++    }
++    return { status, headerPairs, body: rest }
++  }
++  return null
++}
++
++function buildArgs(url: string, options: CurlHttpOptions): string[] {
++  const maxTimeS = options.maxTimeS ?? DEFAULT_MAX_TIME_S
++  const args = [
++    CURL_PATH,
++    "-q",
++    "-sS",
++    "--max-time",
++    String(maxTimeS),
++    "-D",
++    "-",
++    // 关掉 100-continue（表单 body 到 KB 级时 curl 会自动加 Expect 头）。
++    "-H",
++    "Expect:",
++  ]
++  const useHttp2 = options.http2 ?? url.startsWith("https://")
++  if (useHttp2) args.push("--http2")
++  const method = options.method || "GET"
++  if (method === "POST") args.push("-X", "POST")
++  for (const [name, value] of Object.entries(options.headers || {})) {
++    if (value === undefined || value === null) continue
++    args.push("-H", `${name}: ${value}`)
++  }
++  if (options.body !== undefined) args.push("--data-binary", options.body)
++  args.push(url)
++  return args
++}
++
++/**
++ * 跑一次 curl 取完整响应；不可用 / 非 0 退出 / 超时 / 解析失败返回 null。
++ * 每次调用都是新进程，即新连接。
++ */
++export async function curlFetch(
++  url: string,
++  options: CurlHttpOptions = {},
++): Promise<CurlHttpResponse | null> {
++  const maxTimeS = options.maxTimeS ?? DEFAULT_MAX_TIME_S
++  let proc: any
++  try {
++    proc = tjs.spawn(buildArgs(url, options), {
++      stdout: "pipe",
++      stderr: "pipe",
++    })
++  } catch {
++    // ENOENT：curl 不存在。
++    return null
++  }
++
++  // 先挂上读取，避免子进程写满管道后卡死。
++  const stdoutText = new Response(proc.stdout).text()
++  const stderrText = new Response(proc.stderr).text()
++  let timer: any
++  const hardTimeout = new Promise<null>((resolve) => {
++    timer = setTimeout(() => {
++      try {
++        proc.kill("SIGKILL")
++      } catch {
++        // 进程已经退出。
++      }
++      resolve(null)
++    }, maxTimeS * 1000 + HARD_TIMEOUT_MARGIN_MS)
++  })
++  const finished = (async (): Promise<CurlHttpResponse | null> => {
++    const rc = await proc.wait()
++    const out = await stdoutText
++    await stderrText
++    // 设备现测：rc 是对象 {exit_status, term_signal}，不是数字。
++    if (!rc || rc.exit_status !== 0) return null
++    const parsed = parseCurlOutput(String(out))
++    if (!parsed) return null
++    const headers = new Headers()
++    const setCookies: string[] = []
++    for (const [name, value] of parsed.headerPairs) {
++      if (name === "set-cookie") setCookies.push(value)
++      else if (!headers.has(name)) headers.set(name, value)
++    }
++    return { status: parsed.status, headers, setCookies, body: parsed.body }
++  })().catch(() => null)
++
++  const result = await Promise.race([finished, hardTimeout])
++  clearTimeout(timer)
++  return result
++}
+diff --git a/src/backend/drivers/189/util.ts b/src/backend/drivers/189/util.ts
+index 5182aae..4378654 100644
+--- a/src/backend/drivers/189/util.ts
++++ b/src/backend/drivers/189/util.ts
+@@ -23,6 +23,7 @@ import {
+   isEdgeStaticPageResponse,
+   resolveLoginUrlViaCurl,
+ } from "./curl-fallback"
++import { curlFetch } from "./curl-http"
+ 
+ /** Cookie 辅助函数 */
+ function getCookieValue(cookieStr: string, key: string): string | null {
+@@ -122,6 +123,8 @@ function isLoggedInUrl(value: string): boolean {
+ export class Pan189Client {
+   private addition: Cloud189Addition
+   private cookie: string = ""
++  /** open.e.189.cn 域的 Cookie，与 cloud.189.cn 分开存，不跨域发送。 */
++  private openCookie: string = ""
+   private cookieDirty = false
+   private sessionKey: string = ""
+   private rsa = { pubKey: "", pkId: "", expire: 0 }
+@@ -167,18 +170,67 @@ export class Pan189Client {
+     return headers
+   }
+ 
+-  private async updateCookie(headers: Headers): Promise<void> {
++  /** 按域取 Cookie：open.e 的会话不发给 cloud.189.cn，反之亦然。 */
++  private cookiesFor(hostname: string): string {
++    return hostname === "open.e.189.cn" ? this.openCookie : this.cookie
++  }
++
++  private async updateCookie(headers: Headers, hostname: string): Promise<void> {
+     const setCookies = getSetCookieHeaders(headers)
+     if (setCookies.length === 0) return
+ 
++    const isOpen = hostname === "open.e.189.cn"
++    const current = isOpen ? this.openCookie : this.cookie
+     const updated = setCookies.reduce(
+       (cookie, setCookie) => mergeSetCookie(cookie, setCookie),
+-      this.cookie,
++      current,
+     )
+-    if (updated !== this.cookie) {
+-      this.cookie = updated
+-      this.cookieDirty = true
++    if (updated === current) return
++    if (isOpen) {
++      this.openCookie = updated
++      return
+     }
++    this.cookie = updated
++    this.cookieDirty = true
++  }
++
++  /**
++   * 一次 HTTP 请求：优先走子进程 curl（cloud.189.cn 按 TLS 栈分流的会话绑定，
++   * 见 curl-http.ts 开头），curl 不可用时回落 fetch。返回构造的 Response，
++   * 调用方沿用原有的状态码 / 头 / text 语义。
++   */
++  private async httpRequest(
++    url: string,
++    init: {
++      method?: "GET" | "POST"
++      headers: Record<string, string>
++      body?: string
++      manualRedirect?: boolean
++    },
++  ): Promise<Response> {
++    const method = init.method || "GET"
++    const viaCurl = await curlFetch(url, {
++      method,
++      headers: init.headers,
++      body: init.body,
++    })
++    if (!viaCurl) {
++      return fetch(url, {
++        method,
++        headers: init.headers,
++        body: init.body,
++        redirect: init.manualRedirect ? "manual" : "follow",
++      })
++    }
++    const headers = new Headers()
++    viaCurl.headers.forEach((value, name) => headers.set(name, value))
++    for (const cookie of viaCurl.setCookies) headers.append("set-cookie", cookie)
++    const nullBodyStatus = [204, 205, 304].includes(viaCurl.status)
++    return new Response(nullBodyStatus ? null : viaCurl.body, {
++      status: viaCurl.status,
++      headers,
++      url,
++    })
+   }
+ 
+   private async followRedirectsWithCookies(
+@@ -199,14 +251,15 @@ export class Pan189Client {
+       }
+       const requestHeaders: Record<string, string> = { ...headers }
+       if (redirectCount > 0) requestHeaders.Referer = currentUrl
+-      if (this.cookie) requestHeaders.Cookie = this.cookie
++      delete requestHeaders.Cookie
++      const jarCookie = this.cookiesFor(currentUrlObj.hostname)
++      if (jarCookie) requestHeaders.Cookie = jarCookie
+ 
+-      const response = await fetch(currentUrl, {
+-        method: "GET",
++      const response = await this.httpRequest(currentUrl, {
+         headers: requestHeaders,
+-        redirect: "manual",
++        manualRedirect: true,
+       })
+-      await this.updateCookie(response.headers)
++      await this.updateCookie(response.headers, currentUrlObj.hostname)
+ 
+       const location = response.headers.get("location")
+       const isRedirect = response.status >= 300 && response.status < 400
+@@ -355,7 +408,7 @@ export class Pan189Client {
+         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+         Accept: "application/json;charset=UTF-8",
+       }
+-      if (this.cookie) result.Cookie = this.cookie
++      if (this.openCookie) result.Cookie = this.openCookie
+       return result
+     }
+ 
+@@ -371,7 +424,7 @@ export class Pan189Client {
+         }),
+       },
+     )
+-    await this.updateCookie(appConfRes.headers)
++    await this.updateCookie(appConfRes.headers, "open.e.189.cn")
+     const appConf: AppConfResp189 = await appConfRes.json()
+     if (appConf.result !== "0" || !appConf.data) {
+       throw new Error(
+@@ -390,7 +443,7 @@ export class Pan189Client {
+         }),
+       },
+     )
+-    await this.updateCookie(encConfRes.headers)
++    await this.updateCookie(encConfRes.headers, "open.e.189.cn")
+     const encConf: EncryptConfResp189 = await encConfRes.json()
+     if (encConf.result !== 0 || !encConf.data?.pubKey) {
+       throw new Error(
+@@ -437,7 +490,7 @@ export class Pan189Client {
+         body: new URLSearchParams(loginParams),
+       },
+     )
+-    await this.updateCookie(loginRes.headers)
++    await this.updateCookie(loginRes.headers, "open.e.189.cn")
+     const loginData = await loginRes.json()
+     if (loginData.result !== 0) {
+       const msg = loginData.msg || "登录失败"
+@@ -502,13 +555,23 @@ export class Pan189Client {
+       reqBody = new URLSearchParams(options.body).toString()
+     }
+ 
+-    const res = await fetch(urlObj.toString(), {
++    let res = await this.httpRequest(urlObj.toString(), {
+       method,
+       headers,
+       body: reqBody,
+     })
++    // fetch 原来自动跟重定向；curl 不跟，这里逐跳补上（最多 3 跳）。
++    for (let hop = 0; hop < 3; hop++) {
++      const location = res.headers.get("location")
++      if (res.status < 300 || res.status >= 400 || !location) break
++      res = await this.httpRequest(new URL(location, urlObj).toString(), {
++        method,
++        headers,
++        body: reqBody,
++      })
++    }
+ 
+-    await this.updateCookie(res.headers)
++    await this.updateCookie(res.headers, urlObj.hostname)
+ 
+     const text = await res.text()
+     let data: any
+@@ -693,10 +756,9 @@ export class Pan189Client {
+ 
+     // 尝试解析一次 302 重定向获得直接 CDN 地址
+     try {
+-      const probeRes = await fetch(downloadUrl, {
+-        method: "GET",
++      const probeRes = await this.httpRequest(downloadUrl, {
+         headers: this.getDownloadHeaders(),
+-        redirect: "manual",
++        manualRedirect: true,
+       })
+       const loc = probeRes.headers.get("location")
+       if (probeRes.status === 302 && loc) {
+@@ -775,7 +837,7 @@ export class Pan189Client {
+       `https://upload.cloud.189.cn${uri}?params=${encryptedParams}`,
+       { method: "GET", headers },
+     )
+-    await this.updateCookie(response.headers)
++    await this.updateCookie(response.headers, "upload.cloud.189.cn")
+     const text = await response.text()
+     if (!response.ok) {
+       throw new Error(

@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 36 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 38 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -61,6 +61,34 @@
 #   p.wait() 返回 {exit_status, term_signal} 对象（不是数字），p.exitCode 是 undefined，
 #   成功判据只能用 rc.exit_status === 0。本条按 --exclude 口径照常参与 apply。
 #   patch_count 35->36，file_count 35 不变（两个文件都不登记 file 条目，靠补丁 sha 校验）。
+#
+# 第 37 条（2026-11-03，r36 189 传输层）：drivers/189 的登录链与 cloud.189.cn API 改走
+#   子进程 curl。设备实测（conductor，证据 work/cond-r35-189repro/）：同一 Cookie 由 curl
+#   取得后交给 txiki fetch 会被判 InvalidSessionKey；callbackUnify 在 fetch 上 10 s 超时、
+#   curl 767 ms 拿到 302 + 2 条 Set-Cookie。改动两处：
+#   1) 新增 src/backend/drivers/189/curl-http.ts：tjs.spawn 跑
+#      /usr/bin/curl -q -sS --max-time 20 -D - -H "Expect:" [--http2] [-X POST] [-H ...]
+#      [--data-binary ...] <url>；解析头块与 body，返回 {status, headers, setCookies, body}。
+#      不跟随重定向（调用方逐跳跟，逐跳收 Set-Cookie）。curl 不存在 / 非 0 退出 / 超时
+#      （--max-time + 5 s 硬超时 SIGKILL）/ 头解析失败一律返回 null，调用方回落 fetch。
+#   2) util.ts：新增 httpRequest()（curl 优先、fetch 回落）与按域 Cookie 罐——openCookie
+#      只发 open.e.189.cn，this.cookie 只发 cloud.189.cn（含 upload 域），修掉同名单 Cookie
+#      跨域互相覆盖；followRedirectsWithCookies、request()、getDownloadUrl 的 302 探针改走
+#      httpRequest；appConf/encryptConf/loginSubmit 仍走 fetch（现测 57-250 ms 正常）。
+#      上传本体仍走 fetch，只把 Set-Cookie 落到 cloud 罐。
+#   patch_count 36->37，file_count 35 不变（两个文件都不登记 file 条目，靠补丁 sha 校验）。
+#
+# 第 38 条（2026-11-03，r37 下载探针只取头）：getDownloadUrl 的 302 探测原来走 httpRequest
+#   -> curlFetch 的默认路径，curlFetch 用 new Response(proc.stdout).text() 收全文；探针若遇到
+#   200 + 大文件体会把整包读进 tjs 进程内存（路由器 OOM）。本条只改探针路径：
+#   1) curl-http.ts 增加 headersOnly 选项：buildArgs 加 -o /dev/null（保留 -D -），stdout 只剩
+#      响应头；curlFetch 在该模式下返回 body 恒为空串。
+#   2) util.ts 的 httpRequest 透传 headersOnly；curl 不可用时回落 fetch 也只取头（body 流 cancel），
+#      不整包缓冲。getDownloadUrl 的探针改用它；其余 request() 调用、重定向/Cookie 罐/回落重试
+#      一字未改。
+#   实测（本机 tjs 26.9.0 + curl 8.18.0 + 64 MiB mock body）：headersOnly VmHWM 增量 20 kB，
+#   同一端点默认路径 206,328 kB；302 仍拿到 Location 与两条 Set-Cookie。
+#   patch_count 37->38，file_count 35 不变（两个文件仍不登记 file 条目，靠补丁 sha 校验）。
 #   internal/op/share.ts:159 的密码错分支补 status: 403；raw.ts 的 (shareRes.status || 404)
 #   直接透传，不需要改。fs.ts 的 shareErrorResponse 已按「密码错 403、其他 400」实现，未改。
 #   patch_count 34->35；internal/op/share.ts 未登记 file 条目（同 db.ts，靠补丁 sha 校验）。
@@ -72,7 +100,7 @@
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..35> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..38> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -88,7 +116,7 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 35 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 38 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
 #   校验：prepare 之后对 35 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
@@ -97,13 +125,13 @@
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..35 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..38 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
 #   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 35 条指纹后出包）
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 36
+patch_count 38
 file_count 35
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -141,6 +169,8 @@ patch 33 e087532169e3b532080599679c5d856c2f2ebee3119a06ab94347cac26fc0949 work/p
 patch 34 cea431a4bba116cf3bc64cb295ac7e84fc50419ffcb62f3ce9886eb9326d8588 work/p2-34-guest-default-disabled.patch
 patch 35 8ab0c06e4722b3c2776b6d9b800f40776866738a5d95a629e0b21b8c84cb550f work/p2-35-share-wrong-password-status.patch
 patch 36 c7229658ddc9cca72423c77b12fb822aa21bed5f3373948e7a9f69b978c9128a work/p2-36-189-curl-fallback.patch
+patch 37 8d1dd8b0f60a66fd148174f40628499f485f29d34718ec69f5b7b389a8567037 work/p2-37-189-curl-transport.patch
+patch 38 d8d322310cf12fdd8dffee073198bfe1d0c2249081f24444b06ce0b809310410 work/p2-38-189-probe-headers.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf

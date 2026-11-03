@@ -1,0 +1,89 @@
+diff --git a/src/backend/drivers/189/curl-http.ts b/src/backend/drivers/189/curl-http.ts
+index 65ef5ce..9c76a28 100644
+--- a/src/backend/drivers/189/curl-http.ts
++++ b/src/backend/drivers/189/curl-http.ts
+@@ -32,6 +32,11 @@ export interface CurlHttpOptions {
+   maxTimeS?: number
+   /** 默认 https 就走 HTTP/2（与设备实测通过的 curl 口径一致）。 */
+   http2?: boolean
++  /**
++   * 只取响应头（下载直链探针用）：buildArgs 加 -o /dev/null 把 body 丢掉，
++   * stdout 只留 -D - 的头块，返回的 body 恒为空串，不把整包读进内存。
++   */
++  headersOnly?: boolean
+ }
+ 
+ declare const tjs: any
+@@ -106,6 +111,8 @@ function buildArgs(url: string, options: CurlHttpOptions): string[] {
+     "-H",
+     "Expect:",
+   ]
++  // headers-only：body 直接写 /dev/null，stdout 只剩响应头，探针不会缓冲整包。
++  if (options.headersOnly) args.push("-o", "/dev/null")
+   const useHttp2 = options.http2 ?? url.startsWith("https://")
+   if (useHttp2) args.push("--http2")
+   const method = options.method || "GET"
+@@ -167,7 +174,13 @@ export async function curlFetch(
+       if (name === "set-cookie") setCookies.push(value)
+       else if (!headers.has(name)) headers.set(name, value)
+     }
+-    return { status: parsed.status, headers, setCookies, body: parsed.body }
++    // headers-only 下 body 由 -o /dev/null 丢弃，这里再兜一层：不把 body 交出去。
++    return {
++      status: parsed.status,
++      headers,
++      setCookies,
++      body: options.headersOnly ? "" : parsed.body,
++    }
+   })().catch(() => null)
+ 
+   const result = await Promise.race([finished, hardTimeout])
+diff --git a/src/backend/drivers/189/util.ts b/src/backend/drivers/189/util.ts
+index 4378654..a3da6df 100644
+--- a/src/backend/drivers/189/util.ts
++++ b/src/backend/drivers/189/util.ts
+@@ -206,6 +206,8 @@ export class Pan189Client {
+       headers: Record<string, string>
+       body?: string
+       manualRedirect?: boolean
++      /** 只取响应头（下载直链探针）：不把 body 读进内存。 */
++      headersOnly?: boolean
+     },
+   ): Promise<Response> {
+     const method = init.method || "GET"
+@@ -213,8 +215,27 @@ export class Pan189Client {
+       method,
+       headers: init.headers,
+       body: init.body,
++      headersOnly: init.headersOnly,
+     })
+     if (!viaCurl) {
++      if (init.headersOnly) {
++        // curl 不可用时也不能整包缓冲：拿到响应就丢弃 body 流。
++        const fallback = await fetch(url, {
++          method,
++          headers: init.headers,
++          redirect: "manual",
++        })
++        try {
++          await fallback.body?.cancel()
++        } catch {
++          // 流已结束或不可取消。
++        }
++        return new Response(null, {
++          status: fallback.status,
++          headers: fallback.headers,
++          url,
++        })
++      }
+       return fetch(url, {
+         method,
+         headers: init.headers,
+@@ -759,6 +780,7 @@ export class Pan189Client {
+       const probeRes = await this.httpRequest(downloadUrl, {
+         headers: this.getDownloadHeaders(),
+         manualRedirect: true,
++        headersOnly: true,
+       })
+       const loc = probeRes.headers.get("location")
+       if (probeRes.status === 302 && loc) {

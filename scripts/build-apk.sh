@@ -252,11 +252,13 @@ rm -f "$OUT"
 # 打包后再从 adbdump 读实际值比对，不等就说明 staging 与包内文件集不一致。
 STAGE_BYTES=$(find "$STAGE" -type f -exec stat -c %s {} + | awk '{s+=$1} END{print s}')
 echo "STAGE_BYTES=$STAGE_BYTES"
+# B2（r37）：curl 是 189 驱动 curl 传输的运行时依赖，必须在包元数据里声明。
+# 设备现查 apk info -e curl rc=0、/usr/bin/curl 属 curl-8.21.0-r1，依赖可满足。
+set -- -I "depends:curl"
+echo "DEPENDS=curl"
 if [ "$SHARED_TJS" = 1 ]; then
-	set -- -I "depends:txiki-js>=$TJS_MIN_VERSION"
-	echo "DEPENDS=txiki-js>=$TJS_MIN_VERSION"
-else
-	set --
+	set -- "$@" -I "depends:txiki-js>=$TJS_MIN_VERSION"
+	echo "DEPENDS=curl txiki-js>=$TJS_MIN_VERSION"
 fi
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \
