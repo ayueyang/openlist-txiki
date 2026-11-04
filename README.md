@@ -64,6 +64,18 @@ apk del openlist-txiki                       # 数据目录 /etc/openlist-txiki 
 
 数据（`data.db`、`admin.pass`、`openlist-txiki.env`、`rollback/`）都在 `/etc/openlist-txiki`，升级不覆盖用户改过的 env。
 
+## 单独下载 txiki 运行时
+
+运行时也单独发布，三个平台各一个文件，适合已装 alist-encrypt、系统里已有 txiki 的用户，不必再带第二份：
+
+- `tjs-aarch64-linux-musl`（OpenWrt / aarch64）
+- `tjs-x86_64-linux-musl`（Linux）
+- `tjs-x86_64-windows.exe`（Windows）
+
+下载页：<https://github.com/ayueyang/openlist-txiki/releases/tag/txiki-runtime-v26.9.0>
+
+注意：本运行时是 26.9.0 定制构建，带 6 个补丁（流式请求体、断流处理、TLS PSS 等），并支持 QuickJS-ng 字节码版本 27；低于 26.9.0 的运行时无法加载 r40 之后的字节码形态。
+
 ## 独立运行（Windows / Linux）
 
 ```sh
