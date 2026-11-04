@@ -1,0 +1,44 @@
+diff --git a/src/backend/internal/driver/proxy.ts b/src/backend/internal/driver/proxy.ts
+index 521acff..ad0225f 100644
+--- a/src/backend/internal/driver/proxy.ts
++++ b/src/backend/internal/driver/proxy.ts
+@@ -126,6 +126,10 @@ const DRIVER_FORCE_PROXY = new Set<string>([
+   "quarkuc",
+   "chaoxing",
+   "local",
++  // 115 cookie 版直链要带 auth_cookie + 固定 UA，浏览器 302 过去必然 403。
++  // "115cloud" 是 alist 导出的驱动名，"115cookie" 是后台表单的驱动名。
++  "115cloud",
++  "115cookie",
+ ])
+ 
+ /** 默认代理（Go: Config.DefaultProxy() = PreferProxy） */
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index d13b599..3eb28a4 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -19,6 +19,7 @@ import { AliyundriveOpen } from "../../drivers/aliyundrive_open/driver"
+ import { GoogleDrive } from "../../drivers/google_drive/driver"
+ import { QuarkDriver } from "../../drivers/quark/driver"
+ import { Driver115 } from "../../drivers/115/driver"
++import { Driver115Cookie } from "../../drivers/115cookie/driver"
+ import { DriverCloudreve } from "../../drivers/cloudreve_v4/driver"
+ import { DriverCloudreveV3 } from "../../drivers/cloudreve_v3/driver"
+ import { DriverOpenlist } from "../../drivers/openlist/driver"
+@@ -300,10 +301,15 @@ async function createDriver(
+   } else if (
+     normDriver === "115" ||
+     normDriver === "115cloud" ||
++    normDriver === "115cookie" ||
+     normDriver === "115open" ||
+     normDriver === "115netdisk"
+   ) {
+-    driver = new Driver115(parseAddition(storageConfig))
++    const addition = parseAddition(storageConfig)
++    driver =
++      addition.cookie && !addition.access_token
++        ? new Driver115Cookie(addition)
++        : new Driver115(addition)
+     await driver.init?.()
+   } else if (
+     normDriver === "cloudreve" ||

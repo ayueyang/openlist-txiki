@@ -1,0 +1,175 @@
+diff --git a/src/backend/drivers/aliyundrive_open/types.ts b/src/backend/drivers/aliyundrive_open/types.ts
+index 9f0e897..5c15bd5 100644
+--- a/src/backend/drivers/aliyundrive_open/types.ts
++++ b/src/backend/drivers/aliyundrive_open/types.ts
+@@ -11,10 +11,16 @@ export interface AliyundriveOpenAddition {
+   // 在线 API 模式
+   use_online_api?: boolean
+   api_url_address?: string
++  // 兼容 alist 导出的字段名：alist 的 oauth_token_url 与 api_url_address 等价
++  oauth_token_url?: string
+   alipan_type?: "alipanQR" | "alipanTV"
+   // 直接 OAuth 模式（使用自己的应用）
+   client_id?: string
+   client_secret?: string
++  // 迁移场景：alist 导出的配置带现成 access_token（字段名 AccessToken），
++  // 有就先当初始令牌用，等过期/401 再走 refreshAccessToken。
++  access_token?: string
++  AccessToken?: string
+ }
+ 
+ // Token 响应结构
+diff --git a/src/backend/drivers/aliyundrive_open/util.ts b/src/backend/drivers/aliyundrive_open/util.ts
+index e745497..357347a 100644
+--- a/src/backend/drivers/aliyundrive_open/util.ts
++++ b/src/backend/drivers/aliyundrive_open/util.ts
+@@ -9,8 +9,8 @@ const ALI_OPEN_API = "https://openapi.aliyundrive.com/adrive/v1.0"
+ 
+ // ============================================================
+ // AliyunOpenClient - 阿里云盘 OAuth2 OpenAPI 客户端
+-// 优先通过在线 API 中转（GET + query params），
+-// 备用直连 OAuth 端点（需要 client_id + client_secret）
++// 优先通过在线 API 中转：自定义中转先 POST JSON，失败退回 GET + query params；
++// 内置中转仍按 GET；备用直连 OAuth 端点（需要 client_id + client_secret）
+ // ============================================================
+ export class AliyunOpenClient {
+   private addition: AliyundriveOpenAddition
+@@ -23,15 +23,28 @@ export class AliyunOpenClient {
+     this.addition = addition
+     this.refreshTokenVal = addition.refresh_token || ""
+     this.driveId = addition.drive_id || ""
++    // 迁移场景：alist 导出的配置里有现成 access_token（AccessToken），
++    // 先当初始令牌用；过期由 401 重试路径触发刷新。
++    const providedAccess = (
++      addition.access_token ||
++      addition.AccessToken ||
++      ""
++    ).trim()
++    if (providedAccess) {
++      this.accessToken = providedAccess
++      this.tokenExpiresAt = Number.MAX_SAFE_INTEGER
++    }
+   }
+ 
+   public async init(): Promise<void> {
+-    if (!this.refreshTokenVal || !this.refreshTokenVal.trim()) {
++    if (!this.refreshTokenVal.trim() && !this.accessToken) {
+       console.warn("[AliyundriveOpen] refresh_token is empty, skipping init.")
+       return
+     }
+     try {
+-      await this.refreshAccessToken()
++      if (!this.accessToken) {
++        await this.refreshAccessToken()
++      }
+       if (!this.driveId) {
+         await this.resolveDriveId()
+       }
+@@ -88,48 +101,77 @@ export class AliyunOpenClient {
+     }
+     const token = this.refreshTokenVal.trim()
+ 
+-    // 策略1: 通过在线 API 中转（GET + query params）
+-    const onlineApis: string[] = []
+-    if (this.addition.api_url_address && this.addition.api_url_address.trim()) {
+-      const customApi = this.addition.api_url_address.trim()
++    // 策略1: 通过在线 API 中转。自定义中转先 POST JSON（alist 的
++    // /alist/ali_open/token 只认 POST + grant_type），失败再退回 GET query；
++    // 内置中转保持 GET 不变。
++    const onlineApis: Array<{ url: string; post: boolean }> = []
++    const customApi = (
++      this.addition.api_url_address ||
++      this.addition.oauth_token_url ||
++      ""
++    ).trim()
++    if (customApi) {
+       // FIX(H-2): api_url_address 是管理员可配置字段，会把用户 refresh_token
+       // 发给该 URL。必须先做 SSRF 校验，否则可被配置成内网/元数据地址导致
+       // token 外泄。不安全时跳过该自定义地址，继续使用内置受信地址。
+       try {
+         assertSafeUrl(customApi, "AliyundriveOpen api_url_address")
+-        onlineApis.push(customApi)
++        onlineApis.push({ url: customApi, post: true })
++        onlineApis.push({ url: customApi, post: false })
+       } catch (e: any) {
+         console.warn(
+           `[AliyundriveOpen] Skipping unsafe api_url_address: ${e.message}`,
+         )
+       }
+     }
+-    onlineApis.push(
++    for (const builtin of [
+       "https://api.oplist.org/alicloud/renewapi",
+       "https://api.oplist.org/ali_open/token",
+       "https://api.oplist.org/aliyundrive/token",
+       "https://api.alist.nn.ci/alist/ali_open/token",
+       "https://api.alist.nn.ci/aliyundrive/token",
+       "https://api-sam.oplist.org/aliyundrive/token",
+-    )
++    ]) {
++      onlineApis.push({ url: builtin, post: false })
++    }
+ 
+     const driverTxt =
+       this.addition.alipan_type === "alipanTV" ? "alicloud_tv" : "alicloud_qr"
+ 
+-    for (const apiUrl of onlineApis) {
++    for (const api of onlineApis) {
++      const apiUrl = api.url
+       try {
+-        const params = new URLSearchParams({
+-          refresh_ui: token,
+-          refresh_token: token,
+-          server_use: "true",
+-          driver_txt: driverTxt,
+-        })
+-        const res = await fetch(`${apiUrl}?${params.toString()}`, {
+-          method: "GET",
+-          headers: { "Content-Type": "application/json" },
+-        })
++        // POST 分支同样过 SSRF 校验，不因换方法绕过
++        if (api.post) {
++          assertSafeUrl(apiUrl, "AliyundriveOpen token endpoint")
++        }
++        let res: Response
++        if (api.post) {
++          res = await fetch(apiUrl, {
++            method: "POST",
++            headers: { "Content-Type": "application/json" },
++            body: JSON.stringify({
++              grant_type: "refresh_token",
++              refresh_token: token,
++            }),
++          })
++        } else {
++          const params = new URLSearchParams({
++            refresh_ui: token,
++            refresh_token: token,
++            server_use: "true",
++            driver_txt: driverTxt,
++          })
++          res = await fetch(`${apiUrl}?${params.toString()}`, {
++            method: "GET",
++            headers: { "Content-Type": "application/json" },
++          })
++        }
+         if (!res.ok) {
+-          throw new Error(`[Status ${res.status}]`)
++          const detail = await res.text().catch(() => "")
++          throw new Error(
++            `[Status ${res.status}]${detail ? " " + detail.slice(0, 200) : ""}`,
++          )
+         }
+         const data: any = await res.json()
+         const newToken: string =
+@@ -147,8 +189,9 @@ export class AliyunOpenClient {
+           Date.now() + (data.expires_in || 7200) * 1000 - 60000
+         return // Success!
+       } catch (err: any) {
++        const mode = api.post ? "POST" : "GET"
+         console.warn(
+-          `[AliyundriveOpen] Online API '${apiUrl}' failed: ${err.message}`,
++          `[AliyundriveOpen] Online API (${mode}) '${apiUrl}' failed: ${err.message}`,
+         )
+       }
+     }

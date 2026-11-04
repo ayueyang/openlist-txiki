@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 39 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 41 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -104,10 +104,16 @@
 #   davRequestPath 改复用 wirePath（destinationPath 的 Destination 头解码保留）。
 #   canonical-path.test.ts 增加 wirePath 组。patch_count 38->39，file_count 35 不变。
 #
+# 第 40 条（2026-11-04，r40 阿里云盘 Open 中转刷新）：自定义中转（api_url_address 或 alist
+#   导出的 oauth_token_url）先发 POST JSON {grant_type:refresh_token, refresh_token}，失败再退回
+#   原 GET query；内置中转地址保持 GET。addition 可直接给 access_token/AccessToken 当初始令牌，
+#   过期后仍走刷新。drivers/aliyundrive_open/{util.ts,types.ts} 不登记 file 条目（靠补丁 sha 校验）。
+#   patch_count 39->40，file_count 35 不变。
+#
 #   manifest_version <n>
 #   upstream_commit <40 位 sha>
 #   checkout_eol <crlf|lf>        apply 补丁前构建树 checkout 的期望行尾（补丁上下文含 CRLF，须 CRLF 树）
-#   patch <序号 01..39> <sha256> <补丁相对项目根路径>
+#   patch <序号 01..40> <sha256> <补丁相对项目根路径>
 #   file <sha256> <构建树内相对路径> src=<来源> strip_header=<yes|no> eol=<crlf|lf|keep>
 #     src=upstream          上游 checkout 原样，不改
 #     src=repo              项目仓库 <项目根>/<同一路径> 的副本
@@ -123,23 +129,26 @@
 #      entry.ts 保留注释头与 CRLF（与仓库副本逐字节相同，故 strip_header=no）。
 #   3) 补丁产物 local.ts、op/storage.ts、server/copy-task.ts、server/raw.ts 在构建树是 LF；
 #      其余 14 个补丁文件沿用 CRLF checkout。eol= 声明每条在构建树里的最终行尾。
-#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 39 个补丁之后、esbuild 之前，
+#   执行者与时机：build-txiki.mjs 的 prepare 阶段，在 apply 完 41 个补丁之后、esbuild 之前，
 #   逐条从 src= 读字节，按 strip_header 剥头、按 eol 归一，写进构建树；已一致的条目不重写（幂等）。
-#   校验：prepare 之后对 35 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
+#   校验：prepare 之后对 40 条 file 逐条 sha256 比对，任何一条不符打印期望/实际并 exit 1，不出包。
 #
 # 缺口 3：rename-fail-entry.ts 是测试专用入口（生产 bundle 不引用），不在 src/ 下；
 #   唯一来源 work/fault/rename-fail-entry.ts，sha256 a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23，与构建树字节相同。
 #
 # 重建顺序（第三方按此可从零复现冻版）：
 #   1) git clone OpenListTeam/OpenList-Worker，checkout 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca，core.autocrlf=true（CRLF 树，见 checkout_eol）
-#   2) 按下面 patch 01..39 的顺序逐个 git apply --exclude='src/backend/txiki/*'
+#   2) 按下面 patch 01..41 的顺序逐个 git apply --exclude='src/backend/txiki/*'
 #   3) pnpm install --frozen-lockfile
-#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 35 条指纹后出包）
+#   4) node scripts/build-txiki.mjs（本脚本 prepare 阶段补齐 txiki 目录、剥头、归一、校验 40 条指纹后出包）
+#   2026-11-04 r40：新增 41（115 网盘 cookie 版：storage.ts 在 115 分支内按 addition.cookie &&
+#   !addition.access_token 分派到 drivers/115cookie，proxy.ts 的 DRIVER_FORCE_PROXY 加 115cloud/115cookie）；
+#   patch_count 40->41，file_count 35->40（新增 115cookie 四个 src=repo 文件与 proxy.ts 的 src=patch 条目）。
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 39
-file_count 35
+patch_count 41
+file_count 40
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -179,18 +188,25 @@ patch 36 c7229658ddc9cca72423c77b12fb822aa21bed5f3373948e7a9f69b978c9128a work/p
 patch 37 8d1dd8b0f60a66fd148174f40628499f485f29d34718ec69f5b7b389a8567037 work/p2-37-189-curl-transport.patch
 patch 38 d8d322310cf12fdd8dffee073198bfe1d0c2249081f24444b06ce0b809310410 work/p2-38-189-probe-headers.patch
 patch 39 ad87eda9b77641ff46b1a037c8ef13e39ce276dd94b5fd11ca08dbcb4a40c3f6 work/p2-39-pathdecode.patch
+patch 40 15609264ec60c266d207d8d15d199e1409b84169beffd6350095204687396d08 work/p2-40-ali-open-refresh.patch
+patch 41 e5540348718ae7256f31c79b6373b2b1272b8eba7699f16389206ca64719bfd2 work/p2-41-115cookie.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file 62f6ae97c3c5b7e60ddc55281c4724f989f78f40952d2faab42161c8bf91f9e1 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file ba71092eaf11d40d826ffa28fe450ca5112adc12006b3241896cdee450daeb0f src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
+file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
+file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
+file d7e3b8c65a361cf38cce8c4379cf700d38068f2df5077c3ee6def6ed181fa67e src/backend/drivers/115cookie/util.ts src=repo strip_header=no eol=lf
+file ccaca490a7fac98094de601eb7d01ee730e2b355d934337b6bd366418857a128 src/backend/drivers/115cookie/driver.ts src=repo strip_header=no eol=lf
 file bf178726e27ed9ec313d9822f75d1ed134b3fcb60dc410ee300660a29c070e9e src/backend/internal/stream/stream.ts src=patch strip_header=no eol=crlf
 file 7efe4b23569f8458439d00bce562f5c3aaec6afebdb51c00bae7b7648e741907 src/backend/internal/webdav/webdav.ts src=patch strip_header=no eol=crlf
 file 3b0bc05837d6676e6adac59ebe03d708899f519e73163c712b42eb420ae6ff26 src/backend/pkg/password.ts src=patch strip_header=no eol=crlf
 file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backend/pkg/xml.ts src=patch strip_header=no eol=crlf
-file 8d0b71e2d323d3433398905f7436b31d1606ae7998d71f5a36c1dd5f06e7a44a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
+file 7046e61818e9d85a0f6f8d740405552bcfbdd1e0430a29aa81d1e62cfac9e75a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
 file eb8e80d3f609573965bd74ef2ec955e16a4c26f4789bd6b23de056e5e1c2ba22 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
