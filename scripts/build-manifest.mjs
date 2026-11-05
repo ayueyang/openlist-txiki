@@ -55,12 +55,76 @@ for (const f of [opt.bundle, opt.tjs, opt["source-manifest"]]) {
 }
 
 const sha256 = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")
+const sha256buf = (b) => crypto.createHash("sha256").update(b).digest("hex")
+
+// A2：字节码独立二进制。给了 --exe 就必须同时给四个 tjs-* 身份字段（构建侧已核实），
+// 这里复算尾标构成并写进 manifest；任一项不符 exit 1。不给 --exe 时 manifest 不含这些字段，
+// 与 A2 之前的包逐字节同形。
+let bytecodeInfo = null
+if (opt.exe) {
+  const needBc = ["tjs-version", "tjs-compile-sha256", "tjs-template-sha256", "tjs-template-arch"].filter((k) => !opt[k])
+  if (needBc.length) {
+    console.error("FAIL: 给 --exe 时必须同时给 " + needBc.map((k) => "--" + k).join(" "))
+    process.exit(1)
+  }
+  if (!fs.existsSync(opt.exe)) {
+    console.error("FAIL: 文件不存在 " + opt.exe)
+    process.exit(1)
+  }
+  const exeBuf = fs.readFileSync(opt.exe)
+  const exeBytes = exeBuf.length
+  if (exeBytes <= 12) {
+    console.error("FAIL: exe 字节数过小 " + exeBytes)
+    process.exit(1)
+  }
+  const trailerBuf = exeBuf.subarray(exeBytes - 12)
+  const trailerMagic = trailerBuf.subarray(0, 8).toString("latin1")
+  const bcOffset = trailerBuf.readUInt32LE(8)
+  if (trailerMagic !== "tx1k1.js") {
+    console.error("FAIL: 尾 12 B 的 magic=" + JSON.stringify(trailerMagic) + " 期望 tx1k1.js")
+    process.exit(1)
+  }
+  if (bcOffset <= 0 || bcOffset > exeBytes - 12) {
+    console.error("FAIL: 尾标偏移 " + bcOffset + " 越界（exe_bytes=" + exeBytes + "）")
+    process.exit(1)
+  }
+  const bcBuf = exeBuf.subarray(bcOffset, exeBytes - 12)
+  if (bcOffset + bcBuf.length + 12 !== exeBytes) {
+    console.error("FAIL: 构成为 offset+bytes+12 != exe_bytes")
+    process.exit(1)
+  }
+  let engineVersions = {}
+  if (opt["tjs-engine-versions"]) {
+    try {
+      engineVersions = JSON.parse(opt["tjs-engine-versions"])
+    } catch (e) {
+      console.error("FAIL: --tjs-engine-versions 不是合法 JSON: " + e.message)
+      process.exit(1)
+    }
+  }
+  bytecodeInfo = {
+    exe_sha256: sha256buf(exeBuf),
+    exe_bytes: exeBytes,
+    bytecode_sha256: sha256buf(bcBuf),
+    bytecode_bytes: bcBuf.length,
+    bytecode_offset: bcOffset,
+    bytecode_trailer: trailerMagic,
+    tjs_bc_version: bcBuf[0],
+    tjs_version: opt["tjs-version"],
+    tjs_engine_versions: engineVersions,
+    tjs_compile_sha256: opt["tjs-compile-sha256"],
+    tjs_template_sha256: opt["tjs-template-sha256"],
+    tjs_template_arch: opt["tjs-template-arch"],
+  }
+}
 
 // r29：包内精简前端（官方 lite asset）身份。--web-dist 指向解开后的 dist 目录。
 // 只认下面 pin 里的版本：任何一项现算值与 pin 不符就 exit 1（fail-closed，不出包）。
 // 说明：file_count 是本文件上面的「源码指纹条数」，web_dist.file_count 是包内静态文件数，两回事。
 const WEB_PATH = "usr/share/openlist-txiki/dist"
 const WEB_SOURCE = "OpenListTeam/OpenList-Frontend"
+// 同一版本有两个官方 asset：lite 与 standard（完整）。lite 按版本号登记（旧口径不变），
+// standard 按 asset 文件名登记（同名版本，靠文件名区分）。
 const WEB_PINS = {
   "v4.2.7": {
     commit: "d82d950c",
@@ -71,6 +135,17 @@ const WEB_PINS = {
     bytes: 9384554,
     tree_sha256: "507b55de4aac050c340b00ff3c8335755c0f11ef7700fc22ebe3554f6d26db8a",
     index_sha256: "d2151c0c5e0aadc315e68b869c34f1e47030cbc20a266b5a0da3c79492348f47",
+  },
+}
+const WEB_PINS_BY_ARCHIVE = {
+  "openlist-frontend-dist-v4.2.7.tar.gz": {
+    commit: "d82d950c",
+    archive_sha256: "88aba5260646ed784847a11e473880d749b17b80af53caf895fe1f31f36aa3e3",
+    archive_bytes: 20631035,
+    file_count: 452,
+    bytes: 58517793,
+    tree_sha256: "c107306c3f3d760d65bf9f615d92d9a9a67485d72e024b0e0d061178f63c5137",
+    index_sha256: "d39323e13b44e2e909a12d46bfe26141bed55012ee08ea1f6c8f71575e38193a",
   },
 }
 
@@ -124,7 +199,7 @@ if (opt["web-dist"]) {
   // 版本从 asset 文件名取，只认 pin 里的版本。
   const m = path.basename(archivePath).match(/-v(\d+\.\d+\.\d+)\.tar\.gz$/)
   const version = opt["web-version"] || (m ? "v" + m[1] : "")
-  const pin = WEB_PINS[version]
+  const pin = WEB_PINS_BY_ARCHIVE[path.basename(archivePath)] || WEB_PINS[version]
   if (!pin) {
     console.error("FAIL: 未登记的前端版本 " + (version || "(无法从文件名解析，需 --web-version)") + "；已登记：" + Object.keys(WEB_PINS).join(", "))
     process.exit(1)
@@ -190,6 +265,49 @@ if (runtime !== "bundled" && runtime !== "shared") {
   console.error("FAIL: --runtime 只接受 bundled 或 shared（现为 " + runtime + "）")
   process.exit(1)
 }
+
+// r40：驱动拆分形态的 chunk 清单。--split-manifest 指向构建脚本产出的 build-manifest.json，
+// 取其中的 chunks（rel/bytes/sha256），逐条与盘面（相对 bundle 所在目录）核对；
+// 目录里多一个、少一个、字节不符都 exit 1，不出包。
+let splitInfo = null
+if (opt["split-manifest"]) {
+  const smPath = path.resolve(opt["split-manifest"])
+  if (!fs.existsSync(smPath)) {
+    console.error("FAIL: --split-manifest 不存在 " + smPath)
+    process.exit(1)
+  }
+  const sm = JSON.parse(fs.readFileSync(smPath, "utf8"))
+  const list = Array.isArray(sm.chunks) ? sm.chunks : []
+  if (!list.length) {
+    console.error("FAIL: --split-manifest 里没有 chunks（拆分构建没产出 chunk）")
+    process.exit(1)
+  }
+  const baseDir = path.dirname(path.resolve(opt.bundle))
+  for (const c of list) {
+    if (!/^chunks\/[A-Za-z0-9._-]+\.js$/.test(c.rel)) {
+      console.error("FAIL: chunk 路径不合规 " + c.rel)
+      process.exit(1)
+    }
+    const abs = path.join(baseDir, c.rel)
+    if (!fs.existsSync(abs)) {
+      console.error("FAIL: chunk 缺失 " + abs)
+      process.exit(1)
+    }
+    if (fs.statSync(abs).size !== c.bytes || sha256(abs) !== c.sha256) {
+      console.error("FAIL: chunk 字节不符 " + c.rel)
+      process.exit(1)
+    }
+  }
+  const chunkDir = path.join(baseDir, "chunks")
+  const got = fs.readdirSync(chunkDir).filter((n) => n.endsWith(".js")).sort()
+  const want = list.map((c) => c.rel.slice("chunks/".length)).sort()
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    console.error("FAIL: chunks 目录与构建清单不一致（多/少文件）")
+    process.exit(1)
+  }
+  splitInfo = { chunk_count: list.length, chunks: list, split_drivers: sm.split_drivers || [] }
+}
+
 const out = {
   package: "openlist-txiki",
   package_version: opt.version,
@@ -212,6 +330,8 @@ const out = {
   build_date: new Date().toISOString().slice(0, 10),
 }
 if (webDist) out.web_dist = webDist
+if (bytecodeInfo) Object.assign(out, bytecodeInfo)
+if (splitInfo) Object.assign(out, splitInfo)
 if (runtime === "shared") {
   out.runtime = "shared"
   out.tjs_min_version = opt["tjs-min-version"] || "26.9.0"

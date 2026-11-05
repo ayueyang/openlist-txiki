@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """渲染 assets 模板并打 Windows zip / x86_64-linux tar.gz，全程 fail-closed。
 
-唯一模板源：本仓库 build/assets/*.in（占位符 @VERSION@）。
+唯一模板源：本仓库 build/assets/*.in（占位符 @VERSION@、@BUNDLE_BYTES@、
+@BUNDLE_SHA256@、@TJS_BYTES@）。bundle 的字节数与 sha 由生成脚本从 --bin-dir
+里的 openlist-txiki.js 实算，tjs.exe 字节数同理；模板里不许写死字节数或 sha。
 产物：
   <release-dir>/assets/README-Windows.md、run.cmd、run.sh、BUILD.md
   <release-dir>/openlist-txiki-<ver>-win-x64.zip
@@ -15,6 +17,8 @@ fail-closed（任一成立即 rc=1，且不留下 zip/tar）：
   T4 打出来的归档里任一条目出现 '0.1.0-rN' 且不等于 --version
   T5 归档条目字节与渲染源不一致，或缺条目
   T6 --license-dir 下缺 LICENSE_FILES 里的任一份全文
+  T7 取不到 bundle / tjs.exe 的实算身份，或渲染后的 README 不含实算字节数与 sha
+  T8 README-Windows.md 模板里写死了字节数或 sha（必须用占位符）
 
 四份许可证全文（LICENSE_FILES）各打两份：归档根目录一份，LICENSE_SUBDIR 下再一份。
 包内 THIRD-PARTY-NOTICES 同时写了「见 LICENSE.AGPL-3.0」与「包内 /usr/share/openlist-txiki/」，
@@ -41,6 +45,9 @@ import zipfile
 TEMPLATES = ("README-Windows.md", "run.cmd", "run.sh", "BUILD.md")
 ASSETS_IN_ARCHIVE = ("README-Windows.md", "run.cmd", "run.sh")
 VER_RE = re.compile(r"0\.1\.0-r\d+")
+PLACEHOLDERS = ("@VERSION@", "@BUNDLE_BYTES@", "@BUNDLE_SHA256@", "@TJS_BYTES@")
+SHA256_RE = re.compile(r"\b[0-9a-f]{64}\b")
+FIXED_BYTES_RE = re.compile(r"\d{1,3}(?:,\d{3})+\s*B\b")
 MTIME = 1793119200
 FILE_MODES = {
     "README-Windows.md": 0o644,
@@ -66,8 +73,20 @@ def read_bytes(p):
         return f.read()
 
 
-def render(template_dir, out_dir, version):
-    """渲染模板到 out_dir；返回 {文件名: bytes}。任何不合规抛 SystemExit 式的 RuntimeError。"""
+def fmt_bytes(n):
+    return "{:,}".format(n)
+
+
+def file_identity(p):
+    """返回 (字节数, sha256)；文件缺失即 T7 失败，不猜。"""
+    if not os.path.isfile(p):
+        raise RuntimeError("T7 INPUT_MISSING %s" % p)
+    data = read_bytes(p)
+    return len(data), sha256_bytes(data)
+
+
+def render(template_dir, out_dir, version, subs):
+    """渲染模板到 out_dir；返回 {文件名: bytes}。任何不合规抛 RuntimeError。"""
     os.makedirs(out_dir, exist_ok=True)
     rendered = {}
     for name in TEMPLATES:
@@ -81,10 +100,26 @@ def render(template_dir, out_dir, version):
                 "T1 TEMPLATE_HAS_LITERAL_VERSION %s: %s"
                 % (tpl_path, VER_RE.search(text).group(0))
             )
-        out = text.replace("@VERSION@", version).encode("utf-8")
-        if "@@" in out.decode("utf-8", "replace"):
+        if name == "README-Windows.md":
+            hit = SHA256_RE.search(text) or FIXED_BYTES_RE.search(text)
+            if hit:
+                raise RuntimeError(
+                    "T8 TEMPLATE_HAS_LITERAL_BYTES_OR_SHA %s: %s"
+                    % (tpl_path, hit.group(0))
+                )
+        for k, v in subs.items():
+            text = text.replace(k, v)
+        left = [k for k in PLACEHOLDERS if k in text]
+        if left:
+            raise RuntimeError("T2 PLACEHOLDER_LEFT %s: %s" % (name, ",".join(left)))
+        if "@@" in text:
             raise RuntimeError("T2 PLACEHOLDER_LEFT %s" % name)
-        hits = sorted(set(VER_RE.findall(out.decode("utf-8"))))
+        if name == "README-Windows.md":
+            for need in (subs["@BUNDLE_BYTES@"], subs["@BUNDLE_SHA256@"]):
+                if need not in text:
+                    raise RuntimeError("T7 BUNDLE_IDENTITY_NOT_IN_README %s" % need)
+        out = text.encode("utf-8")
+        hits = sorted(set(VER_RE.findall(text)))
         bad = [h for h in hits if h != version]
         if bad:
             raise RuntimeError("T3 STALE_VERSION %s: %s" % (name, ",".join(bad)))
@@ -154,6 +189,8 @@ def main():
     ap.add_argument("--legal-dir", default=None)
     ap.add_argument("--license-dir", default=None)
     ap.add_argument("--template-dir", default=None)
+    ap.add_argument("--bundle", default=None)
+    ap.add_argument("--tjs-win", default=None)
     ap.add_argument("--render-only", action="store_true")
     a = ap.parse_args()
 
@@ -165,9 +202,21 @@ def main():
     lic_dir = a.license_dir or legal_dir
     rel = a.release_dir
     assets_dir = os.path.join(rel, "assets")
+    bundle_path = a.bundle or os.path.join(bin_dir, "openlist-txiki.js")
+    tjs_win_path = a.tjs_win or os.path.join(bin_dir, "tjs-x86_64-windows.exe")
 
     try:
-        rendered = render(tpl_dir, assets_dir, a.version)
+        b_bytes, b_sha = file_identity(bundle_path)
+        t_bytes, _ = file_identity(tjs_win_path)
+        print("bundle_identity path=%s bytes=%d sha256=%s" % (bundle_path, b_bytes, b_sha))
+        print("tjs_win_identity path=%s bytes=%d" % (tjs_win_path, t_bytes))
+        subs = {
+            "@VERSION@": a.version,
+            "@BUNDLE_BYTES@": fmt_bytes(b_bytes),
+            "@BUNDLE_SHA256@": b_sha,
+            "@TJS_BYTES@": fmt_bytes(t_bytes),
+        }
+        rendered = render(tpl_dir, assets_dir, a.version, subs)
         print("render_ok templates=%d version=%s" % (len(rendered), a.version))
         for n in TEMPLATES:
             print("  %-18s %6d B  %s" % (n, len(rendered[n]), sha256_bytes(rendered[n])))

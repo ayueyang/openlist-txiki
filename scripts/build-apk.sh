@@ -35,6 +35,17 @@ case "$SHARED_TJS" in
 	*) echo "FAIL: SHARED_TJS 只接受 0 或 1（现为 $SHARED_TJS）" >&2; exit 1 ;;
 esac
 TJS_MIN_VERSION=${TJS_MIN_VERSION:-26.9.0}
+# A2：字节码独立二进制。默认 0（与 A2 之前逐字节同形）；1 时包内必须有
+# openlist-txiki-bin / launch-bytecode.sh / bytecode-identity.txt，固定文件清单随之增加。
+BYTECODE=${BYTECODE:-0}
+case "$BYTECODE" in
+	0|1) : ;;
+	*) echo "FAIL: BYTECODE 只接受 0 或 1（现为 $BYTECODE）" >&2; exit 1 ;;
+esac
+if [ "$SHARED_TJS" = 1 ] && [ "$BYTECODE" = 1 ]; then
+	echo "FAIL: SHARED_TJS=1 与 BYTECODE=1 不能同时成立（字节码包自带 tjs 作回退）" >&2
+	exit 1
+fi
 
 # r30 C6：设备精简 BusyBox 缺 comm/stat，早失败早说清楚（不做 BusyBox 兼容层）。
 command -v comm >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || {
@@ -76,8 +87,13 @@ fi
 # 旧版本号打新模板会被放过；现在版本串必须整串相等。
 # shared-tjs 变体：包内 SOURCE-OFFER 仍指向同一个源码归档（本包按 0.1.0-r33 源码重打），
 # 版本串必须由调用方显式给 OFFER_VERSION，脚本不猜；自带版 OFFER_VERSION 等于 VERSION。
-if [ "$SHARED_TJS" = 1 ]; then
-	OFFER_VERSION=${OFFER_VERSION:?shared 变体必须显式给 OFFER_VERSION（本包对应的源码归档版本，如 0.1.0-r33）}
+# A2 起：任何变体都允许显式给 OFFER_VERSION（源码归档版本与包版本解耦；A2 实验包
+# 的 bundle 与 r40 逐字节相同，源码归档只能指向真实的 0.1.0-r40 归档）。
+if [ -n "${OFFER_VERSION:-}" ]; then
+	: # 调用方显式给，下面照用
+elif [ "$SHARED_TJS" = 1 ]; then
+	echo "FAIL: shared 变体必须显式给 OFFER_VERSION（本包对应的源码归档版本，如 0.1.0-r33）" >&2
+	exit 1
 else
 	OFFER_VERSION=$VERSION
 fi
@@ -151,14 +167,26 @@ usr/share/openlist-txiki/openlist-txiki.env.default'
 if [ "$SHARED_TJS" = 1 ]; then
 	EXPECTED=$(printf '%s\n' "$EXPECTED" | grep -v '^usr/libexec/openlist-txiki/tjs$')
 fi
+if [ "$BYTECODE" = 1 ]; then
+	EXPECTED=$(printf '%s\n%s\n%s\n%s\n' "$EXPECTED" \
+		'usr/libexec/openlist-txiki/openlist-txiki-bin' \
+		'usr/libexec/openlist-txiki/launch-bytecode.sh' \
+		'usr/share/openlist-txiki/bytecode-identity.txt')
+fi
 DIST_PREFIX='usr/share/openlist-txiki/dist/'
+CHUNK_PREFIX='usr/libexec/openlist-txiki/chunks/'
+# r40 驱动拆分：包内 chunks/ 只允许 manifest 里登记的那些 .js；数量由 CHUNK_COUNT 传入。
+CHUNK_COUNT=${CHUNK_COUNT:-0}
+case "$CHUNK_COUNT" in
+	''|*[!0-9]*) echo "FAIL: CHUNK_COUNT 必须是非负整数（现为 $CHUNK_COUNT）" >&2; exit 1 ;;
+esac
 GOT=$(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort)
 # r30 C5：失败路径清理。中间任一步非零退出（如 comm 缺失 rc=127）都不留 /tmp 残留文件。
 trap 'rm -f /tmp/expected.$$ /tmp/got.$$' EXIT INT TERM HUP
 printf '%s\n' "$EXPECTED" | sort > /tmp/expected.$$
 printf '%s\n' "$GOT" > /tmp/got.$$
 missing=$(comm -23 /tmp/expected.$$ /tmp/got.$$)
-extra=$(comm -13 /tmp/expected.$$ /tmp/got.$$ | grep -v "^$DIST_PREFIX" || true)
+extra=$(comm -13 /tmp/expected.$$ /tmp/got.$$ | grep -v "^$DIST_PREFIX" | grep -v "^$CHUNK_PREFIX" || true)
 rm -f /tmp/expected.$$ /tmp/got.$$
 if [ -n "$missing" ] || [ -n "$extra" ]; then
 	echo "FAIL: staging 文件集不符（缺固定文件或出现 dist 外的额外文件）" >&2
@@ -173,6 +201,16 @@ if [ -z "$want_dist_files" ] || [ "$got_dist_files" != "$want_dist_files" ]; the
 	echo "FAIL: dist 文件数 $got_dist_files 与 manifest web_dist.file_count=${want_dist_files:-读不到} 不符" >&2
 	exit 1
 fi
+# r40：chunks 数量必须与传入的 CHUNK_COUNT 一致；目录里只允许 .js，且不能为空目录残留。
+got_chunks=$(cd "$STAGE" && find usr/libexec/openlist-txiki/chunks -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "$got_chunks" != "$CHUNK_COUNT" ]; then
+	echo "FAIL: chunks 文件数 $got_chunks 与 CHUNK_COUNT=$CHUNK_COUNT 不符" >&2
+	exit 1
+fi
+if [ "$CHUNK_COUNT" -gt 0 ]; then
+	bad_chunk=$(cd "$STAGE" && find usr/libexec/openlist-txiki/chunks -type f ! -name '*.js' | head -n 1)
+	[ -z "$bad_chunk" ] || { echo "FAIL: chunks 目录里有非 .js 文件：$bad_chunk" >&2; exit 1; }
+fi
 
 # 权限位逐项固定（owner 必须 root:root；staging 由 Windows 侧打包上传时会带上
 # MSYS 的 uid，mkpkg 会照抄成 nobody，所以这里强制归零，归零失败就中止）
@@ -185,6 +223,10 @@ else
 fi
 chmod 755 "$STAGE/etc/init.d/openlist-txiki"
 chmod 644 "$STAGE/usr/libexec/openlist-txiki/openlist-txiki.js"
+if [ "$BYTECODE" = 1 ]; then
+	chmod 755 "$STAGE/usr/libexec/openlist-txiki/openlist-txiki-bin"
+	chmod 755 "$STAGE/usr/libexec/openlist-txiki/launch-bytecode.sh"
+fi
 # 只对文件 chmod：r29 起 usr/share/openlist-txiki 下有 licenses/ 与 dist/ 两个子目录，
 # 对目录 chmod 644 会去掉执行位，包内目录就进不去。
 for f in "$STAGE"/usr/share/openlist-txiki/*; do [ -f "$f" ] && chmod 644 "$f"; done
@@ -193,6 +235,10 @@ if [ -d "$STAGE/usr/share/openlist-txiki/licenses" ]; then
 fi
 if [ -d "$STAGE/usr/share/openlist-txiki/dist" ]; then
 	find "$STAGE/usr/share/openlist-txiki/dist" -type f -exec chmod 644 {} \;
+fi
+# r40：拆分后的 chunk 是只读数据文件，权限固定 644。
+if [ -d "$STAGE/usr/libexec/openlist-txiki/chunks" ]; then
+	find "$STAGE/usr/libexec/openlist-txiki/chunks" -type f -exec chmod 644 {} \;
 fi
 # 目录权限固定 0755：Windows/MSYS 拷进来的目录常是 0777，mkpkg 会照抄进包
 # （本轮负向对照实测：0777 staging 用旧脚本打出来的包内目录就是 0777，见
@@ -254,11 +300,14 @@ STAGE_BYTES=$(find "$STAGE" -type f -exec stat -c %s {} + | awk '{s+=$1} END{pri
 echo "STAGE_BYTES=$STAGE_BYTES"
 # B2（r37）：curl 是 189 驱动 curl 传输的运行时依赖，必须在包元数据里声明。
 # 设备现查 apk info -e curl rc=0、/usr/bin/curl 属 curl-8.21.0-r1，依赖可满足。
-set -- -I "depends:curl"
-echo "DEPENDS=curl"
+# 2026-11-04：mkpkg 的 -I depends 重复给会覆盖（实测只留最后一条），两条依赖必须合成
+# 一个空格分隔的字符串一次给；否则 shared 变体丢 curl。
 if [ "$SHARED_TJS" = 1 ]; then
-	set -- "$@" -I "depends:txiki-js>=$TJS_MIN_VERSION"
+	set -- -I "depends:curl txiki-js>=$TJS_MIN_VERSION"
 	echo "DEPENDS=curl txiki-js>=$TJS_MIN_VERSION"
+else
+	set -- -I "depends:curl"
+	echo "DEPENDS=curl"
 fi
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \

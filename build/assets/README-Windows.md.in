@@ -5,8 +5,8 @@ OpenList 的 txiki.js 移植版，单文件运行时，不需要 Node.js，也�
 
 ## 文件
 
-    tjs.exe                 txiki.js 26.9 运行时（x86_64 Windows，5,303,808 B）
-    openlist-txiki.js       应用 bundle（2,034,857 B）
+    tjs.exe                 txiki.js 26.9 运行时（x86_64 Windows，@TJS_BYTES@ B）
+    openlist-txiki.js       应用 bundle（@BUNDLE_BYTES@ B）
     run.cmd                 启动脚本（默认数据目录、首次生成口令）
     SOURCE-OFFER            AGPL-3.0 源码要约（含源码归档下载地址）
     THIRD-PARTY-NOTICES     第三方组件与许可
@@ -59,7 +59,7 @@ WebDAV 挂在 `http://127.0.0.1:15244/dav/`（Basic 认证，用户名 `admin`�
     certutil -hashfile openlist-txiki.js SHA256
 
 与 `SHA256SUMS` 对照；`openlist-txiki.js` 应为
-`6c22e4f5a2250f901464f3b7a489f22efcb28000352728c5ca31bd02adec8f9f`。
+`@BUNDLE_SHA256@`。
 
 ## 许可
 

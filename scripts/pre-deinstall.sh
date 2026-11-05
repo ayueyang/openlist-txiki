@@ -18,16 +18,18 @@ PKG_DIR=/usr/libexec/openlist-txiki
 log() { logger -t openlist-txiki "$*" 2>/dev/null; }
 
 # 只列本包进程：
-# - 自带版：exe 指向 $PKG_DIR/tjs；
+# - 自带版（source 形态）：exe 指向 $PKG_DIR/tjs；
+# - 自带版（bytecode 形态，A2 起默认）：exe 指向 $PKG_DIR/openlist-txiki-bin，进程名不是 tjs，
+#   要单独 pidof，否则停机等待会把它当「已退出」；
 # - shared-tjs 变体：exe 是共用的 /usr/bin/tjs，按 cmdline 里是否带本包 bundle 区分，
 #   不能只看 exe（alist-encrypt 也用 /usr/bin/tjs）。
 ours() {
 	local p exe
-	for p in $(pidof tjs 2>/dev/null); do
+	for p in $(pidof openlist-txiki-bin 2>/dev/null) $(pidof tjs 2>/dev/null); do
 		exe=$(readlink "/proc/$p/exe" 2>/dev/null)
-		if [ "$exe" = "$PKG_DIR/tjs" ]; then
+		if [ "$exe" = "$PKG_DIR/tjs" ] || [ "$exe" = "$PKG_DIR/openlist-txiki-bin" ]; then
 			printf '%s ' "$p"
-		elif [ "$exe" = /usr/bin/tjs ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "$PKG_DIR/openlist-txiki.js"; then
+		elif [ "$exe" = /usr/bin/tjs ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "$PKG_DIR/openlist-txiki"; then
 			printf '%s ' "$p"
 		fi
 	done

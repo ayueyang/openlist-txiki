@@ -1,7 +1,11 @@
 #!/bin/sh /etc/rc.common
 # openlist-txiki：OpenList Worker (txiki.js) 的 procd 服务。
 # 与 Go openlist(5244)、alist-encrypt(5344) 并列的独立服务，默认监听 5345。
-# 启动前用 build-manifest.json 校验包内 bundle 与 tjs 的 sha256，不符拒绝启动。
+# 启动前用 build-manifest.json 校验包内运行时的 sha256，不符拒绝启动。
+#
+# 运行时形态（A2 起）：TJS_MODE=bytecode（默认）用包内独立二进制 openlist-txiki-bin，
+# 启动前做五步字节码身份校验；TJS_MODE=source 是回退开关，用包内 tjs 直接跑 .js，
+# 校验与启动命令与 r39 相同。两个形态的包内容都在，切换只改 $ENV_FILE 里的 TJS_MODE。
 
 USE_PROCD=1
 START=99
@@ -17,6 +21,12 @@ TMP_DIR=/tmp/openlist-txiki
 # TJS_BIN 允许调用环境覆盖，仅用于测试；正常安装不需要设。
 TJS_BIN=${TJS_BIN:-$PKG_DIR/tjs}
 BUNDLED_TJS=${BUNDLED_TJS:-1}
+# 运行时形态（A2）：bytecode=包内独立二进制 openlist-txiki-bin（默认）；
+# source=包内 tjs 直接跑 openlist-txiki.js（回退开关，启动行为与 r39 相同）。
+# 只接受这两个值，其它值拒绝启动。可在 $ENV_FILE 里写 TJS_MODE=source 切回源码形态。
+TJS_MODE=${TJS_MODE:-bytecode}
+BIN=$PKG_DIR/openlist-txiki-bin
+BYTECODE_RUNNER=$PKG_DIR/launch-bytecode.sh
 
 log() { logger -t openlist-txiki "$*"; }
 
@@ -42,6 +52,11 @@ version_ge() {
 # 从 build-manifest.json 取一个 64 位 sha 字段，不引 jq
 manifest_sha() {
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1
+}
+
+# 从 build-manifest.json 取一个非负整数字段（A2 的 exe / bytecode 字段）
+manifest_num() {
+	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$MANIFEST" | head -n 1
 }
 
 # 端口是否已在监听（/proc/net/tcp{,6} 状态 0A）
@@ -105,6 +120,125 @@ pick_probe_port() {
 	return 1
 }
 
+# source 形态的启动前校验：与 r39 相同（bundle sha256 + 包内 tjs sha256），
+# 通过后由 "$TJS_BIN" run "$PKG_DIR/openlist-txiki.js" 启动。
+check_source() {
+	[ -x "$TJS_BIN" ] || { log "missing $TJS_BIN"; return 1; }
+	[ -f "$PKG_DIR/openlist-txiki.js" ] || { log "missing $PKG_DIR/openlist-txiki.js"; return 1; }
+
+	want_bundle=$(manifest_sha bundle_sha256)
+	if [ -z "$want_bundle" ]; then
+		log "build-manifest.json 缺少 bundle_sha256，拒绝启动"
+		return 1
+	fi
+	got_bundle=$(sha256sum "$PKG_DIR/openlist-txiki.js" | cut -d' ' -f1)
+	if [ "$got_bundle" != "$want_bundle" ]; then
+		log "bundle sha256 不符：包内 $got_bundle 期望 $want_bundle，拒绝启动"
+		return 1
+	fi
+	if [ "$BUNDLED_TJS" = 1 ]; then
+		want_tjs=$(manifest_sha tjs_sha256)
+		if [ -z "$want_tjs" ]; then
+			log "build-manifest.json 缺少 tjs_sha256，拒绝启动"
+			return 1
+		fi
+		got_tjs=$(sha256sum "$TJS_BIN" | cut -d' ' -f1)
+		if [ "$got_tjs" != "$want_tjs" ]; then
+			log "tjs sha256 不符：包内 $got_tjs 期望 $want_tjs，拒绝启动"
+			return 1
+		fi
+	else
+		# shared-tjs 变体：运行时不随包，按 manifest 记录的最低版本做启动前闸。
+		tjs_min=$(manifest_str tjs_min_version)
+		tjs_min=${tjs_min:-26.9.0}
+		tjs_ver=$("$TJS_BIN" --version 2>/dev/null | head -n 1)
+		if ! version_ge "$tjs_ver" "$tjs_min"; then
+			log "系统 tjs 版本 ${tjs_ver:-读不到} 低于要求 $tjs_min（$TJS_BIN），拒绝启动；请升级 txiki-js 包"
+			return 1
+		fi
+		log "runtime: shared $TJS_BIN version=$tjs_ver (min $tjs_min)"
+	fi
+	return 0
+}
+
+# r40：驱动拆分形态的 chunk 清单核对。
+# manifest 有 chunk_count 字段时（>=1），包内 $PKG_DIR/chunks 的文件数必须相等，
+# 否则驱动按需加载会出现 could not load；缺字段（r39 及更早）直接放行。
+check_chunks() {
+	want=$(manifest_num chunk_count)
+	case "$want" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	[ "$want" -ge 1 ] || return 0
+	got=$(ls -1 "$PKG_DIR/chunks"/*.js 2>/dev/null | wc -l | tr -d ' ')
+	if [ "$got" != "$want" ]; then
+		log "chunk 校验失败：包内 $got 个文件，manifest chunk_count=$want，拒绝启动"
+		return 1
+	fi
+	log "chunk ok: $want 个（拆分驱动按需加载）"
+	return 0
+}
+
+# bytecode 形态的五步校验（A2 替代门 1-3 + 首字节）。任一步不过返回 1，由调用方拒绝启动。
+# 设备没有 od（实测 busybox applet 未编入），尾标用 hexdump 读：'1/4 "%u"' 按主机字节序解释 4 字节。
+check_bytecode() {
+	[ -x "$BIN" ] || { log "missing $BIN"; return 1; }
+	[ -x "$BYTECODE_RUNNER" ] || { log "missing $BYTECODE_RUNNER"; return 1; }
+	# 回退开关要求 .js 与包内 tjs 一直随包，不能只在 source 形态才存在。
+	[ -f "$PKG_DIR/openlist-txiki.js" ] || { log "missing $PKG_DIR/openlist-txiki.js（source 回退需要）"; return 1; }
+	[ -x "$TJS_BIN" ] || { log "missing $TJS_BIN（source 回退需要）"; return 1; }
+
+	want_exe=$(manifest_sha exe_sha256)
+	exe_bytes=$(manifest_num exe_bytes)
+	bc_off=$(manifest_num bytecode_offset)
+	bc_bytes=$(manifest_num bytecode_bytes)
+	bc_ver=$(manifest_num tjs_bc_version)
+	if [ -z "$want_exe" ] || [ -z "$exe_bytes" ] || [ -z "$bc_off" ] || [ -z "$bc_bytes" ] || [ -z "$bc_ver" ]; then
+		log "build-manifest.json 缺 bytecode 字段（exe_sha256/exe_bytes/bytecode_offset/bytecode_bytes/tjs_bc_version），拒绝启动"
+		return 1
+	fi
+
+	got_exe=$(sha256sum "$BIN" | cut -d' ' -f1)
+	if [ "$got_exe" != "$want_exe" ]; then
+		log "bytecode ① 失败：exe sha256 包内 $got_exe 期望 $want_exe，拒绝启动"
+		return 1
+	fi
+
+	trailer_magic=$(tail -c 12 "$BIN" | head -c 8)
+	if [ "$trailer_magic" != "tx1k1.js" ]; then
+		log "bytecode ② 失败：尾 12 B 的 magic=[$trailer_magic] 期望 tx1k1.js，拒绝启动"
+		return 1
+	fi
+
+	got_bytes=$(wc -c < "$BIN" | tr -d ' ')
+	if [ "$got_bytes" != "$exe_bytes" ]; then
+		log "bytecode ③ 失败：产物字节 $got_bytes 期望 $exe_bytes，拒绝启动"
+		return 1
+	fi
+	if [ $((bc_off + bc_bytes + 12)) -ne "$exe_bytes" ]; then
+		log "bytecode ③ 失败：manifest 不自洽 offset($bc_off)+bytes($bc_bytes)+12 != exe_bytes($exe_bytes)，拒绝启动"
+		return 1
+	fi
+	got_off=$(tail -c 4 "$BIN" | hexdump -v -e '1/4 "%u"')
+	if [ "$got_off" != "$bc_off" ]; then
+		log "bytecode ③ 失败：尾标偏移 $got_off 期望 $bc_off，拒绝启动"
+		return 1
+	fi
+
+	got_bcver_hex=$(tail -c $((exe_bytes - bc_off)) "$BIN" | head -c 1 | hexdump -v -e '/1 "%02x"')
+	case "$got_bcver_hex" in
+		''|*[!0-9a-f]*) log "bytecode ④ 失败：读不出字节码首字节（hex=[$got_bcver_hex]），拒绝启动"; return 1 ;;
+	esac
+	got_bcver=$((0x$got_bcver_hex))
+	if [ "$got_bcver" != "$bc_ver" ]; then
+		log "bytecode ④ 失败：字节码首字节 $got_bcver 期望 $bc_ver，拒绝启动"
+		return 1
+	fi
+
+	log "bytecode identity ok: exe=$want_exe bytes=$exe_bytes offset=$bc_off bc_bytes=$bc_bytes bc_version=$bc_ver"
+	return 0
+}
+
 # 启动前自检：用同一个数据目录起一个只绑 127.0.0.1 的临时实例，问 init_status。
 # 只有看到 "initialized":true 才算证明 admin 存在；临时进程无论如何都会杀掉。
 # 设备 busybox 的 sleep 不支持小数，轮询按 1 秒一次、最多 20 次（约 20 秒）。
@@ -116,10 +250,17 @@ probe_admin_ready() {
 	mkdir -p "$TMP_DIR" || return 1
 	chmod 700 "$TMP_DIR"
 	rm -f "$TMP_DIR/probe.log"
-	TJS_HOST=127.0.0.1 TJS_PORT=$probe_port TJS_DATA_DIR="$DATA_DIR" \
-		TJS_JWT_SECRET="$JWT_SECRET" TJS_ADMIN_PASS="${TJS_ADMIN_PASS:-}" \
-		OPENLIST_TXIKI_READONLY=1 TMPDIR="$TMP_DIR" \
-		"$TJS_BIN" run "$PKG_DIR/openlist-txiki.js" >>"$TMP_DIR/probe.log" 2>&1 &
+	if [ "$TJS_MODE" = "bytecode" ]; then
+		TJS_HOST=127.0.0.1 TJS_PORT=$probe_port TJS_DATA_DIR="$DATA_DIR" \
+			TJS_JWT_SECRET="$JWT_SECRET" TJS_ADMIN_PASS="${TJS_ADMIN_PASS:-}" \
+			OPENLIST_TXIKI_READONLY=1 TMPDIR="$TMP_DIR" \
+			"$BYTECODE_RUNNER" >>"$TMP_DIR/probe.log" 2>&1 &
+	else
+		TJS_HOST=127.0.0.1 TJS_PORT=$probe_port TJS_DATA_DIR="$DATA_DIR" \
+			TJS_JWT_SECRET="$JWT_SECRET" TJS_ADMIN_PASS="${TJS_ADMIN_PASS:-}" \
+			OPENLIST_TXIKI_READONLY=1 TMPDIR="$TMP_DIR" \
+			"$TJS_BIN" run "$PKG_DIR/openlist-txiki.js" >>"$TMP_DIR/probe.log" 2>&1 &
+	fi
 	probe_pid=$!
 	probe_ok=1
 	probe_i=0
@@ -163,45 +304,25 @@ db_looks_initialized() {
 }
 
 start_service() {
-	[ -x "$TJS_BIN" ] || { log "missing $TJS_BIN"; exit 1; }
-	[ -f "$PKG_DIR/openlist-txiki.js" ] || { log "missing $PKG_DIR/openlist-txiki.js"; exit 1; }
 	[ -f "$MANIFEST" ] || { log "missing $MANIFEST"; exit 1; }
 	[ -f "$ENV_FILE" ] || { log "missing $ENV_FILE (post-install should create it)"; exit 1; }
 
-	want_bundle=$(manifest_sha bundle_sha256)
-	if [ -z "$want_bundle" ]; then
-		log "build-manifest.json 缺少 bundle_sha256，拒绝启动"
-		exit 1
-	fi
-	got_bundle=$(sha256sum "$PKG_DIR/openlist-txiki.js" | cut -d' ' -f1)
-	if [ "$got_bundle" != "$want_bundle" ]; then
-		log "bundle sha256 不符：包内 $got_bundle 期望 $want_bundle，拒绝启动"
-		exit 1
-	fi
-	if [ "$BUNDLED_TJS" = 1 ]; then
-		want_tjs=$(manifest_sha tjs_sha256)
-		if [ -z "$want_tjs" ]; then
-			log "build-manifest.json 缺少 tjs_sha256，拒绝启动"
-			exit 1
-		fi
-		got_tjs=$(sha256sum "$TJS_BIN" | cut -d' ' -f1)
-		if [ "$got_tjs" != "$want_tjs" ]; then
-			log "tjs sha256 不符：包内 $got_tjs 期望 $want_tjs，拒绝启动"
-			exit 1
-		fi
-	else
-		# shared-tjs 变体：运行时不随包，按 manifest 记录的最低版本做启动前闸。
-		tjs_min=$(manifest_str tjs_min_version)
-		tjs_min=${tjs_min:-26.9.0}
-		tjs_ver=$("$TJS_BIN" --version 2>/dev/null | head -n 1)
-		if ! version_ge "$tjs_ver" "$tjs_min"; then
-			log "系统 tjs 版本 ${tjs_ver:-读不到} 低于要求 $tjs_min（$TJS_BIN），拒绝启动；请升级 txiki-js 包"
-			exit 1
-		fi
-		log "runtime: shared $TJS_BIN version=$tjs_ver (min $tjs_min)"
-	fi
-
+	# 先读 env 再判形态：TJS_MODE 允许在 $ENV_FILE 里改（默认 bytecode）。
 	. "$ENV_FILE"
+	check_chunks || exit 1
+	case "$TJS_MODE" in
+		bytecode)
+			check_bytecode || exit 1
+			;;
+		source)
+			check_source || exit 1
+			;;
+		*)
+			log "TJS_MODE=$TJS_MODE 非法（只接受 bytecode|source），拒绝启动"
+			exit 1
+			;;
+	esac
+
 	: "${LISTEN_ADDR:=127.0.0.1}"
 	: "${LISTEN_PORT:=5345}"
 	: "${READONLY:=1}"
@@ -250,7 +371,12 @@ start_service() {
 	chmod 700 "$TMP_DIR"
 
 	procd_open_instance openlist-txiki
-	procd_set_param command "$TJS_BIN" run "$PKG_DIR/openlist-txiki.js"
+	if [ "$TJS_MODE" = "bytecode" ]; then
+		# procd 没有工作目录参数，启动器负责 cd 到包目录后 exec 独立二进制（不带参数）。
+		procd_set_param command "$BYTECODE_RUNNER"
+	else
+		procd_set_param command "$TJS_BIN" run "$PKG_DIR/openlist-txiki.js"
+	fi
 	# 固定转发 7 个键（第 7 个是 TJS_ADMIN_PASS：空值也传，应用侧读空等于没设，行为可预期）；
 	# 后面 7 个可选键只在用户于 env 文件里显式设置时才传，
 	# 不设就不传，应用侧走自己的默认值（upload-limit.ts 的 25MB/16MB）。
@@ -276,7 +402,7 @@ start_service() {
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
-	log "started: listen=$LISTEN_ADDR:$LISTEN_PORT data=$DATA_DIR readonly=$READONLY"
+	log "started: mode=$TJS_MODE listen=$LISTEN_ADDR:$LISTEN_PORT data=$DATA_DIR readonly=$READONLY"
 }
 
 stop_service() {
