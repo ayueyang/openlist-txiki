@@ -198,7 +198,7 @@ function normalizeEol(text, eol) {
  * 源码指纹预检 v2（fail-closed，2026-10-22 P3-1b 补齐三个缺口）。
  *
  * 输入 work/p2-source-manifest.txt（manifest_version 3）：
- *   - 42 个补丁的 sha256 与应用顺序（patch <序号>）；
+ *   - 43 个补丁的 sha256 与应用顺序（patch <序号>）；
  *   - 28 条源码指纹，每条带 src=（upstream/repo/patch/显式路径）、strip_header=、eol=；
  *   - rename-fail-entry.ts 的来源固定为 work/fault/rename-fail-entry.ts。
  *
@@ -276,7 +276,7 @@ function verifySourceManifest() {
   if (!entries.files.length) problems.push("清单缺少 file 条目")
   if (entries.patchCount !== entries.patches.length) problems.push("patch_count " + entries.patchCount + " 与实际 patch 条目 " + entries.patches.length + " 不符")
   if (entries.fileCount !== entries.files.length) problems.push("file_count " + entries.fileCount + " 与实际 file 条目 " + entries.files.length + " 不符")
-  if (entries.patches.length !== 42) problems.push("补丁栈应为 42 个，实际 " + entries.patches.length + " 个")
+  if (entries.patches.length !== 43) problems.push("补丁栈应为 43 个，实际 " + entries.patches.length + " 个")
   entries.patches.forEach((p, idx) => {
     const want = String(idx + 1).padStart(2, "0")
     if (p.seq !== want) problems.push("补丁顺序断档：第 " + (idx + 1) + " 条序号 " + p.seq + "，期望 " + want)
@@ -329,7 +329,7 @@ function verifySourceManifest() {
     const abs = path.join(root, e.rel)
     if (e.src === "patch") {
       if (!fs.existsSync(abs)) {
-        problems.push(e.rel + ": 补丁产物缺失（42 个补丁是否按清单顺序 apply 过？）")
+        problems.push(e.rel + ": 补丁产物缺失（43 个补丁是否按清单顺序 apply 过？）")
         continue
       }
       const before = fs.readFileSync(abs)
@@ -406,7 +406,7 @@ function verifySourceManifest() {
       entries.commit.slice(0, 8) +
       "，补丁 " +
       entries.patches.length +
-      "/42（01..42 顺序与 sha 一致），指纹 " +
+      "/43（01..43 顺序与 sha 一致），指纹 " +
       info.fingerprint_entries +
       " 条（file " +
       info.fingerprint_files +
@@ -430,6 +430,41 @@ function verifySourceManifest() {
 }
 
 const sourceFingerprint = verifySourceManifest()
+
+/**
+ * 189 传输栈在位断言（2026-11-05 relogin-r2）。
+ *
+ * 补丁 37/38 只在清单里、没真正 apply 时，r39..r41 的发布 bundle 就是这样静默
+ * 出包的（grep 不到 httpRequest / headersOnly）。指纹预检只校验补丁文件的 sha256，
+ * 不校验补丁是否落地，所以这里补一条最小在位检查：三个标记缺一即非零退出。
+ */
+function assert189TransportInPlace() {
+  const dir = path.join(root, "src/backend/drivers/189")
+  const curlHttp = path.join(dir, "curl-http.ts")
+  const utilTs = path.join(dir, "util.ts")
+  const problems = []
+  if (!fs.existsSync(curlHttp)) {
+    problems.push("缺少 src/backend/drivers/189/curl-http.ts（补丁 37 未落地）")
+  }
+  if (!fs.existsSync(utilTs)) {
+    problems.push("缺少 src/backend/drivers/189/util.ts")
+  }
+  const utilText = fs.existsSync(utilTs) ? fs.readFileSync(utilTs, "utf8") : ""
+  if (!utilText.includes("httpRequest")) {
+    problems.push("util.ts 不含 httpRequest（补丁 37 未落地）")
+  }
+  const curlText = fs.existsSync(curlHttp) ? fs.readFileSync(curlHttp, "utf8") : ""
+  if (!curlText.includes("headersOnly")) {
+    problems.push("curl-http.ts 不含 headersOnly（补丁 38 未落地）")
+  }
+  if (problems.length) {
+    console.error("FAIL: 189 传输栈在位断言不通过（" + problems.length + " 项）— 构建中止")
+    for (const p of problems) console.error("  - " + p)
+    process.exit(1)
+  }
+  console.error("189 传输栈在位断言通过：curl-http.ts 存在，util.ts 含 httpRequest，curl-http.ts 含 headersOnly")
+}
+assert189TransportInPlace()
 
 if (process.env.TXIKI_PRECHECK_ONLY) {
   console.error("TXIKI_PRECHECK_ONLY=1：预检通过，跳过 esbuild")

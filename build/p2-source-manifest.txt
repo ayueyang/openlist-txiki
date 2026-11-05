@@ -147,10 +147,15 @@
 #   2026-11-05 P6-2e：新增 42（internal/op/share.ts 单根分支：单目录分享允许按子路径下钻，
 #   canonicalize(root + rest) 后仍过 withinShare，越界与编码残留仍 403；单文件分享根路径与多文件语义不变）。
 #   patch_count 41->42，file_count 40 不变（share.ts 与 share_path.test.ts 未登记 file 条目，靠补丁 sha 校验）。
+#   2026-11-05 relogin-r2：第 43 条重做（补丁 43 原版把补丁 36 的 curl-fallback import 当成新增，
+#   基线取 upstream util.ts，只能在 pristine 上打、在 01..42 树上失败）。新版按 01..42 树为基线
+#   （util.ts index 8dd276a），含 N1/N2 + U1/U2/U3/U7/U8 与 architect 10:37 勘误 D-1..D-4；
+#   patch_count 43、file_count 40 不变。37/38 保留并在 01..42 树上落地，构建期新增在位断言：
+#   189 三个标记（curl-http.ts 存在、util.ts 含 httpRequest、curl-http.ts 含 headersOnly）缺一即非零退出。
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 42
+patch_count 43
 file_count 40
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -193,7 +198,16 @@ patch 38 d8d322310cf12fdd8dffee073198bfe1d0c2249081f24444b06ce0b809310410 work/p
 patch 39 ad87eda9b77641ff46b1a037c8ef13e39ce276dd94b5fd11ca08dbcb4a40c3f6 work/p2-39-pathdecode.patch
 patch 40 15609264ec60c266d207d8d15d199e1409b84169beffd6350095204687396d08 work/p2-40-ali-open-refresh.patch
 patch 41 e5540348718ae7256f31c79b6373b2b1272b8eba7699f16389206ca64719bfd2 work/p2-41-115cookie.patch
+#
+# 第 43 条（2026-11-05，189 自动重登）：新增 drivers/189/relogin.ts（isSessionInvalidResponse +
+#   ReloginGuard：60 s 最小间隔、60/300/900/1800 s 退避、连败 4 次熔断 30 min、进程级同账号每小时 6 次、
+#   单飞）与 relogin.test.ts；util.ts 接重登（force 清 Cookie、判定改用 isSessionInvalidResponse、
+#   重登前查账号密码、限流/失败错误码）、driver.ts init 加 189_LOGIN_FAILED: 前缀。
+#   登录三步 POST 的传输未改（仍为 fetch，U4-U6 冻结）。
+#   patch_count 42->43，file_count 40 不变（189 目录不登记 file 条目，靠补丁 sha 校验）。
+#   基线说明：本条 diff 取自 r41 构建树实际状态（patch 37/38 在该树未落地），见 progress.md 同日段。
 patch 42 661eaf248c2e8fa6b697b36c0ca718cefa811e8c675d97ac30b6eaa868d5333a work/p2-42-share-single-dir.patch
+patch 43 25ba02115608684350bcf7ae98682bf2945b095a6b6d14a10bd37024beb2fd40 work/p2-43-189-relogin.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf

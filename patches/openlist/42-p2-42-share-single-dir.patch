@@ -1,0 +1,79 @@
+diff --git a/src/backend/internal/op/share.ts b/src/backend/internal/op/share.ts
+index 698fa92..7f9ef46 100644
+--- a/src/backend/internal/op/share.ts
++++ b/src/backend/internal/op/share.ts
+@@ -198,11 +198,20 @@ export async function resolveShare(
+   const withinShare = (p: string) =>
+     roots.some((a) => a === "/" || p === a || p.startsWith(a + "/"))
+ 
+-  // Single-file share: one file has no sub-paths, so trailing segments are
+-  // always suspicious — reject instead of concatenating them.
++  // P6-2e：单根分享可能是目录分享。根为目录时允许按子路径下钻，
++  // 拼接后仍过 withinShare（越界拒绝）；根为文件时子路径会落到不存在的
++  // 路径，由存储层给出 not found，不再在这一层一律判 400。
+   if (share.files.length === 1) {
+-    if (rest.length > 0) return { ok: false, error: "path not found in share" }
+-    return { ok: true, share, files: roots, realPath: roots[0] }
++    if (rest.length === 0)
++      return { ok: true, share, files: roots, realPath: roots[0] }
++    const root = roots[0]
++    const joined = canonicalizePath(
++      `${root === "/" ? "" : root}/${rest.join("/")}`,
++    )
++    if (!joined.ok) return { ok: false, error: "relative path", status: 403 }
++    if (!withinShare(joined.path))
++      return { ok: false, error: "path not found in share" }
++    return { ok: true, share, files: roots, realPath: joined.path }
+   }
+ 
+   // Multi-file share, sub-path: match by basename
+diff --git a/src/backend/internal/op/share_path.test.ts b/src/backend/internal/op/share_path.test.ts
+index bdeee11..6afccb8 100644
+--- a/src/backend/internal/op/share_path.test.ts
++++ b/src/backend/internal/op/share_path.test.ts
+@@ -147,3 +147,18 @@ test("P1-20 access: 密码错仍回 wrong password（顺序不变）", async ()
+   assert.equal(r.ok, false)
+   assert.equal(r.error, "wrong password")
+ })
++
++test("P6-2e access: 单目录分享子路径落到规范串，越界与编码残留仍 403", async () => {
++  await seed([share({ files: ["/t/pub"] })])
++  const root = await resolveShare("/@s/abc", "", env)
++  assert.equal(root.ok, true)
++  assert.equal(root.realPath, "/t/pub")
++  const sub = await resolveShare("/@s/abc/sub/inside.txt", "", env)
++  assert.equal(sub.ok, true)
++  assert.equal(sub.realPath, "/t/pub/sub/inside.txt")
++  for (const bad of ["/@s/abc/../../etc/passwd", "/@s/abc/%2e%2e/x"]) {
++    const rr = await resolveShare(bad, "", env)
++    assert.equal(rr.ok, false, bad)
++    assert.equal(rr.status, 403, bad)
++  }
++})
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index fabac1e..a9ac75b 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -657,10 +657,18 @@ fsRouter.post("/get", async (c) => {
+ 
+       // Mapped to a real path — get with share-aware raw_url (/sd/{shareId}...)
+       const shareId = reqPath.split("/").filter(Boolean)[1] || ""
+-      const { item, provider } = await getItem(
+-        shareRes.realPath!,
+-        requestContext,
+-      )
++      // P6-2e：分享映射出的路径不存在时按 404 收口。单根目录分享的子路径
++      // 允许任意名字，驱动对不存在的名字抛 ENOENT，不能漏成 500。
++      let got: any
++      try {
++        got = await getItem(shareRes.realPath!, requestContext)
++      } catch {
++        return c.json(
++          { code: 404, message: "path not found in share", data: null },
++          404,
++        )
++      }
++      const { item, provider } = got
+       const subPath = reqPath.replace(/^\/@s\/[^/]+/, "")
+       return c.json({
+         code: 200,

@@ -1,0 +1,1070 @@
+diff --git a/src/backend/drivers/189/driver.ts b/src/backend/drivers/189/driver.ts
+index 49a2c37..776ef02 100644
+--- a/src/backend/drivers/189/driver.ts
++++ b/src/backend/drivers/189/driver.ts
+@@ -112,7 +112,17 @@ export class Cloud189Driver implements StorageDriver {
+   }
+ 
+   async init(): Promise<void> {
+-    await this.client.login()
++    try {
++      await this.client.login()
++    } catch (error: any) {
++      // 稳定前缀：存储状态列与判据按这一行匹配；控制流不变，仍然抛出。
++      const wrapped = new Error(
++        `189_LOGIN_FAILED: ${error?.message || String(error)}`,
++      ) as Error & { code?: string; cause?: unknown }
++      wrapped.code = error?.code
++      wrapped.cause = error
++      throw wrapped
++    }
+   }
+ 
+   /**
+diff --git a/src/backend/drivers/189/relogin.test.ts b/src/backend/drivers/189/relogin.test.ts
+new file mode 100644
+index 0000000..d04c6ec
+--- /dev/null
++++ b/src/backend/drivers/189/relogin.test.ts
+@@ -0,0 +1,215 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import {
++  RELOGIN_ERRORS,
++  ReloginGuard,
++  classifySessionInvalidResponse,
++  isSessionInvalidResponse,
++  shortHash,
++} from "./relogin"
++
++test("B1 errorCode=InvalidSessionKey is a session failure", () => {
++  assert.equal(isSessionInvalidResponse({ errorCode: "InvalidSessionKey" }), true)
++})
++
++test("B2 res_code=InvalidSessionKey is a session failure", () => {
++  assert.equal(isSessionInvalidResponse({ res_code: "InvalidSessionKey" }), true)
++})
++
++test("B3 res_code=1010 is a session failure", () => {
++  assert.equal(isSessionInvalidResponse({ res_code: 1010 }), true)
++  assert.equal(isSessionInvalidResponse({ res_code: "1010" }), true)
++})
++
++test("B4 check ip error text is a session failure", () => {
++  assert.equal(
++    isSessionInvalidResponse({
++      res_code: 0,
++      res_message:
++        "check ip error - curIp=1.1.1.1, cookiesIp=2.2.2.2",
++    }),
++    true,
++  )
++  // B18：无 errorCode、res_code=0 时才走文案兜底，reason 必须标出来。
++  assert.deepEqual(
++    classifySessionInvalidResponse({
++      res_code: 0,
++      res_message: "check ip error - curIp=1.1.1.1, cookiesIp=2.2.2.2",
++    }),
++    { invalid: true, reason: "msg_fallback" },
++  )
++  assert.equal(
++    isSessionInvalidResponse({
++      errorCode: "InvalidSessionKey",
++      errorMsg: "check ip error - curIp=1.1.1.1, cookiesIp=2.2.2.2",
++    }),
++    true,
++  )
++})
++
++test("B5 InvalidSessionKey plus check ip error stays a session failure", () => {
++  assert.equal(
++    isSessionInvalidResponse({
++      errorCode: "InvalidSessionKey",
++      errorMsg: "check ip error",
++    }),
++    true,
++  )
++})
++
++test("B6 a normal empty listing is not a session failure", () => {
++  assert.equal(
++    isSessionInvalidResponse({ res_code: 0, fileListAO: { count: 0 } }),
++    false,
++  )
++})
++
++test("B7 an ordinary API error is not a session failure", () => {
++  assert.equal(
++    isSessionInvalidResponse({ res_code: 400, res_message: "参数错误" }),
++    false,
++  )
++  // B17：res_code=400 + check ip error 文案不触发重登（明确不覆盖的一角）。
++  assert.equal(
++    isSessionInvalidResponse({
++      res_code: 400,
++      res_message: "check ip error - curIp=1.1.1.1, cookiesIp=2.2.2.2",
++    }),
++    false,
++  )
++})
++
++test("B8 empty or null payload does not throw", () => {
++  assert.equal(isSessionInvalidResponse({}), false)
++  assert.equal(isSessionInvalidResponse(null), false)
++  assert.equal(isSessionInvalidResponse(undefined), false)
++  assert.equal(isSessionInvalidResponse("check ip error"), false)
++})
++
++test("B9 first attempt is allowed", () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  assert.equal(guard.canAttempt(1_000_000).ok, true)
++})
++
++test("B10 success enforces the 60 s minimum interval", () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  guard.recordSuccess(1_000_000)
++  const decision = guard.canAttempt(1_001_000)
++  assert.equal(decision.ok, false)
++  assert.equal(decision.reason, "min_interval")
++  assert.ok(Math.abs((decision.retryAfterMs || 0) - 59_000) <= 1)
++})
++
++test("B11 failures back off 60/300/900 s, the fourth one trips the breaker", () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  const start = 1_000_000
++
++  const expected = [60_000, 300_000, 900_000]
++  for (let i = 0; i < expected.length; i++) {
++    guard.recordFailure("login", start + i * 1_000_000)
++    const decision = guard.canAttempt(start + i * 1_000_000 + 1_000)
++    assert.equal(decision.ok, false)
++    assert.equal(decision.reason, "backoff")
++    assert.ok(Math.abs((decision.retryAfterMs || 0) - (expected[i] - 1_000)) <= 1)
++  }
++
++  const fourthAt = start + 3 * 1_000_000
++  guard.recordFailure("login", fourthAt)
++  const breaker = guard.canAttempt(fourthAt + 1_000)
++  assert.equal(breaker.ok, false)
++  assert.equal(breaker.reason, "circuit")
++  assert.ok(Math.abs((breaker.retryAfterMs || 0) - (1_800_000 - 1_000)) <= 1)
++
++  // B19：resend 相（登录成功但会话不可用）单独计数，3 次后暂停 30 min，
++  // 不走进登录熔断；文案走 session_pause 分支。
++  const sessionGuard = new ReloginGuard()
++  const t0 = 2_000_000
++  for (let i = 0; i < 2; i++) sessionGuard.recordFailure("resend", t0 + i * 61_000)
++  assert.equal(sessionGuard.canAttempt(t0 + 122_000).ok, true)
++  sessionGuard.recordFailure("resend", t0 + 122_000)
++  const paused = sessionGuard.canAttempt(t0 + 123_000)
++  assert.equal(paused.ok, false)
++  assert.equal(paused.reason, "session_pause")
++  assert.ok(Math.abs((paused.retryAfterMs || 0) - (1_800_000 - 1_000)) <= 1)
++})
++
++test("B12 the breaker clears after 30 minutes", () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  const start = 5_000_000
++  for (let i = 0; i < 4; i++) guard.recordFailure("login", start)
++  assert.equal(guard.getFailureCount(), 4)
++  assert.equal(guard.canAttempt(start + 1_800_000 + 1).ok, true)
++  assert.equal(guard.getFailureCount(), 0)
++})
++
++test("B13 five concurrent runs share one login", async () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  let calls = 0
++  const run = () =>
++    guard.run(async () => {
++      calls += 1
++      await new Promise((resolve) => setTimeout(resolve, 10))
++      return calls
++    })
++  const results = await Promise.all([run(), run(), run(), run(), run()])
++  assert.equal(calls, 1)
++  assert.deepEqual(results, [1, 1, 1, 1, 1])
++})
++
++test("B13b a throttled run rejects with 189_RELOGIN_THROTTLED and retryAfterMs", async () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  await guard.run(async () => undefined, 1_000_000)
++  await assert.rejects(
++    () => guard.run(async () => undefined, 1_001_000),
++    (error: any) => {
++      assert.equal(error.code, RELOGIN_ERRORS.THROTTLED)
++      assert.ok(error.retryAfterMs > 58_000 && error.retryAfterMs <= 59_000)
++      assert.ok(error.message.includes(RELOGIN_ERRORS.THROTTLED))
++      return true
++    },
++  )
++})
++
++test("B13c a failing run records one failure and rethrows the original error", async () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  await assert.rejects(
++    () =>
++      guard.run(async () => {
++        throw new Error("boom")
++      }, 1_000_000),
++    /boom/,
++  )
++  assert.equal(guard.getFailureCount(), 1)
++  assert.equal(guard.getAttemptCount(), 1)
++})
++
++test("B13d the process-level account limit stops the seventh attempt per hour", async () => {
++  ReloginGuard.resetProcessState()
++  const guard = new ReloginGuard()
++  const key = shortHash("user@example.com")
++  const start = 10_000_000
++  for (let i = 0; i < 6; i++) {
++    const at = start + i * 61_000
++    assert.equal(guard.canAttempt(at, key).ok, true)
++    await guard.run(async () => undefined, at, key)
++  }
++  const blocked = guard.canAttempt(start + 6 * 61_000, key)
++  assert.equal(blocked.ok, false)
++  assert.equal(blocked.reason, "hourly_limit")
++})
++
++test("B14 shortHash matches the sha256 of the account name", () => {
++  assert.equal(
++    shortHash("abc"),
++    "ba7816bf",
++  )
++  assert.equal(shortHash(""), "e3b0c442")
++})
+diff --git a/src/backend/drivers/189/relogin.ts b/src/backend/drivers/189/relogin.ts
+new file mode 100644
+index 0000000..f39c772
+--- /dev/null
++++ b/src/backend/drivers/189/relogin.ts
+@@ -0,0 +1,414 @@
++/**
++ * 189（天翼云盘）重登接点：会话失效判定、限流、单飞。
++ *
++ * 本模块只做三件事，不放 HTTP 细节、不放 UI 文案、不接触 addition/cookie/密码：
++ * 1. isSessionInvalidResponse()：判定一条 API 响应是否代表会话失效；
++ * 2. ReloginGuard.canAttempt/recordSuccess/recordFailure：限流与退避状态机；
++ * 3. ReloginGuard.run()：单飞 + 限流 + 计数，包住一个 () => Promise<T>。
++ *
++ * 状态只放内存，不写库：进程重启清零，重启后第一次请求会尝试一次。
++ * 进程级「同账号每小时 N 次」只存 sha256(username) 前 8 位，不存明文。
++ */
++
++export const RELOGIN_ERRORS = {
++  NO_CREDENTIALS: "189_RELOGIN_NO_CREDENTIALS",
++  THROTTLED: "189_RELOGIN_THROTTLED",
++  FAILED: "189_RELOGIN_FAILED",
++  /** 登录协议成功但 cloud 会话代际没有变化（architect 10:37 勘误 D-2）。 */
++  NO_SESSION: "189_LOGIN_NO_SESSION",
++} as const
++
++export type ReloginErrorCode = (typeof RELOGIN_ERRORS)[keyof typeof RELOGIN_ERRORS]
++
++export type SessionInvalidReason = "errorCode" | "res_code_1010" | "msg_fallback"
++
++export interface SessionInvalidVerdict {
++  invalid: boolean
++  reason?: SessionInvalidReason
++}
++
++/**
++ * 会话失效判定矩阵（DESIGN 第二节 + 10:37 勘误 1.4）。
++ *
++ * 只认明确的码；`check ip error` 文案只在「没有 errorCode，且没有非零 res_code」
++ * 时兜底（B17/B18）。不按 HTTP 401/403 或非 JSON 响应重登，避免把下载直链/CDN
++ * 的正常失败放大成登录风暴。reason 只用于插桩与 A3 分段，不参与控制流。
++ */
++export function classifySessionInvalidResponse(data: any): SessionInvalidVerdict {
++  if (!data || typeof data !== "object") return { invalid: false }
++  if (data.errorCode === "InvalidSessionKey") {
++    return { invalid: true, reason: "errorCode" }
++  }
++  if (data.res_code === "InvalidSessionKey") {
++    return { invalid: true, reason: "errorCode" }
++  }
++  if (String(data.res_code) === "1010") {
++    return { invalid: true, reason: "res_code_1010" }
++  }
++  const resCode = data.res_code
++  const nonZeroResCode =
++    resCode !== undefined &&
++    resCode !== null &&
++    String(resCode) !== "" &&
++    String(resCode) !== "0"
++  if (!data.errorCode && !nonZeroResCode) {
++    const message = String(data.errorMsg || data.res_message || "")
++    if (/check\s*ip\s*error/i.test(message)) {
++      return { invalid: true, reason: "msg_fallback" }
++    }
++  }
++  return { invalid: false }
++}
++
++/** 布尔语义保留：调用点不需要改。 */
++export function isSessionInvalidResponse(data: any): boolean {
++  return classifySessionInvalidResponse(data).invalid
++}
++
++/** sha256 前 8 位，用于日志与进程级账号键；不存明文。 */
++export function shortHash(value: string): string {
++  return sha256Hex(String(value ?? "")).slice(0, 8)
++}
++
++const SHA256_K = [
++  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
++  0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
++  0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
++  0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
++  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
++  0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
++  0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
++  0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
++  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++]
++
++function rotr32(value: number, bits: number): number {
++  return ((value >>> bits) | (value << (32 - bits))) >>> 0
++}
++
++/**
++ * 纯 JS 同步 sha256：tjs 没有 node:crypto，WebCrypto 只有异步 digest，
++ * 而限流判定是同步路径，故自带一份最小实现（只用于取短哈希，不做密码学用途）。
++ */
++function sha256Hex(input: string): string {
++  const bytes = new TextEncoder().encode(input)
++  const length = bytes.length
++  const blockCount = Math.ceil((length + 9) / 64)
++  const padded = new Uint8Array(blockCount * 64)
++  padded.set(bytes)
++  padded[length] = 0x80
++  const view = new DataView(padded.buffer)
++  const bitLength = length * 8
++  view.setUint32(padded.length - 8, Math.floor(bitLength / 0x100000000))
++  view.setUint32(padded.length - 4, bitLength >>> 0)
++
++  let h0 = 0x6a09e667
++  let h1 = 0xbb67ae85
++  let h2 = 0x3c6ef372
++  let h3 = 0xa54ff53a
++  let h4 = 0x510e527f
++  let h5 = 0x9b05688c
++  let h6 = 0x1f83d9ab
++  let h7 = 0x5be0cd19
++  const w = new Uint32Array(64)
++
++  for (let block = 0; block < blockCount; block++) {
++    const offset = block * 64
++    for (let t = 0; t < 16; t++) w[t] = view.getUint32(offset + t * 4)
++    for (let t = 16; t < 64; t++) {
++      const s0 = rotr32(w[t - 15], 7) ^ rotr32(w[t - 15], 18) ^ (w[t - 15] >>> 3)
++      const s1 = rotr32(w[t - 2], 17) ^ rotr32(w[t - 2], 19) ^ (w[t - 2] >>> 10)
++      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0
++    }
++
++    let a = h0
++    let b = h1
++    let c = h2
++    let d = h3
++    let e = h4
++    let f = h5
++    let g = h6
++    let h = h7
++
++    for (let t = 0; t < 64; t++) {
++      const s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
++      const ch = (e & f) ^ (~e & g)
++      const temp1 = (h + s1 + ch + SHA256_K[t] + w[t]) >>> 0
++      const s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
++      const maj = (a & b) ^ (a & c) ^ (b & c)
++      const temp2 = (s0 + maj) >>> 0
++      h = g
++      g = f
++      f = e
++      e = (d + temp1) >>> 0
++      d = c
++      c = b
++      b = a
++      a = (temp1 + temp2) >>> 0
++    }
++
++    h0 = (h0 + a) >>> 0
++    h1 = (h1 + b) >>> 0
++    h2 = (h2 + c) >>> 0
++    h3 = (h3 + d) >>> 0
++    h4 = (h4 + e) >>> 0
++    h5 = (h5 + f) >>> 0
++    h6 = (h6 + g) >>> 0
++    h7 = (h7 + h) >>> 0
++  }
++
++  return [h0, h1, h2, h3, h4, h5, h6, h7]
++    .map((value) => value.toString(16).padStart(8, "0"))
++    .join("")
++}
++
++export interface ReloginGuardOptions {
++  /** 同一实例两次登录的最小间隔，默认 60 s。 */
++  minIntervalMs?: number
++  /** 连续失败后的退避窗口，按失败次数取；超出取最后一个，默认 60/300/900/1800 s。 */
++  backoffMs?: number[]
++  /**
++   * 连续失败到第几次进入熔断，默认 4：
++   * 失败 1/2/3 次后分别退避 60/300/900 s（CRITERIA B11），第 4 次失败熔断 30 min。
++   */
++  maxFailures?: number
++  /** 熔断时长，默认 30 min。 */
++  circuitMs?: number
++  /** 进程级同账号每小时最多尝试次数，默认 6。 */
++  maxPerHour?: number
++  /** resend 相连续失败几次后暂停，默认 3（10:37 勘误 D-3）。 */
++  sessionFailLimit?: number
++  /** resend 相暂停时长，默认 30 min。 */
++  sessionPauseMs?: number
++  /** 每次真正发起登录前回调一次，用于日志计数。 */
++  onAttempt?: (info: { attempt: number; now: number }) => void
++}
++
++export interface AttemptDecision {
++  ok: boolean
++  reason?: "circuit" | "min_interval" | "backoff" | "hourly_limit" | "session_pause"
++  retryAfterMs?: number
++}
++
++/** 失败分相：login 计入退避/熔断；resend 只计 session_fail（D-3）。 */
++export type ReloginPhase = "login" | "resend"
++
++const HOUR_MS = 3_600_000
++
++function reloginError(
++  code: ReloginErrorCode,
++  message: string,
++  retryAfterMs?: number,
++): Error & { code: ReloginErrorCode; retryAfterMs?: number; cause?: unknown } {
++  const error = new Error(message) as Error & {
++    code: ReloginErrorCode
++    retryAfterMs?: number
++    cause?: unknown
++  }
++  error.code = code
++  if (retryAfterMs !== undefined) {
++    error.retryAfterMs = retryAfterMs
++    error.cause = { retryAfterMs }
++  }
++  return error
++}
++
++export class ReloginGuard {
++  private readonly minIntervalMs: number
++  private readonly backoffMs: number[]
++  private readonly maxFailures: number
++  private readonly circuitMs: number
++  private readonly maxPerHour: number
++  private readonly sessionFailLimit: number
++  private readonly sessionPauseMs: number
++  private readonly onAttempt?: ReloginGuardOptions["onAttempt"]
++
++  /** 进程级：同账号（sha256 前 8 位）最近一小时的成功尝试时间戳。 */
++  private static processAttempts = new Map<string, number[]>()
++
++  private inflight: Promise<unknown> | null = null
++  private lastAttemptAt = 0
++  private backoffUntil = 0
++  private circuitUntil = 0
++  private failures = 0
++  private attempts = 0
++  /** resend 相连续失败（登录成功但会话不可用）。 */
++  private sessionFailures = 0
++  private sessionPauseUntil = 0
++
++  constructor(options: ReloginGuardOptions = {}) {
++    this.minIntervalMs = options.minIntervalMs ?? 60_000
++    this.backoffMs = options.backoffMs ?? [60_000, 300_000, 900_000, 1_800_000]
++    this.maxFailures = options.maxFailures ?? 4
++    this.circuitMs = options.circuitMs ?? 1_800_000
++    this.maxPerHour = options.maxPerHour ?? 6
++    this.sessionFailLimit = options.sessionFailLimit ?? 3
++    this.sessionPauseMs = options.sessionPauseMs ?? 1_800_000
++    this.onAttempt = options.onAttempt
++  }
++
++  /** 仅供单测清理进程级状态。 */
++  static resetProcessState(): void {
++    ReloginGuard.processAttempts.clear()
++  }
++
++  getAttemptCount(): number {
++    return this.attempts
++  }
++
++  getFailureCount(): number {
++    return this.failures
++  }
++
++  canAttempt(now: number = Date.now(), accountKey = ""): AttemptDecision {
++    if (this.sessionPauseUntil > 0) {
++      if (now < this.sessionPauseUntil) {
++        return {
++          ok: false,
++          reason: "session_pause",
++          retryAfterMs: this.sessionPauseUntil - now,
++        }
++      }
++      this.sessionPauseUntil = 0
++      this.sessionFailures = 0
++    }
++
++    if (this.circuitUntil > 0) {
++      if (now < this.circuitUntil) {
++        return {
++          ok: false,
++          reason: "circuit",
++          retryAfterMs: this.circuitUntil - now,
++        }
++      }
++      // 熔断到期：计数清零，重新开始。
++      this.circuitUntil = 0
++      this.failures = 0
++      this.backoffUntil = 0
++    }
++
++    if (this.failures > 0) {
++      const remain = this.backoffUntil - now
++      if (remain > 0) {
++        return { ok: false, reason: "backoff", retryAfterMs: remain }
++      }
++    }
++
++    if (this.lastAttemptAt > 0) {
++      const remain = this.minIntervalMs - (now - this.lastAttemptAt)
++      if (remain > 0) {
++        return { ok: false, reason: "min_interval", retryAfterMs: remain }
++      }
++    }
++
++    if (accountKey) {
++      const recent = (ReloginGuard.processAttempts.get(accountKey) || []).filter(
++        (at) => now - at < HOUR_MS,
++      )
++      ReloginGuard.processAttempts.set(accountKey, recent)
++      if (recent.length >= this.maxPerHour) {
++        return {
++          ok: false,
++          reason: "hourly_limit",
++          retryAfterMs: recent[0] + HOUR_MS - now,
++        }
++      }
++    }
++
++    return { ok: true }
++  }
++
++  recordSuccess(now: number = Date.now()): void {
++    this.failures = 0
++    this.backoffUntil = 0
++    this.circuitUntil = 0
++    this.sessionFailures = 0
++    this.sessionPauseUntil = 0
++    this.lastAttemptAt = now
++  }
++
++  /**
++   * 失败计数分相（10:37 勘误 D-3）。
++   * - phase=login：计入 60/300/900/1800 退避与 30 min 熔断；
++   * - phase=resend：单独计数，连续 3 次暂停 30 min，不进登录熔断。
++   */
++  recordFailure(phase: ReloginPhase = "login", now: number = Date.now()): void {
++    if (phase === "resend") {
++      this.sessionFailures += 1
++      this.lastAttemptAt = now
++      if (this.sessionFailures >= this.sessionFailLimit) {
++        this.sessionPauseUntil = now + this.sessionPauseMs
++      }
++      return
++    }
++    this.failures += 1
++    this.lastAttemptAt = now
++    if (this.failures >= this.maxFailures) {
++      this.circuitUntil = now + this.circuitMs
++      this.backoffUntil = this.circuitUntil
++      return
++    }
++    const index = Math.min(this.failures, this.backoffMs.length) - 1
++    this.backoffUntil = now + this.backoffMs[index]
++  }
++
++  /**
++   * 单飞 + 限流 + 计数。
++   * 1) 已有 inflight 直接复用它，不重复登录；
++   * 2) canAttempt 拒绝则抛 189_RELOGIN_THROTTLED（带 retryAfterMs）；
++   * 3) 执行 fn，成功清零失败计数，失败累加并进入退避/熔断。
++   */
++  run<T>(fn: () => Promise<T>, now: number = Date.now(), accountKey = ""): Promise<T> {
++    if (this.inflight) return this.inflight as Promise<T>
++
++    const decision = this.canAttempt(now, accountKey)
++    if (!decision.ok) {
++      const seconds = Math.ceil((decision.retryAfterMs || 0) / 1000)
++      const message =
++        decision.reason === "session_pause"
++          ? `[189Cloud] 登录成功但会话不可用，${seconds} 秒后再试（${RELOGIN_ERRORS.THROTTLED}）`
++          : `[189Cloud] 重登被限流，${seconds} 秒后再试（${RELOGIN_ERRORS.THROTTLED}）`
++      return Promise.reject(
++        reloginError(RELOGIN_ERRORS.THROTTLED, message, decision.retryAfterMs),
++      )
++    }
++
++    this.lastAttemptAt = now
++    this.attempts += 1
++    const attempt = this.attempts
++    if (accountKey) {
++      const recent = (ReloginGuard.processAttempts.get(accountKey) || []).filter(
++        (at) => now - at < HOUR_MS,
++      )
++      recent.push(now)
++      ReloginGuard.processAttempts.set(accountKey, recent)
++    }
++    try {
++      this.onAttempt?.({ attempt, now })
++    } catch {
++      // 日志回调不得影响登录本身。
++    }
++
++    const task = Promise.resolve()
++      .then(fn)
++      .then(
++        (value) => {
++          this.recordSuccess(now)
++          return value
++        },
++        (error) => {
++          const phase: ReloginPhase =
++            (error as any)?.phase === "resend" ? "resend" : "login"
++          this.recordFailure(phase, now)
++          throw error
++        },
++      )
++    const tracked = task.finally(() => {
++      if (this.inflight === tracked) this.inflight = null
++    })
++    this.inflight = tracked
++    return tracked
++  }
++}
+diff --git a/src/backend/drivers/189/util.test.ts b/src/backend/drivers/189/util.test.ts
+index 287742d..4bf48b1 100644
+--- a/src/backend/drivers/189/util.test.ts
++++ b/src/backend/drivers/189/util.test.ts
+@@ -74,10 +74,11 @@ test("login preserves cookies from intermediate redirects", async () => {
+   await client.login({ force: true })
+ 
+   assert.equal(cookiesSent.length, 3)
+-  assert.match(cookiesSent[2], /(?:^|; )LT=token(?:;|$)/)
+-  assert.match(cookiesSent[2], /(?:^|; )GUID=device(?:;|$)/)
+-  assert.match(client.getCookie(), /(?:^|; )LT=token(?:;|$)/)
+-  assert.match(client.getCookie(), /(?:^|; )GUID=device(?:;|$)/)
++  // 补丁 37 的按域 Cookie 罐：open.e.189.cn 的 Set-Cookie 只留在 open 域，
++  // 不再合并进 cloud.189.cn 的单罐（空 COOKIE_LOGIN_USER 覆盖的根因）。
++  assert.equal(cookiesSent[2], "")
++  assert.doesNotMatch(client.getCookie(), /(?:^|; )LT=token(?:;|$)/)
++  assert.doesNotMatch(client.getCookie(), /(?:^|; )GUID=device(?:;|$)/)
+ })
+ 
+ test("login rejects redirects to untrusted hosts before sending cookies", async () => {
+@@ -107,7 +108,8 @@ test("login rejects redirects to untrusted hosts before sending cookies", async
+     () => client.login({ force: true }),
+     /不受信任的登录重定向地址/,
+   )
+-  assert.deepEqual(cookiesSent, ["session=secret"])
++  // U3：force 登录先清内存 Cookie，首跳不再携带旧 Cookie（防「已登录」短路）。
++  assert.deepEqual(cookiesSent, [""])
+ })
+ 
+ test("login rejects trusted-host redirects that downgrade to HTTP", async () => {
+@@ -330,7 +332,8 @@ test("persistent InvalidSessionKey is reported instead of an empty directory", a
+ 
+   await assert.rejects(
+     () => client.getFiles("-11"),
+-    /cookieUserSession is null or invalid/,
++    // U7：仅配置 Cookie（无账号密码）时不再重试原请求，直接报无法自动重登。
++    /189_RELOGIN_NO_CREDENTIALS/,
+   )
+ })
+ 
+diff --git a/src/backend/drivers/189/util.ts b/src/backend/drivers/189/util.ts
+index 8dd276a..c580f24 100644
+--- a/src/backend/drivers/189/util.ts
++++ b/src/backend/drivers/189/util.ts
+@@ -24,6 +24,12 @@ import {
+   resolveLoginUrlViaCurl,
+ } from "./curl-fallback"
+ import { curlFetch } from "./curl-http"
++import {
++  RELOGIN_ERRORS,
++  ReloginGuard,
++  classifySessionInvalidResponse,
++  shortHash,
++} from "./relogin"
+ 
+ /** Cookie 辅助函数 */
+ function getCookieValue(cookieStr: string, key: string): string | null {
+@@ -75,6 +81,48 @@ function getSetCookieHeaders(headers: Headers): string[] {
+   return combined ? [combined] : []
+ }
+ 
++/**
++ * 189 重登插桩（architect 10:37 勘误 D-4）：只在 OPENLIST_189_TRACE=1 时输出，
++ * 一行一条，不写库、不落盘。默认关闭，正常日志与原来一致。
++ * 只输出长度、sha256 前 8 位与 cookie 名字，不输出 cookie/password/token 原值。
++ */
++const TRACE_ENABLED =
++  typeof process !== "undefined" &&
++  Boolean(process.env && process.env.OPENLIST_189_TRACE === "1")
++
++function trace(line: string): void {
++  if (!TRACE_ENABLED) return
++  console.log(`[189Cloud] ${line}`)
++}
++
++/** 响应字节数（只用于日志，不改变解析路径）。 */
++function byteLength(text: string): number {
++  return new TextEncoder().encode(text).length
++}
++
++/** 从 check ip error 文案里取 IP，只输出 sha256 前 8 位用于跨请求关联。 */
++function ipSha8(message: string, key: "curIp" | "cookiesIp"): string {
++  const match = String(message || "").match(
++    new RegExp(`${key}\\s*=\\s*([^,\\s]+)`),
++  )
++  return match ? shortHash(match[1]) : "-"
++}
++
++/** 单个 cookie 名的值长度（根因键 COOKIE_LOGIN_USER 单独记长度，不记值）。 */
++function cookieValueLength(cookieStr: string, key: string): number {
++  const value = getCookieValue(cookieStr, key)
++  return value === null ? 0 : value.length
++}
++
++/** cookie 名列表（不含值），用于比对旧会话键是否残留。 */
++function cookieNameList(cookieStr: string): string {
++  return cookieStr
++    .split(";")
++    .map((part) => part.split("=")[0].trim())
++    .filter(Boolean)
++    .join(",")
++}
++
+ /**
+  * 189Cloud returns file/folder IDs as JSON numbers. IDs exceed JavaScript's
+  * safe integer range, so protect the numeric token before parsing to retain
+@@ -128,6 +176,16 @@ export class Pan189Client {
+   private cookieDirty = false
+   private sessionKey: string = ""
+   private rsa = { pubKey: "", pkId: "", expire: 0 }
++  /** 最近一次 httpRequest 实际使用的传输栈（curl / fetch），只用于插桩。 */
++  private lastTransport: "curl" | "fetch" | "-" = "-"
++  /** login() 入口计数：判据里的 login_seq。 */
++  private loginSeq = 0
++  private relogin = new ReloginGuard({
++    onAttempt: ({ attempt, now }) => {
++      // 可数日志行：A3/A5/A6 直接按这一行计登录次数（默认关闭，见 trace）。
++      trace(`relogin attempt #${attempt} ts=${now}`)
++    },
++  })
+ 
+   constructor(
+     addition: Cloud189Addition,
+@@ -217,6 +275,7 @@ export class Pan189Client {
+       body: init.body,
+       headersOnly: init.headersOnly,
+     })
++    this.lastTransport = viaCurl ? "curl" : "fetch"
+     if (!viaCurl) {
+       if (init.headersOnly) {
+         // curl 不可用时也不能整包缓冲：拿到响应就丢弃 body 流。
+@@ -376,7 +435,20 @@ export class Pan189Client {
+    * 2. 若未登录且配置了账号密码，执行 open.e.189.cn OAuth2 登录流程
+    */
+   async login(options: { force?: boolean } = {}): Promise<void> {
++    this.loginSeq += 1
++    const seq = this.loginSeq
++    const cookieBefore = this.cookie
++    if (options.force) {
++      // 旧 Cookie 会让 loginUrl.action 直接判「已登录」而在下面短路返回，
++      // 重登就不会真正换会话；force 时先清内存 Cookie。空值不会落库：
++      // flushPendingDriverState 对空 cookie 直接 return。
++      this.cookie = ""
++      this.cookieDirty = true
++    }
+     if (this.cookie && !options.force) return
++    trace(
++      `login start seq=${seq} force=${Boolean(options.force)} cookie_before_len=${cookieBefore.length} cookie_before_sha8=${cookieBefore ? shortHash(cookieBefore) : "-"} cookie_login_user_len_before=${cookieValueLength(cookieBefore, "COOKIE_LOGIN_USER")} open_cookie_len=${this.openCookie.length}`,
++    )
+ 
+     const loginUrl =
+       "https://cloud.189.cn/api/portal/loginUrl.action?redirectURL=https%3A%2F%2Fcloud.189.cn%2Fmain.action"
+@@ -391,6 +463,16 @@ export class Pan189Client {
+     }
+ 
+     const redirectUrlStr = await this.resolveLoginUrl(loginUrl, headers)
++    {
++      const firsthopClass = isLoggedInUrl(redirectUrlStr)
++        ? "web_main"
++        : /[?&]lt=/.test(redirectUrlStr) && /[?&]reqId=/.test(redirectUrlStr)
++          ? "login_page"
++          : "other"
++      trace(
++        `login firsthop seq=${seq} class=${firsthopClass} transport=${this.lastTransport} lt_present=${/[?&]lt=/.test(redirectUrlStr)} reqid_present=${/[?&]reqId=/.test(redirectUrlStr)}`,
++      )
++    }
+     if (isLoggedInUrl(redirectUrlStr)) {
+       // 已经处于登录状态
+       return
+@@ -434,6 +516,7 @@ export class Pan189Client {
+     }
+ 
+     // 1. 获取 App 配置
++    const appConfStartedAt = Date.now()
+     const appConfRes = await fetch(
+       "https://open.e.189.cn/api/logbox/oauth2/appConf.do",
+       {
+@@ -446,7 +529,11 @@ export class Pan189Client {
+       },
+     )
+     await this.updateCookie(appConfRes.headers, "open.e.189.cn")
+-    const appConf: AppConfResp189 = await appConfRes.json()
++    const appConfText = await appConfRes.text()
++    const appConf: AppConfResp189 = JSON.parse(appConfText)
++    trace(
++      `login.post seq=${seq} step=appConf transport=fetch http=${appConfRes.status} result=${String(appConf.result)} bytes=${byteLength(appConfText)} ms=${Date.now() - appConfStartedAt} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
++    )
+     if (appConf.result !== "0" || !appConf.data) {
+       throw new Error(
+         `[189Cloud] 获取 AppConf 失败: ${appConf.msg || JSON.stringify(appConf)}`,
+@@ -454,6 +541,7 @@ export class Pan189Client {
+     }
+ 
+     // 2. 获取加密配置 (公钥 & 前缀)
++    const encConfStartedAt = Date.now()
+     const encConfRes = await fetch(
+       "https://open.e.189.cn/api/logbox/config/encryptConf.do",
+       {
+@@ -465,7 +553,11 @@ export class Pan189Client {
+       },
+     )
+     await this.updateCookie(encConfRes.headers, "open.e.189.cn")
+-    const encConf: EncryptConfResp189 = await encConfRes.json()
++    const encConfText = await encConfRes.text()
++    const encConf: EncryptConfResp189 = JSON.parse(encConfText)
++    trace(
++      `login.post seq=${seq} step=encryptConf transport=fetch http=${encConfRes.status} result=${String(encConf.result)} bytes=${byteLength(encConfText)} ms=${Date.now() - encConfStartedAt}`,
++    )
+     if (encConf.result !== 0 || !encConf.data?.pubKey) {
+       throw new Error(
+         `[189Cloud] 获取 EncryptConf 失败: ${JSON.stringify(encConf)}`,
+@@ -501,6 +593,7 @@ export class Pan189Client {
+       paramId: appConf.data.paramId || "",
+     }
+ 
++    const loginSubmitStartedAt = Date.now()
+     const loginRes = await fetch(
+       "https://open.e.189.cn/api/logbox/oauth2/loginSubmit.do",
+       {
+@@ -512,7 +605,11 @@ export class Pan189Client {
+       },
+     )
+     await this.updateCookie(loginRes.headers, "open.e.189.cn")
+-    const loginData = await loginRes.json()
++    const loginText = await loginRes.text()
++    const loginData = JSON.parse(loginText)
++    trace(
++      `login.submit seq=${seq} transport=fetch http=${loginRes.status} result=${String(loginData.result)} bytes=${byteLength(loginText)} ms=${Date.now() - loginSubmitStartedAt} set_cookie=${getSetCookieHeaders(loginRes.headers).length} toUrl_len=${String(loginData.toUrl || "").length} toUrl_host=${(() => { try { return new URL(String(loginData.toUrl || "")).hostname } catch { return "-" } })()} toUrl_path=${(() => { try { return new URL(String(loginData.toUrl || "")).pathname } catch { return "-" } })()} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
++    )
+     if (loginData.result !== 0) {
+       const msg = loginData.msg || "登录失败"
+       if (
+@@ -529,11 +626,29 @@ export class Pan189Client {
+ 
+     // 5. 跟随跳转完成授权
+     if (loginData.toUrl) {
+-      await this.followRedirectsWithCookies(loginData.toUrl, {
++      const toUrlStartedAt = Date.now()
++      const cloudGenBefore = this.cookie ? shortHash(this.cookie) : "-"
++      const cloudNamesBefore = cookieNameList(this.cookie)
++      const followed = await this.followRedirectsWithCookies(loginData.toUrl, {
+         "User-Agent":
+           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+       })
++      let finalHost = "-"
++      let finalPath = "-"
++      try {
++        const finalUrl = new URL(followed.url)
++        finalHost = finalUrl.hostname
++        finalPath = finalUrl.pathname
++      } catch {
++        // 解析不了就留 "-"，不影响登录控制流。
++      }
++      trace(
++        `callback seq=${seq} transport=${this.lastTransport} http=${followed.response.status} hops=${followed.urls.length} final_host=${finalHost} final_path=${finalPath} set_cookie=${getSetCookieHeaders(followed.response.headers).length} set_cookie_names=${getSetCookieHeaders(followed.response.headers).map((c) => c.split("=")[0].trim()).join(",") || "-"} cloud_gen_before=${cloudGenBefore} cloud_gen_after_cb=${this.cookie ? shortHash(this.cookie) : "-"} cloud_names_before=${cloudNamesBefore || "-"} cloud_names_after_cb=${cookieNameList(this.cookie) || "-"} ms=${Date.now() - toUrlStartedAt}`,
++      )
+     }
++    trace(
++      `login.end seq=${seq} cookie_len=${this.cookie.length} cookie_sha8=${this.cookie ? shortHash(this.cookie) : "-"} cookie_login_user_len=${cookieValueLength(this.cookie, "COOKIE_LOGIN_USER")} open_cookie_len=${this.openCookie.length}`,
++    )
+   }
+ 
+   /**
+@@ -602,29 +717,120 @@ export class Pan189Client {
+       throw new Error(`[189Cloud] 非预期响应: ${text.slice(0, 200)}`)
+     }
+ 
+-    const invalidSession =
+-      data.errorCode === "InvalidSessionKey" ||
+-      data.res_code === "InvalidSessionKey" ||
+-      String(data.res_code) === "1010"
+-    if (invalidSession) {
++    // 失败时把 HTTP 状态与错误码挂在 Error 上：重发阶段要把 http/code 记进插桩，
++    // 只改异常对象的附加字段，不改抛出/捕获控制流。
++    const apiError = (message: string): Error => {
++      const error = new Error(message) as Error & Record<string, unknown>
++      error.httpStatus = res.status
++      error.errorCode = data.errorCode ?? data.res_code
++      const messageText = String(data.errorMsg || data.res_message || "")
++      const curIpHash = ipSha8(messageText, "curIp")
++      const cookiesIpHash = ipSha8(messageText, "cookiesIp")
++      error.ipEqual = curIpHash !== "-" && curIpHash === cookiesIpHash
++      error.curIpSha8 = curIpHash
++      error.cookiesIpSha8 = cookiesIpHash
++      error.cookieGen = this.cookie ? shortHash(this.cookie) : "-"
++      return error
++    }
++
++    const verdict = classifySessionInvalidResponse(data)
++    if (verdict.invalid) {
++      const errorMessage = String(data.errorMsg || data.res_message || "")
++      const curIpHash = ipSha8(errorMessage, "curIp")
++      const cookiesIpHash = ipSha8(errorMessage, "cookiesIp")
++      trace(
++        `invalid session reason=${verdict.reason} code=${String(data.errorCode ?? data.res_code ?? "-")} http=${res.status} transport=${this.lastTransport} ip_equal=${curIpHash !== "-" && curIpHash === cookiesIpHash} curIp_sha8=${curIpHash} cookiesIp_sha8=${cookiesIpHash} cookie_len=${this.cookie.length} cookie_sha8=${this.cookie ? shortHash(this.cookie) : "-"} cookie_login_user_len=${cookieValueLength(this.cookie, "COOKIE_LOGIN_USER")}`,
++      )
+       if (retry) {
+-        await this.login({ force: true })
+-        return this.request<T>(url, {
+-          ...options,
+-          retryOnInvalidSession: false,
+-        })
++        if (!this.addition.username || !this.addition.password) {
++          const error = new Error(
++            `[189Cloud] 仅配置了 Cookie，IP 变化后无法自动重登，请补账号密码或重新取 Cookie（${RELOGIN_ERRORS.NO_CREDENTIALS}）`,
++          ) as Error & { code?: string }
++          error.code = RELOGIN_ERRORS.NO_CREDENTIALS
++          throw error
++        }
++        const cloudGenBefore = this.cookie ? shortHash(this.cookie) : "-"
++        trace(
++          `relogin.begin trigger=${verdict.reason} login_seq=${this.loginSeq} cloud_gen_before=${cloudGenBefore}`,
++        )
++        try {
++          await this.relogin.run(
++            async () => {
++              try {
++                await this.login({ force: true })
++              } catch (error: any) {
++                // D-3：登录协议本身失败计入 login 相退避/熔断。
++                if (error && typeof error === "object") error.phase = "login"
++                throw error
++              }
++              // D-2：登录后 cloud cookie 代际必须变化；没变就是「登录成功但
++              // 会话不可用」，按 resend 相计数，不记成功。
++              const cloudGenAfter = this.cookie ? shortHash(this.cookie) : "-"
++              if (cloudGenAfter === "-" || cloudGenAfter === cloudGenBefore) {
++                const error = new Error(
++                  `[189Cloud] 登录成功但会话不可用（${RELOGIN_ERRORS.NO_SESSION}）`,
++                ) as Error & { code?: string; phase?: string }
++                error.code = RELOGIN_ERRORS.NO_SESSION
++                error.phase = "resend"
++                throw error
++              }
++            },
++            Date.now(),
++            shortHash(this.addition.username),
++          )
++        } catch (e: any) {
++          const throttled = e?.code === RELOGIN_ERRORS.THROTTLED
++          const retryAfterMs = Number(
++            e?.retryAfterMs || this.relogin.canAttempt(Date.now()).retryAfterMs || 0,
++          )
++          const suffix = retryAfterMs > 0 ? `，retryAfterMs=${retryAfterMs}` : ""
++          const error = new Error(
++            throttled
++              ? `${e?.message || "重登被限流"}（${RELOGIN_ERRORS.THROTTLED}${suffix}）`
++              : `[189Cloud] 自动重登失败：${e?.message || String(e)}（${RELOGIN_ERRORS.FAILED}${suffix}）`,
++          ) as Error & { code?: string; retryAfterMs?: number }
++          error.code = throttled
++            ? RELOGIN_ERRORS.THROTTLED
++            : RELOGIN_ERRORS.FAILED
++          if (retryAfterMs > 0) error.retryAfterMs = retryAfterMs
++          trace(`relogin.end phase=${e?.phase === "resend" ? "resend" : "login"} code=${String(e?.code || "-")} msg=${String(e?.message || e).slice(0, 160)}`)
++          throw error
++        }
++        trace(
++          `relogin.ok cloud_gen_after=${this.cookie ? shortHash(this.cookie) : "-"} cookie_len=${this.cookie.length} cookie_login_user_len=${cookieValueLength(this.cookie, "COOKIE_LOGIN_USER")}`,
++        )
++        try {
++          const resent = await this.request<T>(url, {
++            ...options,
++            retryOnInvalidSession: false,
++          })
++          trace(
++            `resend.ok url=${new URL(url).pathname} transport=${this.lastTransport} cookie_gen=${this.cookie ? shortHash(this.cookie) : "-"}`,
++          )
++          return resent
++        } catch (e: any) {
++          trace(
++            `resend.fail url=${new URL(url).pathname} http=${e?.httpStatus ?? "-"} code=${String(e?.errorCode ?? e?.code ?? "-")} ip_equal=${e?.ipEqual ?? "-"} curIp_sha8=${e?.curIpSha8 ?? "-"} cookiesIp_sha8=${e?.cookiesIpSha8 ?? "-"} cloud_gen_on_resend=${e?.cookieGen ?? (this.cookie ? shortHash(this.cookie) : "-")} transport=${this.lastTransport}`,
++          )
++          const error = new Error(
++            `${e?.message || String(e)}（已尝试重登）`,
++          ) as Error & { code?: string; reloginAttempted?: boolean }
++          error.code = e?.code
++          error.reloginAttempted = true
++          throw error
++        }
+       }
+-      throw new Error(
++      throw apiError(
+         data.errorMsg || data.res_message || "[189Cloud] 登录会话已失效",
+       )
+     }
+ 
+     if (data.errorCode) {
+-      throw new Error(data.errorMsg || `[189Cloud] API 错误: ${data.errorCode}`)
++      throw apiError(data.errorMsg || `[189Cloud] API 错误: ${data.errorCode}`)
+     }
+ 
+     if (!res.ok) {
+-      throw new Error(
++      throw apiError(
+         data.errorMsg ||
+           data.res_message ||
+           `[189Cloud] HTTP 请求失败 (${res.status})`,
+@@ -632,7 +838,7 @@ export class Pan189Client {
+     }
+ 
+     if (data.res_code !== undefined && String(data.res_code) !== "0") {
+-      throw new Error(
++      throw apiError(
+         data.res_message || `189 API 错误 (res_code: ${data.res_code})`,
+       )
+     }
