@@ -29,9 +29,9 @@
 | WebDAV | WebDAV | 已适配 | 服务端与客户端驱动都验过 |
 | S3 | S3 | 已适配 | 读写与删除已验 |
 | 百度网盘 | BaiduNetdisk | 已适配 | refresh_token + access_token，可列目录与下载 |
-| 天翼云盘 | 189 | 已适配 | 登录首跳被 TLS 指纹拦，已用设备 curl 兜底解决 |
-| 夸克网盘 | Quark | 已适配 | cookie 认证，实测列目录与取链 |
-| 阿里云盘 Open | AliyundriveOpen | 适配中 | 中转令牌刷新需 POST JSON，修复待发布 |
+| 天翼云盘 | 189 | 基础可用（缺可用恢复路径） | 登录首跳已用 curl 兜底；登录三步仍走 fetch，会话失效后重登不成立，IP 变化会报 check ip error |
+| 夸克网盘 | Quark | 基础可用（缺恢复路径） | cookie 认证，能列目录与取链；服务端下发的 cookie 更新未落库，重启后可能需重新粘贴 |
+| 阿里云盘 Open | AliyundriveOpen | 基础可用（缺恢复路径） | 中转刷新已改成 POST JSON；新 refresh_token 未落库，重启后可能挂载失败 |
 | 115 网盘 | 115（cookie 版） | 待适配 | 现有实现是 Open API 版，cookie/TV 扫码版需移植 |
 | 百度网盘青春版 | BaiduYouth | 不支持 | cookie 驱动未移植，建议改用会员版 |
 | 其余 70+ 驱动 | — | 未验证 | 需要具体账号与用例，按需逐个适配 |
