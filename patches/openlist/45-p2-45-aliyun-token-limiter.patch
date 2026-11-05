@@ -1,0 +1,229 @@
+diff --git a/src/backend/drivers/aliyundrive_open/driver.ts b/src/backend/drivers/aliyundrive_open/driver.ts
+index 1395c1d..e9760fc 100644
+--- a/src/backend/drivers/aliyundrive_open/driver.ts
++++ b/src/backend/drivers/aliyundrive_open/driver.ts
+@@ -26,9 +26,15 @@ export class AliyundriveOpen implements StorageDriver {
+   private addition: AliyundriveOpenAddition
+   private pathFileIdCache = new Map<string, string>()
+ 
+-  constructor(addition: AliyundriveOpenAddition) {
++  constructor(
++    addition: AliyundriveOpenAddition,
++    onTokenUpdate?: (tokens: {
++      access_token: string
++      refresh_token: string
++    }) => void | Promise<void>,
++  ) {
+     this.addition = addition
+-    this.client = new AliyunOpenClient(addition)
++    this.client = new AliyunOpenClient(addition, onTokenUpdate)
+   }
+ 
+   async init(): Promise<void> {
+diff --git a/src/backend/drivers/aliyundrive_open/limiter.ts b/src/backend/drivers/aliyundrive_open/limiter.ts
+new file mode 100644
+index 0000000..4e7b756
+--- /dev/null
++++ b/src/backend/drivers/aliyundrive_open/limiter.ts
+@@ -0,0 +1,62 @@
++/**
++ * 阿里云盘 Open 的 per-user 轻量限流。
++ *
++ * 参数取自 alist/OpenList 的 limiter.go:20-30：list 3.9/s、link 0.9/s、
++ * other 14.9/s。实现为「按 user + 桶排队的最小间隔」，只等待、不抛错，
++ * 调用方语义与不限流时一致；日志只在真的等过时打一行。
++ */
++
++export type AliyunRateBucket = "list" | "link" | "other"
++
++export const ALIYUN_RATE_INTERVAL_MS: Record<AliyunRateBucket, number> = {
++  list: Math.ceil(1000 / 3.9),
++  link: Math.ceil(1000 / 0.9),
++  other: Math.ceil(1000 / 14.9),
++}
++
++interface BucketState {
++  nextAt: number
++}
++
++const users = new Map<string, Map<AliyunRateBucket, BucketState>>()
++
++function bucketFor(userKey: string, bucket: AliyunRateBucket): BucketState {
++  let buckets = users.get(userKey)
++  if (!buckets) {
++    buckets = new Map()
++    users.set(userKey, buckets)
++  }
++  let state = buckets.get(bucket)
++  if (!state) {
++    state = { nextAt: 0 }
++    buckets.set(bucket, state)
++  }
++  return state
++}
++
++export function classifyAliyunPath(path: string): AliyunRateBucket {
++  if (path.includes("/openFile/list")) return "list"
++  if (path.includes("/openFile/getDownloadUrl")) return "link"
++  return "other"
++}
++
++/** 按 user + 桶排队；返回实际等待的毫秒数（0 表示没等）。 */
++export async function waitAliyunRateLimit(
++  userKey: string,
++  bucket: AliyunRateBucket,
++  now: number = Date.now(),
++): Promise<number> {
++  const state = bucketFor(userKey, bucket)
++  const start = Math.max(now, state.nextAt)
++  const waitMs = start - now
++  state.nextAt = start + ALIYUN_RATE_INTERVAL_MS[bucket]
++  if (waitMs > 0) {
++    await new Promise((resolve) => setTimeout(resolve, waitMs))
++  }
++  return waitMs
++}
++
++/** 仅单测用：清空进程级状态。 */
++export function resetAliyunRateLimit(): void {
++  users.clear()
++}
+diff --git a/src/backend/drivers/aliyundrive_open/util.ts b/src/backend/drivers/aliyundrive_open/util.ts
+index 357347a..3d3f72a 100644
+--- a/src/backend/drivers/aliyundrive_open/util.ts
++++ b/src/backend/drivers/aliyundrive_open/util.ts
+@@ -4,6 +4,15 @@ import {
+   AliyunFileItem,
+ } from "./types"
+ import { assertSafeUrl } from "../../pkg/http"
++import {
++  classifyAliyunPath,
++  waitAliyunRateLimit,
++} from "./limiter"
++
++export interface AliyunTokenUpdate {
++  access_token: string
++  refresh_token: string
++}
+ 
+ const ALI_OPEN_API = "https://openapi.aliyundrive.com/adrive/v1.0"
+ 
+@@ -18,9 +27,16 @@ export class AliyunOpenClient {
+   private refreshTokenVal: string = ""
+   public driveId: string = ""
+   private tokenExpiresAt: number = 0
++  private onTokenUpdate?: (
++    tokens: AliyunTokenUpdate,
++  ) => void | Promise<void>
+ 
+-  constructor(addition: AliyundriveOpenAddition) {
++  constructor(
++    addition: AliyundriveOpenAddition,
++    onTokenUpdate?: (tokens: AliyunTokenUpdate) => void | Promise<void>,
++  ) {
+     this.addition = addition
++    this.onTokenUpdate = onTokenUpdate
+     this.refreshTokenVal = addition.refresh_token || ""
+     this.driveId = addition.drive_id || ""
+     // 迁移场景：alist 导出的配置里有现成 access_token（AccessToken），
+@@ -187,6 +203,7 @@ export class AliyunOpenClient {
+         if (newToken) this.refreshTokenVal = newToken
+         this.tokenExpiresAt =
+           Date.now() + (data.expires_in || 7200) * 1000 - 60000
++        await this.emitTokenUpdate()
+         return // Success!
+       } catch (err: any) {
+         const mode = api.post ? "POST" : "GET"
+@@ -230,6 +247,7 @@ export class AliyunOpenClient {
+       if (data.refresh_token) this.refreshTokenVal = data.refresh_token
+       this.tokenExpiresAt =
+         Date.now() + (data.expires_in || 7200) * 1000 - 60000
++      await this.emitTokenUpdate()
+       return // Success!
+     } catch (err: any) {
+       console.warn(`[AliyundriveOpen] Direct OAuth failed: ${err.message}`)
+@@ -243,6 +261,32 @@ export class AliyunOpenClient {
+     )
+   }
+ 
++  /** 刷新成功后把新令牌交给存储层落库；回调异常不影响本次请求。 */
++  private async emitTokenUpdate(): Promise<void> {
++    if (!this.onTokenUpdate) return
++    try {
++      await this.onTokenUpdate({
++        access_token: this.accessToken,
++        refresh_token: this.refreshTokenVal,
++      })
++    } catch (e: any) {
++      console.warn(
++        `[AliyundriveOpen] token update callback failed: ${e?.message || e}`,
++      )
++    }
++  }
++
++  /** per-user 限流键：refresh_token 的稳定短哈希，不落明文。 */
++  private rateLimitKey(): string {
++    const source = this.refreshTokenVal || this.accessToken || "unknown"
++    let hash = 0x811c9dc5
++    for (let i = 0; i < source.length; i++) {
++      hash ^= source.charCodeAt(i)
++      hash = Math.imul(hash, 0x01000193) >>> 0
++    }
++    return hash.toString(16).padStart(8, "0")
++  }
++
+   private async ensureToken(): Promise<void> {
+     if (!this.accessToken || Date.now() >= this.tokenExpiresAt) {
+       await this.refreshAccessToken()
+@@ -266,6 +310,16 @@ export class AliyunOpenClient {
+     } catch (e: any) {
+       throw new Error(`[AliyundriveOpen] blocked unsafe URL: ${e.message}`)
+     }
++    // M5：per-user 轻量限流。list 3.9/s、link 0.9/s、other 14.9/s；
++    // 只排队不报错，避免批量列目录/取链把上游打成 429。
++    const bucket = classifyAliyunPath(path)
++    const rateKey = this.rateLimitKey()
++    const waitedMs = await waitAliyunRateLimit(rateKey, bucket)
++    if (waitedMs > 0) {
++      console.log(
++        `[AliyundriveOpen] rate limit bucket=${bucket} wait_ms=${waitedMs} user=${rateKey}`,
++      )
++    }
+     const res = await fetch(url, {
+       method: "POST",
+       headers: {
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 592b9ef..026b240 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -272,7 +272,29 @@ async function createDriver(
+     normDriver.includes("aliyun")
+   ) {
+     // 统一只保留阿里云盘 OAuth2 (AliyundriveOpen)
+-    driver = new AliyundriveOpen(parseAddition(storageConfig))
++    driver = new AliyundriveOpen(parseAddition(storageConfig), async (tokens) => {
++      // M4：刷新后的 refresh_token / access_token 写回存储。与 Onedrive 的
++      // 落库口径一致：同步 storageConfig.addition，deferred 场景由既存机制兜。
++      try {
++        const db = await getDb()
++        const st = (db.storages || []).find(
++          (s: any) => s.id === storageConfig?.id,
++        )
++        if (!st) return
++        const stAddition =
++          typeof st.addition === "string"
++            ? JSON.parse(st.addition || "{}")
++            : st.addition || {}
++        stAddition.refresh_token = tokens.refresh_token
++        stAddition.access_token = tokens.access_token
++        st.addition = JSON.stringify(stAddition)
++        storageConfig.addition = st.addition
++        if (deferredTokenPersistence.has(storageConfig)) return
++        await saveDb(db)
++      } catch (e) {
++        console.warn("[AliyundriveOpen] failed to persist token:", e)
++      }
++    })
+     await driver.init?.()
+   } else if (
+     normDriver === "googlephoto" ||

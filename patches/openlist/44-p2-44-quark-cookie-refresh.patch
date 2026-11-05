@@ -1,0 +1,116 @@
+diff --git a/src/backend/drivers/quark/driver.ts b/src/backend/drivers/quark/driver.ts
+index 685ec04..a300ed4 100644
+--- a/src/backend/drivers/quark/driver.ts
++++ b/src/backend/drivers/quark/driver.ts
+@@ -28,12 +28,17 @@ export class QuarkDriver implements StorageDriver {
+   private client: QuarkClient
+   private pathFileIdCache = new Map<string, string>()
+ 
+-  constructor(addition: QuarkAddition) {
+-    this.client = new QuarkClient(addition)
++  constructor(
++    addition: QuarkAddition,
++    onCookieUpdate?: (cookie: string) => void,
++  ) {
++    this.client = new QuarkClient(addition, onCookieUpdate)
+   }
+ 
+   async init(): Promise<void> {
+     await this.client.init()
++    // M1/M2：进程常驻，定时续期 __puus；周期见 QuarkClient.startAutoRefresh。
++    this.client.startAutoRefresh()
+   }
+ 
+   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+diff --git a/src/backend/drivers/quark/util.ts b/src/backend/drivers/quark/util.ts
+index c1738f5..ae14b5e 100644
+--- a/src/backend/drivers/quark/util.ts
++++ b/src/backend/drivers/quark/util.ts
+@@ -348,6 +348,69 @@ export class QuarkClient {
+     return resp.data
+   }
+ 
++  // ---- Cookie refresh loop ----
++  //
++  // alist 的做法（quark_uc/util.go:240-297）：每 100 分钟 ±5 分钟抖动，去掉
++  // __puus 后请求 /config，让服务端重新下发；否则 __puus 约 3 小时后过期，
++  // 下载先 403、随后列表也失败，只能重新粘 cookie。
++  private refreshTimer: any = null
++
++  public startAutoRefresh(): void {
++    if (this.refreshTimer) return
++    const raw =
++      typeof process !== "undefined" && process.env
++        ? process.env.OPENLIST_QUARK_REFRESH_MS
++        : ""
++    const override = Number(raw || 0)
++    let period = 100 * 60 * 1000
++    if (Number.isFinite(override) && override > 0) {
++      // 只给测试用；生产不设这个变量。
++      period = Math.max(1000, Math.floor(override))
++    } else {
++      period += Math.floor((Math.random() * 10 - 5) * 60 * 1000)
++    }
++    this.refreshTimer = setInterval(() => {
++      void this.refreshCookie()
++    }, period)
++    try {
++      ;(this.refreshTimer as any)?.unref?.()
++    } catch {
++      // txiki 的 setInterval 可能不返回对象；不影响功能。
++    }
++    console.log(
++      `[Quark/UC] (${this.addition.variant || "Quark"}) cookie refresh loop period_ms=${period}`,
++    )
++  }
++
++  public stopAutoRefresh(): void {
++    if (!this.refreshTimer) return
++    clearInterval(this.refreshTimer)
++    this.refreshTimer = null
++  }
++
++  /**
++   * 主动刷新一次：删掉旧 __puus/__pus 再请求 /config，服务端通过 Set-Cookie
++   * 下发新值；request() 负责合并并触发 onCookieUpdate 落库。
++   */
++  public async refreshCookie(): Promise<boolean> {
++    if (!this.cookie?.trim()) return false
++    const before = this.cookie
++    // 设备实测（2026-11-05）：删掉 __puus 再请求 /config 会直接 401
++    // require login [guest]，与 alist 的 quark_uc 不同。改为带原 cookie 请求
++    // /config 做保活/轮换；服务端下发的新 Set-Cookie 由同一路径合并并落库。
++    try {
++      await this.request("/config", "GET")
++      const changed = this.cookie !== before
++      console.log(
++        `[Quark/UC] (${this.addition.variant || "Quark"}) cookie refresh ok changed=${changed} cookie_len=${this.cookie.length}`,
++      )
++      return changed
++    } catch (e: any) {
++      console.warn(`[Quark/UC] cookie refresh failed:`, e.message)
++      return false
++    }
++  }
++
+   // ---- Init (validates cookie by calling /config) ----
+ 
+   async init(): Promise<void> {
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 3eb28a4..592b9ef 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -296,7 +296,12 @@ async function createDriver(
+     normDriver === "uc" ||
+     normDriver === "quarkcookie"
+   ) {
+-    driver = new QuarkDriver(parseAddition(storageConfig))
++    driver = new QuarkDriver(parseAddition(storageConfig), (cookie: string) => {
++      // M1：响应下发的新 __puus/__pus 落库；失败只告警，不影响本次请求。
++      persistStorageCookie(storageConfig, cookie).catch((e) => {
++        console.warn("[Quark/UC] failed to persist cookie:", e)
++      })
++    })
+     await driver.init?.()
+   } else if (
+     normDriver === "115" ||

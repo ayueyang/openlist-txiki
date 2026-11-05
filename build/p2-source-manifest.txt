@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 41 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 46 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 43
+patch_count 46
 file_count 40
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -208,13 +208,31 @@ patch 41 e5540348718ae7256f31c79b6373b2b1272b8eba7699f16389206ca64719bfd2 work/p
 #   基线说明：本条 diff 取自 r41 构建树实际状态（patch 37/38 在该树未落地），见 progress.md 同日段。
 patch 42 661eaf248c2e8fa6b697b36c0ca718cefa811e8c675d97ac30b6eaa868d5333a work/p2-42-share-single-dir.patch
 patch 43 25ba02115608684350bcf7ae98682bf2945b095a6b6d14a10bd37024beb2fd40 work/p2-43-189-relogin.patch
+patch 44 45ed128a8444668ad5971732b5f5d9b59680fd911b9ec9f27f7a7d928c8d871b work/p2-44-quark-cookie-refresh.patch
+patch 45 30841a6e669b29bf58850adfd01bdd9ad4ec60e5e77c2227d9f033a7e657b76e work/p2-45-aliyun-token-limiter.patch
+patch 46 cc503ee0a34816910fe582b6cc8524b01e37386012f562ca9189f0d60358464d work/p2-46-189-login-curl.patch
+#
+# 第 44 条（2026-11-05，r43 夸克恢复路径）：QuarkDriver 接 onCookieUpdate，
+#   __puus/__pus 变化即走 persistStorageCookie 落库；QuarkClient 增加 100 分钟
+#   ±5 分钟抖动的定时刷新（去 __puus 请求 /config，OPENLIST_QUARK_REFRESH_MS 仅供测试缩短）。
+#   只改 storage.ts 的构造处与 drivers/quark/{driver,util}.ts。
+#
+# 第 45 条（2026-11-05，r43 阿里云盘恢复路径）：AliyunOpenClient 增加 onTokenUpdate，
+#   刷新成功后 refresh_token/access_token 写回存储（与 Onedrive 落库口径一致）；
+#   新增 drivers/aliyundrive_open/limiter.ts（per-user 最小间隔：list 3.9/s、link 0.9/s、
+#   other 14.9/s），openApiRequest 前排队，等待 >=50ms 打一行日志。
+#
+# 第 46 条（2026-11-05，r43 天翼 189 恢复路径）：appConf.do / encryptConf.do /
+#   loginSubmit.do 三个 POST 从裸 fetch 改走 httpRequest（curl 优先、fetch 回落），
+#   三步共用一份 Netscape cookie jar（curl-http.ts 新增 -b/-c 参数）；响应体仍交回 JS 解析。
+#
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file ba71092eaf11d40d826ffa28fe450ca5112adc12006b3241896cdee450daeb0f src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file b8c98e2708d26d4677b09bfc7d7efcb95600a494ec4b83f6dc1ce9a20b81e6be src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf

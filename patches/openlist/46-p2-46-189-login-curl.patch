@@ -1,0 +1,225 @@
+diff --git a/src/backend/drivers/189/curl-http.ts b/src/backend/drivers/189/curl-http.ts
+index 9c76a28..a921005 100644
+--- a/src/backend/drivers/189/curl-http.ts
++++ b/src/backend/drivers/189/curl-http.ts
+@@ -37,6 +37,10 @@ export interface CurlHttpOptions {
+    * stdout 只留 -D - 的头块，返回的 body 恒为空串，不把整包读进内存。
+    */
+   headersOnly?: boolean
++  /** cookie 源：cookie 字符串或 jar 文件路径，传给 curl -b。 */
++  cookieSource?: string
++  /** cookie jar 文件路径，传给 curl -c；与 -b 同一文件时即读写同一罐。 */
++  cookieJar?: string
+ }
+ 
+ declare const tjs: any
+@@ -122,6 +126,10 @@ function buildArgs(url: string, options: CurlHttpOptions): string[] {
+     args.push("-H", `${name}: ${value}`)
+   }
+   if (options.body !== undefined) args.push("--data-binary", options.body)
++  // 登录三步共用一份 Netscape jar：-b 读、-c 写；与 -H Cookie 并存时
++  // curl 用自定义头，jar 继续负责跨进程携带服务端下发的 cookie。
++  if (options.cookieSource) args.push("-b", options.cookieSource)
++  if (options.cookieJar) args.push("-c", options.cookieJar)
+   args.push(url)
+   return args
+ }
+diff --git a/src/backend/drivers/189/util.ts b/src/backend/drivers/189/util.ts
+index c509a4c..bcd089f 100644
+--- a/src/backend/drivers/189/util.ts
++++ b/src/backend/drivers/189/util.ts
+@@ -266,6 +266,9 @@ export class Pan189Client {
+       manualRedirect?: boolean
+       /** 只取响应头（下载直链探针）：不把 body 读进内存。 */
+       headersOnly?: boolean
++      /** 登录三步：cookie 源（jar 路径或 cookie 串）与 jar 文件。 */
++      cookieSource?: string
++      cookieJar?: string
+     },
+   ): Promise<Response> {
+     const method = init.method || "GET"
+@@ -274,6 +277,8 @@ export class Pan189Client {
+       headers: init.headers,
+       body: init.body,
+       headersOnly: init.headersOnly,
++      cookieSource: init.cookieSource,
++      cookieJar: init.cookieJar,
+     })
+     this.lastTransport = viaCurl ? "curl" : "fetch"
+     if (!viaCurl) {
+@@ -313,6 +318,73 @@ export class Pan189Client {
+     })
+   }
+ 
++  /** 登录三步专用 cookie jar：实例内固定路径，/tmp 重启自清。 */
++  private loginJar = ""
++
++  private loginJarPath(): string {
++    if (!this.loginJar) {
++      const tmp =
++        (typeof process !== "undefined" && process.env?.TMPDIR) || "/tmp"
++      this.loginJar = `${tmp}/.openlist-189-jar-${Date.now().toString(36)}-${Math.random()
++        .toString(36)
++        .slice(2, 8)}`
++    }
++    return this.loginJar
++  }
++
++  /** 把 JS 侧按域 cookie 罐写成 curl 的 Netscape jar，供三步 POST 共用。 */
++  private async seedLoginJar(jarPath: string, cookie: string): Promise<void> {
++    const lines = ["# Netscape HTTP Cookie File"]
++    for (const part of String(cookie || "").split(";")) {
++      const trimmed = part.trim()
++      if (!trimmed) continue
++      const eq = trimmed.indexOf("=")
++      if (eq <= 0) continue
++      const name = trimmed.slice(0, eq).trim()
++      const value = trimmed.slice(eq + 1).trim()
++      if (!name) continue
++      lines.push([".189.cn", "TRUE", "/", "TRUE", "0", name, value].join("\t"))
++    }
++    const anyTjs = (globalThis as any).tjs
++    try {
++      if (anyTjs?.writeFile) {
++        await anyTjs.writeFile(jarPath, lines.join("\n") + "\n")
++      }
++    } catch (e: any) {
++      trace(`login jar write failed path=${jarPath} err=${e?.message || e}`)
++    }
++  }
++
++  private async removeLoginJar(): Promise<void> {
++    if (!this.loginJar) return
++    const jarPath = this.loginJar
++    this.loginJar = ""
++    try {
++      await (globalThis as any).tjs?.remove?.(jarPath)
++    } catch {
++      // /tmp 重启自清；删不掉不影响登录。
++    }
++  }
++
++  /**
++   * 登录 POST：curl 优先、fetch 回落（curl 不可用时 httpRequest 内回落）。
++   * Cookie 仍由 JS 侧按域罐给出；jar 让 curl 跨三个进程携带服务端下发值。
++   */
++  private async loginPost(
++    url: string,
++    headers: Record<string, string>,
++    form: URLSearchParams,
++    jarPath: string,
++  ): Promise<Response> {
++    return this.httpRequest(url, {
++      method: "POST",
++      headers,
++      body: form.toString(),
++      cookieSource: jarPath,
++      cookieJar: jarPath,
++    })
++  }
++
+   private async followRedirectsWithCookies(
+     initialUrl: string,
+     headers: Record<string, string>,
+@@ -516,23 +588,27 @@ export class Pan189Client {
+     }
+ 
+     // 1. 获取 App 配置
++    //
++    // M8：登录首跳已走 curl，但下面三个 POST 以前仍是裸 fetch；同样的
++    // TLS 栈分流会让它们落到另一条出口/静态页，重登后重发仍 check ip error。
++    // 三步统一走 httpRequest（curl 优先、fetch 回落），cookie 走同一份 jar。
++    const jarPath = this.loginJarPath()
++    await this.seedLoginJar(jarPath, this.openCookie || "")
+     const appConfStartedAt = Date.now()
+-    const appConfRes = await fetch(
++    const appConfRes = await this.loginPost(
+       "https://open.e.189.cn/api/logbox/oauth2/appConf.do",
+-      {
+-        method: "POST",
+-        headers: authHeaders(),
+-        body: new URLSearchParams({
+-          version: "2.0",
+-          appKey: appId,
+-        }),
+-      },
++      authHeaders(),
++      new URLSearchParams({
++        version: "2.0",
++        appKey: appId,
++      }),
++      jarPath,
+     )
+     await this.updateCookie(appConfRes.headers, "open.e.189.cn")
+     const appConfText = await appConfRes.text()
+     const appConf: AppConfResp189 = JSON.parse(appConfText)
+     trace(
+-      `login.post seq=${seq} step=appConf transport=fetch http=${appConfRes.status} result=${String(appConf.result)} bytes=${byteLength(appConfText)} ms=${Date.now() - appConfStartedAt} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
++      `login.post seq=${seq} step=appConf transport=${this.lastTransport} http=${appConfRes.status} result=${String(appConf.result)} bytes=${byteLength(appConfText)} ms=${Date.now() - appConfStartedAt} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
+     )
+     if (appConf.result !== "0" || !appConf.data) {
+       throw new Error(
+@@ -542,21 +618,19 @@ export class Pan189Client {
+ 
+     // 2. 获取加密配置 (公钥 & 前缀)
+     const encConfStartedAt = Date.now()
+-    const encConfRes = await fetch(
++    const encConfRes = await this.loginPost(
+       "https://open.e.189.cn/api/logbox/config/encryptConf.do",
+-      {
+-        method: "POST",
+-        headers: authHeaders(),
+-        body: new URLSearchParams({
+-          appId,
+-        }),
+-      },
++      authHeaders(),
++      new URLSearchParams({
++        appId,
++      }),
++      jarPath,
+     )
+     await this.updateCookie(encConfRes.headers, "open.e.189.cn")
+     const encConfText = await encConfRes.text()
+     const encConf: EncryptConfResp189 = JSON.parse(encConfText)
+     trace(
+-      `login.post seq=${seq} step=encryptConf transport=fetch http=${encConfRes.status} result=${String(encConf.result)} bytes=${byteLength(encConfText)} ms=${Date.now() - encConfStartedAt}`,
++      `login.post seq=${seq} step=encryptConf transport=${this.lastTransport} http=${encConfRes.status} result=${String(encConf.result)} bytes=${byteLength(encConfText)} ms=${Date.now() - encConfStartedAt}`,
+     )
+     if (encConf.result !== 0 || !encConf.data?.pubKey) {
+       throw new Error(
+@@ -594,21 +668,17 @@ export class Pan189Client {
+     }
+ 
+     const loginSubmitStartedAt = Date.now()
+-    const loginRes = await fetch(
++    const loginRes = await this.loginPost(
+       "https://open.e.189.cn/api/logbox/oauth2/loginSubmit.do",
+-      {
+-        method: "POST",
+-        headers: {
+-          ...authHeaders(),
+-        },
+-        body: new URLSearchParams(loginParams),
+-      },
++      authHeaders(),
++      new URLSearchParams(loginParams),
++      jarPath,
+     )
+     await this.updateCookie(loginRes.headers, "open.e.189.cn")
+     const loginText = await loginRes.text()
+     const loginData = JSON.parse(loginText)
+     trace(
+-      `login.submit seq=${seq} transport=fetch http=${loginRes.status} result=${String(loginData.result)} bytes=${byteLength(loginText)} ms=${Date.now() - loginSubmitStartedAt} set_cookie=${getSetCookieHeaders(loginRes.headers).length} toUrl_len=${String(loginData.toUrl || "").length} toUrl_host=${(() => { try { return new URL(String(loginData.toUrl || "")).hostname } catch { return "-" } })()} toUrl_path=${(() => { try { return new URL(String(loginData.toUrl || "")).pathname } catch { return "-" } })()} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
++      `login.submit seq=${seq} transport=${this.lastTransport} http=${loginRes.status} result=${String(loginData.result)} bytes=${byteLength(loginText)} ms=${Date.now() - loginSubmitStartedAt} set_cookie=${getSetCookieHeaders(loginRes.headers).length} toUrl_len=${String(loginData.toUrl || "").length} toUrl_host=${(() => { try { return new URL(String(loginData.toUrl || "")).hostname } catch { return "-" } })()} toUrl_path=${(() => { try { return new URL(String(loginData.toUrl || "")).pathname } catch { return "-" } })()} open_gen=${this.openCookie ? shortHash(this.openCookie) : "-"}`,
+     )
+     if (loginData.result !== 0) {
+       const msg = loginData.msg || "登录失败"
+@@ -649,6 +719,7 @@ export class Pan189Client {
+     trace(
+       `login.end seq=${seq} cookie_len=${this.cookie.length} cookie_sha8=${this.cookie ? shortHash(this.cookie) : "-"} cookie_login_user_len=${cookieValueLength(this.cookie, "COOKIE_LOGIN_USER")} open_cookie_len=${this.openCookie.length}`,
+     )
++    await this.removeLoginJar()
+   }
+ 
+   /**
