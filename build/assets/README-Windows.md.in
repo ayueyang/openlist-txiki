@@ -10,7 +10,7 @@ OpenList 的 txiki.js 移植版，单文件运行时，不需要 Node.js，也�
     run.cmd                 启动脚本（默认数据目录、首次生成口令）
     SOURCE-OFFER            AGPL-3.0 源码要约（含源码归档下载地址）
     THIRD-PARTY-NOTICES     第三方组件与许可
-    dist\                   前端静态文件（222 个，v4.2.7 lite，随包）
+    dist\                   前端静态文件（@DIST_COUNT@ 个，v4.2.7 lite，随包）
     SHA256SUMS              本目录文件校验值
 
 ## 运行

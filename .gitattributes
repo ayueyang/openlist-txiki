@@ -1,6 +1,7 @@
 patches/** -text
 LICENSE -text
 build/assets/run.cmd.in -text
+build/assets/*.in -text
 build/build-txiki.mjs -text
 build/p2-source-manifest.txt -text
 scripts/build-manifest.mjs -text

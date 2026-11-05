@@ -3,8 +3,10 @@
 """渲染 assets 模板并打 Windows zip / x86_64-linux tar.gz，全程 fail-closed。
 
 唯一模板源：本仓库 build/assets/*.in（占位符 @VERSION@、@BUNDLE_BYTES@、
-@BUNDLE_SHA256@、@TJS_BYTES@）。bundle 的字节数与 sha 由生成脚本从 --bin-dir
+@BUNDLE_SHA256@、@TJS_BYTES@、@DIST_COUNT@）。bundle 的字节数与 sha 由生成脚本从 --bin-dir
 里的 openlist-txiki.js 实算，tjs.exe 字节数同理；模板里不许写死字节数或 sha。
+dist 文件数由 --dist-count 显式给出，或由 --dist-dir 实数列出；模板含 @DIST_COUNT@
+而不给数即失败（public 脚本本身不打 dist，打包方负责传入实际打入数）。
 产物：
   <release-dir>/assets/README-Windows.md、run.cmd、run.sh、BUILD.md
   <release-dir>/openlist-txiki-<ver>-win-x64.zip
@@ -19,8 +21,9 @@ fail-closed（任一成立即 rc=1，且不留下 zip/tar）：
   T6 --license-dir 下缺 LICENSE_FILES 里的任一份全文
   T7 取不到 bundle / tjs.exe 的实算身份，或渲染后的 README 不含实算字节数与 sha
   T8 README-Windows.md 模板里写死了字节数或 sha（必须用占位符）
+  T9 模板含 @DIST_COUNT@ 但没给 --dist-count / --dist-dir，或分发的 dist 目录不存在
 
-四份许可证全文（LICENSE_FILES）各打两份：归档根目录一份，LICENSE_SUBDIR 下再一份。
+五份许可证全文（LICENSE_FILES）各打两份：归档根目录一份，LICENSE_SUBDIR 下再一份。
 包内 THIRD-PARTY-NOTICES 同时写了「见 LICENSE.AGPL-3.0」与「包内 /usr/share/openlist-txiki/」，
 两个声明都要在同一件归档内成立。
 
@@ -29,7 +32,8 @@ fail-closed（任一成立即 rc=1，且不留下 zip/tar）：
       --release-dir artifacts/release-r18-HHMM \\
       --bin-dir artifacts/release-r18-HHMM/bin \\
       --legal-dir scripts/apk \\
-      --license-dir <含四份 LICENSE.* 全文的目录，默认同 --legal-dir>
+      --license-dir <含五份 LICENSE.* 全文的目录，默认同 --legal-dir> \\
+      --dist-count <该归档实际打入的 dist 文件数，与 --dist-dir 二选一>
   --template-dir 可覆盖模板目录（负向实测用）；--render-only 只渲染不打包。
 """
 import argparse
@@ -45,7 +49,7 @@ import zipfile
 TEMPLATES = ("README-Windows.md", "run.cmd", "run.sh", "BUILD.md")
 ASSETS_IN_ARCHIVE = ("README-Windows.md", "run.cmd", "run.sh")
 VER_RE = re.compile(r"0\.1\.0-r\d+")
-PLACEHOLDERS = ("@VERSION@", "@BUNDLE_BYTES@", "@BUNDLE_SHA256@", "@TJS_BYTES@")
+PLACEHOLDERS = ("@VERSION@", "@BUNDLE_BYTES@", "@BUNDLE_SHA256@", "@TJS_BYTES@", "@DIST_COUNT@")
 SHA256_RE = re.compile(r"\b[0-9a-f]{64}\b")
 FIXED_BYTES_RE = re.compile(r"\d{1,3}(?:,\d{3})+\s*B\b")
 MTIME = 1793119200
@@ -60,6 +64,7 @@ LICENSE_FILES = (
     "LICENSE.LGPL-3.0",
     "LICENSE.Apache-2.0",
     "LICENSE.MIT",
+    "LICENSE.MIT-OpenList-Frontend",
 )
 LICENSE_SUBDIR = "usr/share/openlist-txiki"
 
@@ -83,6 +88,13 @@ def file_identity(p):
         raise RuntimeError("T7 INPUT_MISSING %s" % p)
     data = read_bytes(p)
     return len(data), sha256_bytes(data)
+
+
+def count_dist_files(d):
+    """递归数 dist 下的普通文件数（不含目录条目），与归档实际打入数同口径。"""
+    if not os.path.isdir(d):
+        raise RuntimeError("T9 DIST_DIR_MISSING %s" % d)
+    return sum(len(files) for _root, _dirs, files in os.walk(d))
 
 
 def render(template_dir, out_dir, version, subs):
@@ -191,6 +203,8 @@ def main():
     ap.add_argument("--template-dir", default=None)
     ap.add_argument("--bundle", default=None)
     ap.add_argument("--tjs-win", default=None)
+    ap.add_argument("--dist-count", type=int, default=None)
+    ap.add_argument("--dist-dir", default=None)
     ap.add_argument("--render-only", action="store_true")
     a = ap.parse_args()
 
@@ -206,6 +220,16 @@ def main():
     tjs_win_path = a.tjs_win or os.path.join(bin_dir, "tjs-x86_64-windows.exe")
 
     try:
+        readme_tpl = os.path.join(tpl_dir, "README-Windows.md.in")
+        needs_dist_count = (
+            os.path.isfile(readme_tpl)
+            and "@DIST_COUNT@" in read_bytes(readme_tpl).decode("utf-8")
+        )
+        dist_count = a.dist_count
+        if dist_count is None and a.dist_dir:
+            dist_count = count_dist_files(a.dist_dir)
+        if needs_dist_count and dist_count is None:
+            raise RuntimeError("T9 DIST_COUNT_MISSING")
         b_bytes, b_sha = file_identity(bundle_path)
         t_bytes, _ = file_identity(tjs_win_path)
         print("bundle_identity path=%s bytes=%d sha256=%s" % (bundle_path, b_bytes, b_sha))
@@ -216,6 +240,8 @@ def main():
             "@BUNDLE_SHA256@": b_sha,
             "@TJS_BYTES@": fmt_bytes(t_bytes),
         }
+        if dist_count is not None:
+            subs["@DIST_COUNT@"] = str(dist_count)
         rendered = render(tpl_dir, assets_dir, a.version, subs)
         print("render_ok templates=%d version=%s" % (len(rendered), a.version))
         for n in TEMPLATES:
