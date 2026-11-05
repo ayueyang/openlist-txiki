@@ -103,6 +103,18 @@ STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
 stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按白名单校验），然后调 `apk mkpkg` 出包。`build-manifest.json` 由
 `scripts/build-manifest.mjs` 生成（参数见该脚本头部注释）。
 
+### 发布矩阵工具
+
+`scripts/build-matrix.sh`、`build-variant.py`、`fetch-frontend.sh`、`launch-bytecode.sh` 是发布矩阵工具，出四个变体；输入缺任一项即 fail-fast：
+
+- `BASE_STAGE`：默认 `work/porter-r40/stage`，提供 bundle、tjs 与固定件
+- `work/frontend/{standard,lite}/dist`：两份前端产物（`fetch-frontend.sh` 取得）
+- `work/p2-source-manifest.txt` 与 `SPLIT_MANIFEST`（chunk 清单）
+- 钉死的 docker 镜像（`DOCKER_IMAGE`）；`BYTECODE=1` 另需 `HOSTTJS`/`TEMPLATE` 编译器与模板
+- 生成发布归档另需 `build/make-archives.py --bin-dir`（如 `bin-r43/`，含 bundle 与三目标 tjs）
+
+脚本按自身位置判定布局：位于 `scripts/apk/`（开发树）或 `scripts/`（本归档）都能运行。
+
 ## 4. 许可
 
 上游与依赖的许可证全文见归档根与 `LICENSE`；第三方组件清单见

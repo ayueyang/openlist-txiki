@@ -37,7 +37,14 @@ import shutil
 import subprocess
 import sys
 
-PROJ = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 布局自适应：开发树里本脚本在 scripts/apk/，发布归档/公开仓是 scripts/ 扁平布局。
+# 脚本目录名是 apk 时 PROJ 上跳两级，否则上跳一级；其余仓内文件一律以 SCRIPTS_DIR 为锚。
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS_DIR = HERE
+if os.path.basename(HERE) == "apk":
+    PROJ = os.path.dirname(os.path.dirname(HERE))
+else:
+    PROJ = os.path.dirname(HERE)
 IMG = os.environ.get("DOCKER_IMAGE", "alpine@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000")
 
 VERSION = os.environ.get("VERSION", "0.1.0-r40")
@@ -243,7 +250,7 @@ def build_bytecode(work, stage, log_path):
     dst = os.path.join(stage, "usr/libexec/openlist-txiki/openlist-txiki-bin")
     shutil.copyfile(out, dst)
     os.chmod(dst, 0o755)
-    runner_src = os.path.join(PROJ, "scripts/apk/launch-bytecode.sh")
+    runner_src = os.path.join(SCRIPTS_DIR, "launch-bytecode.sh")
     runner_dst = os.path.join(stage, "usr/libexec/openlist-txiki/launch-bytecode.sh")
     if not os.path.exists(runner_src):
         die("缺启动器 %s" % runner_src)
@@ -342,7 +349,7 @@ def main():
         die("index.html sha 与钉死值不符")
 
     # 2. init：仓内版本（带 TJS_BIN/BUNDLED_TJS）覆盖包内的旧 init；shared 只改两行
-    init_src_bytes = open(os.path.join(PROJ, "scripts/apk/openlist-txiki.init"), "rb").read()
+    init_src_bytes = open(os.path.join(SCRIPTS_DIR, "openlist-txiki.init"), "rb").read()
     init_dst = os.path.join(stage, "etc/init.d/openlist-txiki")
     init_bytes = init_src_bytes
     if TJS == "shared":
@@ -391,7 +398,7 @@ def main():
     print("OK   bundle %d B %s / tjs %d B %s（未重编）" % (BUNDLE_BYTES, BUNDLE_SHA, TJS_BYTES, TJS_SHA))
 
     man = os.path.join(stage, "usr/share/openlist-txiki/build-manifest.json")
-    cmd = ["node", os.path.join(PROJ, "scripts/apk/build-manifest.mjs"),
+    cmd = ["node", os.path.join(SCRIPTS_DIR, "build-manifest.mjs"),
            "--bundle", bundle, "--tjs", tjs_bin,
            "--source-manifest", os.path.join(PROJ, "work/p2-source-manifest.txt"),
            "--version", VERSION, "--inputs", str(INPUTS_COUNT),
@@ -475,13 +482,15 @@ def main():
         print("OK   shared stage 无 tjs")
     # 5. 构建两次 + cmp
     logs = []
+    scripts_rel = rel(SCRIPTS_DIR)
     for tag in ("run1", "run2"):
         out_apk = os.path.join(work, tag + ".apk")
         if os.path.exists(out_apk):
             os.remove(out_apk)
-        inner = ("STAGE=/w/%s SCRIPTS=/w/scripts/apk OUT=/w/%s VERSION=%s SHARED_TJS=%d OFFER_VERSION=%s "
-                 "BYTECODE=%s CHUNK_COUNT=%d TJS_MIN_VERSION=26.9.0 sh /w/scripts/apk/build-apk.sh") % (
-            rel(stage), rel(out_apk), VERSION, 1 if TJS == "shared" else 0, OFFER_VERSION, BYTECODE, chunk_count)
+        inner = ("STAGE=/w/%s SCRIPTS=/w/%s OUT=/w/%s VERSION=%s SHARED_TJS=%d OFFER_VERSION=%s "
+                 "BYTECODE=%s CHUNK_COUNT=%d TJS_MIN_VERSION=26.9.0 sh /w/%s/build-apk.sh") % (
+            rel(stage), scripts_rel, rel(out_apk), VERSION, 1 if TJS == "shared" else 0, OFFER_VERSION,
+            BYTECODE, chunk_count, scripts_rel)
         log = os.path.join(OUT_DIR, "raw", "build-%s-%s.log.txt" % (variant, tag))
         r, out = run(docker(inner), log)
         logs.append(log)

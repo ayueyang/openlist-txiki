@@ -1,7 +1,8 @@
 #!/bin/sh
 # 取 OpenList-Frontend 官方 dist asset（standard / lite），校验 sha256 后解开。
 #
-# 用法：sh scripts/apk/fetch-frontend.sh standard|lite <dest-dir>
+# 用法：sh <脚本所在目录>/fetch-frontend.sh standard|lite <dest-dir>
+#       （脚本在 scripts/apk/ 与 scripts/ 两种布局下都可用）
 # 产物：<dest-dir>/<asset 文件名>  与  <dest-dir>/dist/
 # 版本钉死 v4.2.7（与 build-manifest.mjs 的 WEB_PINS 同一口径）；换版本要同时改两处。
 set -eu
