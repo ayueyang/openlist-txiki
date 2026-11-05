@@ -144,10 +144,13 @@
 #   2026-11-04 r40：新增 41（115 网盘 cookie 版：storage.ts 在 115 分支内按 addition.cookie &&
 #   !addition.access_token 分派到 drivers/115cookie，proxy.ts 的 DRIVER_FORCE_PROXY 加 115cloud/115cookie）；
 #   patch_count 40->41，file_count 35->40（新增 115cookie 四个 src=repo 文件与 proxy.ts 的 src=patch 条目）。
+#   2026-11-05 P6-2e：新增 42（internal/op/share.ts 单根分支：单目录分享允许按子路径下钻，
+#   canonicalize(root + rest) 后仍过 withinShare，越界与编码残留仍 403；单文件分享根路径与多文件语义不变）。
+#   patch_count 41->42，file_count 40 不变（share.ts 与 share_path.test.ts 未登记 file 条目，靠补丁 sha 校验）。
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 41
+patch_count 42
 file_count 40
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -190,6 +193,7 @@ patch 38 d8d322310cf12fdd8dffee073198bfe1d0c2249081f24444b06ce0b809310410 work/p
 patch 39 ad87eda9b77641ff46b1a037c8ef13e39ce276dd94b5fd11ca08dbcb4a40c3f6 work/p2-39-pathdecode.patch
 patch 40 15609264ec60c266d207d8d15d199e1409b84169beffd6350095204687396d08 work/p2-40-ali-open-refresh.patch
 patch 41 e5540348718ae7256f31c79b6373b2b1272b8eba7699f16389206ca64719bfd2 work/p2-41-115cookie.patch
+patch 42 661eaf248c2e8fa6b697b36c0ca718cefa811e8c675d97ac30b6eaa868d5333a work/p2-42-share-single-dir.patch
 file 2a340db3eeb5bb164b96a0bcafbbe24b9903d6d0d2018bc1ea09ec6105207224 tsconfig.json src=upstream strip_header=no eol=keep
 file 8495a8ab4c19dafce4e0563a7681fea66d0b0202438d07201c4277fd1d945fa2 src/backend/drivers/local.ts src=patch strip_header=no eol=lf
 file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backend/internal/model/store/driver/d1.ts src=patch strip_header=no eol=crlf
@@ -209,7 +213,7 @@ file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backen
 file 7046e61818e9d85a0f6f8d740405552bcfbdd1e0430a29aa81d1e62cfac9e75a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file eb8e80d3f609573965bd74ef2ec955e16a4c26f4789bd6b23de056e5e1c2ba22 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file e61b768ee6ea2f8173bf058d29c1df407c64392992d2f1665b175e3ef1a106ae src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file 472cddeaaa10b2ef2d1f79e7e82b47f31b7dd560d03156c1fd96f5c5c6d70225 src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
@@ -221,7 +225,7 @@ file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backen
 file d50868832ba8764c755732669b7514e975b3fee1ddded29308012b834e9a79ce src/backend/txiki/guest-default.ts src=repo strip_header=yes eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
-file f7ec348dd5c0ffe7710c38c139df41b28f1d1a21f5709adc4cef4ea2937938b9 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
+file 7f69e2c9d8d19a98f60ea8bc42c3e2538105b224775cdd27e808d6d643286f78 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
 file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
