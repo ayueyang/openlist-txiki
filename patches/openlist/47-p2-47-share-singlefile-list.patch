@@ -1,0 +1,59 @@
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index a9ac75b..9a8ac1f 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -418,6 +418,54 @@ fsRouter.post("/list", async (c) => {
+       }
+ 
+       // Mapped to a real path — fall through to normal listing
++      // P6-2e：单根分享的根可能就是一个文件。listItems(文件) 在 Local 上直接
++      // ENOTDIR、在别的驱动上多为空列表，前端只看到空目录。根请求先 getItem
++      // 判形态：文件 → 单条虚拟列表；目录 → 原逻辑（目录分享行为不变）。
++      if (
++        shareRes.share &&
++        Array.isArray(shareRes.share.files) &&
++        shareRes.share.files.length === 1 &&
++        reqPath === `/@s/${shareRes.share.id}`
++      ) {
++        let rootItem: any = null
++        try {
++          rootItem = (await getItem(shareRes.realPath!, requestContext)).item
++        } catch {
++          // 取不到按原路径继续，交给 listItems 给出既有错误形态
++          rootItem = null
++        }
++        if (rootItem && !rootItem.is_dir) {
++          const segs = String(shareRes.realPath).split("/").filter(Boolean)
++          const name = segs[segs.length - 1] || String(shareRes.realPath)
++          return c.json({
++            code: 200,
++            message: "success",
++            data: {
++              content: [
++                {
++                  name,
++                  size: rootItem.size || 0,
++                  is_dir: false,
++                  created:
++                    rootItem.created ||
++                    rootItem.modified ||
++                    new Date().toISOString(),
++                  modified: rootItem.modified || new Date().toISOString(),
++                  sign: "",
++                  thumb: rootItem.thumb || "",
++                  type: rootItem.type ?? 0,
++                },
++              ],
++              total: 1,
++              readme: shareRes.share.readme || "",
++              header: shareRes.share.header || "",
++              write: false,
++              write_content_bypass: false,
++              provider: "Share",
++            },
++          })
++        }
++      }
+       const { content, provider } = await listItems(
+         shareRes.realPath!,
+         requestContext,

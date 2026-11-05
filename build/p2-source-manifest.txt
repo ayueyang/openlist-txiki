@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 46 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 47 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 46
+patch_count 47
 file_count 40
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -245,14 +245,14 @@ file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backen
 file 7046e61818e9d85a0f6f8d740405552bcfbdd1e0430a29aa81d1e62cfac9e75a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file e61b768ee6ea2f8173bf058d29c1df407c64392992d2f1665b175e3ef1a106ae src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file 25ef8c10d05897cec00c42ef23820a962bb9b16e19287ac85a677d7e1f5d383c src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file 472cddeaaa10b2ef2d1f79e7e82b47f31b7dd560d03156c1fd96f5c5c6d70225 src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file 7a6387508311cb9b5bb8fae2855a950e8d7bf28ff3f94ef4216afb61771e6f85 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file cd37c8fe865201fab6f0bc64cce3e61f08d9e3599a9f236846e569e89a81056e src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file 93468f5e401c3d98615f8f6d1d81b872c14c9be3cf5a12e738f35ee754155e61 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file d50868832ba8764c755732669b7514e975b3fee1ddded29308012b834e9a79ce src/backend/txiki/guest-default.ts src=repo strip_header=yes eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
@@ -342,3 +342,9 @@ file b9b253508a840465387e9a9e5461515aaa25864f39d072d806c1ff03fadd0a89 src/backen
 #   同批把 r27 两处带绝对行号的注释改成函数名 + 错误码的相对描述，tailLog 文档改为只接 stall / error；
 #   两处跨文件行号引用（entry.ts / httpserver.c）同步改成符号名，使注释里不再出现绝对行号。
 #   本条与第 31/32 条一样不进 apply：字节由 file src=repo 的 response-fixup.ts 条目承载。
+#
+# 第 47 条（2026-11-06，P6-2e）：src/backend/server/fs.ts 的 /api/fs/list 分享根。
+#   单根分享的根是文件时，listItems(file) 返回空列表；根请求先 getItem 判形态，
+#   文件回单条虚拟列表（total=1），目录仍走原 listItems。不改分享存储格式与子路径语义。
+#   patch_count 46->47，file_count 40 不变（fs.ts 已登记 file 条目，sha 随之重算）。
+patch 47 d4b11658aa1bc6eb83488f8aef606f30baca2b324b465d08d62a9fa142bc722e work/p2-47-share-singlefile-list.patch
