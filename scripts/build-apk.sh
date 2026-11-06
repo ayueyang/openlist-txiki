@@ -92,11 +92,18 @@ if [ "$BYTECODE" = 1 ]; then
 		echo "FAIL: BYTECODE=1 但包内缺 bytecode-identity.txt 或文件为空：$IDENT（期望 package_version=$VERSION）" >&2
 		exit 1
 	fi
-	ident_version=$(sed -n 's/^package_version=//p' "$IDENT" | head -n 1)
-	if [ -z "$ident_version" ]; then
+	# r48 B4：按字段解析，不再只取第一行。多行/重复 package_version 一律拒绝，避免第二行旧值被静默放行。
+	ident_count=$(grep -c '^package_version=' "$IDENT" || true)
+	if [ "${ident_count:-0}" -eq 0 ]; then
 		echo "FAIL: $IDENT 里读不到 package_version 行（实际：无该行；期望：package_version=$VERSION）" >&2
 		exit 1
 	fi
+	if [ "$ident_count" -ne 1 ]; then
+		echo "FAIL: $IDENT 里有 $ident_count 行 package_version（期望恰好 1 行，多行会掩盖旧值）" >&2
+		grep -n '^package_version=' "$IDENT" >&2 || true
+		exit 1
+	fi
+	ident_version=$(sed -n 's/^package_version=//p' "$IDENT")
 	if [ "$ident_version" != "$VERSION" ]; then
 		echo "FAIL: bytecode-identity.txt 的 package_version=$ident_version 与包版本 VERSION=$VERSION 不完全相等，拒绝打包（实际：$ident_version；期望：$VERSION）" >&2
 		ident_line=$(sed -n '/^package_version=/p' "$IDENT" | head -n 1)

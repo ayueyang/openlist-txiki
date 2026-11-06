@@ -552,8 +552,12 @@ def run(args):
     print("gate G1-G5 OK version=%s patch_count=%d dist_files=%d"
           % (version, cfg["patch_count"], len(dist_files)))
 
-    if "0.1.0-r" in read(os.path.join(cfg["dist"]["path"], "VERSION")).decode("utf-8", "replace"):
-        fail("DIST_VERSION_IS_PACKAGE_VERSION")
+    # r48 B5：VERSION 缺失时给明确错误码，不抛 Python 栈（此前 read() 直接 FileNotFoundError）。
+    vpath = os.path.join(cfg["dist"]["path"], "VERSION")
+    if not os.path.isfile(vpath):
+        fail("DIST_VERSION_MISSING", path=vpath)
+    if "0.1.0-r" in read(vpath).decode("utf-8", "replace"):
+        fail("DIST_VERSION_IS_PACKAGE_VERSION", path=vpath)
 
     lic = load_licenses(cfg)
     tmpdir = tempfile.mkdtemp(prefix="build-archives-")

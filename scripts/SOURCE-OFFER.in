@@ -25,10 +25,12 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
   3. 适配层 src/backend/txiki/ 全部源码；
   4. 构建入口 build/build-txiki.mjs、源码指纹清单 build/p2-source-manifest.txt、
      构建说明 docs/BUILD.md；
-  5. 打包脚本与生命周期钩子 scripts/，共 12 个文件，逐个如下：
-     build-apk.sh、build-manifest.mjs、openlist-txiki.init、
-     pre-upgrade.sh、post-upgrade.sh、pre-deinstall.sh、post-deinstall.sh、post-install.sh、
-     openlist-txiki.env.default、SOURCE-OFFER、SOURCE-OFFER.in、THIRD-PARTY-NOTICES。
+  5. 打包脚本与生命周期钩子 scripts/，共 18 个文件，逐个如下：
+     build-apk.sh、build-manifest.mjs、build-archives.py、build-archives.inputs.*.json、
+     build-matrix.sh、build-variant.py、fetch-frontend.sh、launch-bytecode.sh、
+     openlist-txiki.init、pre-upgrade.sh、post-upgrade.sh、pre-deinstall.sh、post-deinstall.sh、
+     post-install.sh、openlist-txiki.env.default、SOURCE-OFFER、SOURCE-OFFER.in、
+     THIRD-PARTY-NOTICES。
      其中 SOURCE-OFFER 与 THIRD-PARTY-NOTICES 是随包分发的法务文本，SOURCE-OFFER.in 是其
      渲染模板；发布流水线用的 pack.sh 不在归档内（只做本仓发布编排，与重建无关），
      需要时可按第三节联系方式书面索取。
@@ -51,7 +53,7 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 
 三、要约有效期与联系方式
 
-  有效期：自 2026-10-28 起至 2029-10-28（3 年）。
+  有效期：自本包分发之日起 3 年；本版分发日 2026-11-06，覆盖至 2029-11-06。
   联系人：84396@163.com（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
   两个二进制归档内不含该文件，也可从 Release 页文件名读取）。
 

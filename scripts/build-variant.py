@@ -426,7 +426,7 @@ def main():
     checks = [
         ("package_version", m["package_version"], VERSION),
         ("bundle_sha256", m["bundle_sha256"], BUNDLE_SHA),
-        ("tjs_sha256", m["tjs_sha256"], TJS_SHA),
+        ("tjs_sha256", m["tjs_sha256"], None if TJS == "shared" else TJS_SHA),
         ("patch_count", m["patch_count"], PATCH_COUNT),
         ("file_count", m["file_count"], FILE_COUNT),
         ("inputs_count", m["inputs_count"], INPUTS_COUNT),

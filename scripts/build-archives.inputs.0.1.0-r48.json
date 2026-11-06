@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0-r47",
+  "version": "0.1.0-r48",
   "patch_count": 50,
   "bundle": {
     "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r45-assets-0930/bin/openlist-txiki.js",
@@ -23,13 +23,13 @@
     "files": 452
   },
   "offer": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r47-build-1640/source/openlist-txiki-0.1.0-r47/scripts/SOURCE-OFFER",
-    "sha256": "c81797d3daa95ecb8d99ac60713afb695daf0298bd5927ce999caff1ecf8a649",
-    "bytes": 5151
+    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r48-build-0526/source/openlist-txiki-0.1.0-r48/scripts/SOURCE-OFFER",
+    "sha256": "31abe6329de2778db9fbe24959b8a2c41369c586e3099bcda7f8447cc786e3bf",
+    "bytes": 5331
   },
   "notices": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r47-build-1640/source/openlist-txiki-0.1.0-r47/scripts/THIRD-PARTY-NOTICES",
-    "sha256": "de0a464bf3d473eb6debffaba0142f57fc72eb5139b9e0f927cf1a45429545d3",
+    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r48-build-0526/source/openlist-txiki-0.1.0-r48/scripts/THIRD-PARTY-NOTICES",
+    "sha256": "bbfb11f17046b0b9518a6ee9f50b16e21a97fccb8de35a84bbf39a767dab6684",
     "bytes": 4140
   },
   "templates": {
