@@ -1,6 +1,6 @@
-# 从源码构建（openlist-txiki 0.1.0-r45）
+# 从源码构建（openlist-txiki 0.1.0-r46）
 
-本归档是 openlist-txiki 0.1.0-r45 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r46 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
@@ -108,7 +108,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r45
+VERSION=0.1.0-r46
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```

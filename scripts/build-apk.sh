@@ -80,6 +80,46 @@ if [ "$manifest_version" != "$VERSION" ]; then
 	exit 1
 fi
 
+# S5 fail-closed：包内 THIRD-PARTY-NOTICES 内容门（r46-01，CA-77 方案 A）。
+# 历史事故：r44、r45 连续两版把 lite 档的四值写进全部四件发布物（含装 standard 前端的
+# linux/win 两件），构建链只查这个文件在不在（EXPECTED 名单），不查正文，所以没人拦。
+# 四条任一不符即中止，报错打出实际命中行：
+#   ① 存在且非空；② 版本串整串命中；③ 无 @@ 残留；④ 无单档断言且档名与本包 manifest 一致。
+# ② 的锚串末尾带「（」：版本行格式固定为「本声明对应包版本：<版本>（与包内…」，
+# 不带尾锚时 VERSION=0.1.0-r4 会子串命中模板里的 0.1.0-r46，正是 r446 D1 那类漏放。
+TPN=$STAGE/usr/share/openlist-txiki/THIRD-PARTY-NOTICES
+if [ ! -f "$TPN" ] || [ ! -s "$TPN" ]; then
+	echo "FAIL: 包内缺 THIRD-PARTY-NOTICES 或为空：$TPN" >&2
+	exit 1
+fi
+if ! grep -Fq "本声明对应包版本：$VERSION（" "$TPN"; then
+	echo "FAIL: THIRD-PARTY-NOTICES 缺少整串「本声明对应包版本：$VERSION（」；实际版本行：" >&2
+	grep -n '本声明对应包版本' "$TPN" >&2 || echo "  （文件里没有版本行）" >&2
+	exit 1
+fi
+if grep -Fq '@@' "$TPN"; then
+	echo "FAIL: THIRD-PARTY-NOTICES 含未渲染占位符 @@；命中行：" >&2
+	grep -nF '@@' "$TPN" >&2
+	exit 1
+fi
+if grep -Fq '本包包含 OpenListTeam/OpenList-Frontend 的官方发布件' "$TPN"; then
+	echo "FAIL: THIRD-PARTY-NOTICES 仍有单档断言（本包包含…的官方发布件）；命中行：" >&2
+	grep -nF '本包包含 OpenListTeam/OpenList-Frontend 的官方发布件' "$TPN" >&2
+	exit 1
+fi
+if grep -Fq 'openlist-frontend-dist' "$TPN"; then
+	web_dist_archive=$(sed -n '/"web_dist"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/s/.*"archive"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1)
+	if [ -z "$web_dist_archive" ]; then
+		echo "FAIL: 从 $MANIFEST 读不到 web_dist.archive，无法核对 THIRD-PARTY-NOTICES 的档名" >&2
+		exit 1
+	fi
+	if ! grep -Fq "$web_dist_archive" "$TPN"; then
+		echo "FAIL: THIRD-PARTY-NOTICES 提到 openlist-frontend-dist，但不含本包 manifest 的 web_dist.archive=$web_dist_archive" >&2
+		grep -nF 'openlist-frontend-dist' "$TPN" >&2
+		exit 1
+	fi
+fi
+
 # B5 fail-closed：包内 SOURCE-OFFER 是把 SOURCE-OFFER.in 渲染进 stage 的成品，本脚本既不渲染也不改写它，
 # 所以这里逐条核对它确实是本次 $VERSION 的成品。三条任一不满足就中止，不带着旧版本或未替换占位符出门。
 # 历史事故：工作树里另有一份未渲染的 0.1.0-r28 残留，与包内成品并存，肉眼看不出。
