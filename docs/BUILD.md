@@ -1,6 +1,6 @@
-# 从源码构建（openlist-txiki 0.1.0-r46）
+# 从源码构建（openlist-txiki 0.1.0-r47）
 
-本归档是 openlist-txiki 0.1.0-r46 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r47 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
@@ -108,7 +108,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r46
+VERSION=0.1.0-r47
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```
@@ -117,17 +117,25 @@ STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
 stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按白名单校验），然后调 `apk mkpkg` 出包。`build-manifest.json` 由
 `scripts/build-manifest.mjs` 生成（参数见该脚本头部注释）。
 
-### 发布矩阵工具
+## 3.1 从源码归档复算桌面两件（linux tar.gz / win x64 zip）
 
-`scripts/build-matrix.sh`、`build-variant.py`、`fetch-frontend.sh`、`launch-bytecode.sh` 是发布矩阵工具，出四个变体；输入缺任一项即 fail-fast：
+归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（三份模板）、
+`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.0.1.0-r47.json`（输入锚点）：
 
-- `BASE_STAGE`：默认 `work/porter-r40/stage`，提供 bundle、tjs 与固定件
-- `work/frontend/{standard,lite}/dist`：两份前端产物（`fetch-frontend.sh` 取得）
-- `work/p2-source-manifest.txt` 与 `SPLIT_MANIFEST`（chunk 清单）
-- 钉死的 docker 镜像（`DOCKER_IMAGE`）；`BYTECODE=1` 另需 `HOSTTJS`/`TEMPLATE` 编译器与模板
-- 生成发布归档另需 `build/make-archives.py --bin-dir`（如 `bin-r43/`，含 bundle 与三目标 tjs）
+```sh
+python scripts/build-archives.py --inputs scripts/build-archives.inputs.0.1.0-r47.json   --out /tmp/desktop --renderer build/make-archives.py
+```
 
-脚本按自身位置判定布局：位于 `scripts/apk/`（开发树）或 `scripts/`（本归档）都能运行。
+- inputs.json 的字段来源：`bundle` 指第 1 节 `dist-txiki/openlist-txiki.js`，`tjs_linux`/`tjs_win`
+  指第 2 节编出的两个二进制；`dist` 是 `fetch-frontend.sh` 拉取的官方前端 dist 目录
+  （文件数/字节/树 sha256 已钉在 json 里）；`offer`/`notices` 指归档 `scripts/SOURCE-OFFER`
+  与 `scripts/THIRD-PARTY-NOTICES`；`templates.dir` 指归档 `build/assets/`。
+  路径可写绝对路径或相对当前工作目录，换机器复算时按实际位置改这几条。
+- 期望输出一行 `BUILD=PASS`，另两行给出两件的 `bytes` 与 `sha256`；任一项入身份不符即
+  `BUILD=FAIL reason=...`、exit 1，输出目录零新文件。
+- 核对方式：与同一版本的 `SHA256SUMS.txt`（或 Release 资产页）逐件 `sha256sum -c`；文件名是
+  `openlist-txiki-<version>-linux-x86_64.tar.gz` 与 `openlist-txiki-<version>-win-x64.zip`。
+- 组装器只做确定性重排与渲染，不重编 bundle、不重下 dist：要改 bundle 先走第 1 节。
 
 ## 4. 许可
 

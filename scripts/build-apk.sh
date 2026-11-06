@@ -80,6 +80,31 @@ if [ "$manifest_version" != "$VERSION" ]; then
 	exit 1
 fi
 
+# S4b fail-closed：自带 tjs 变体（BYTECODE=1）包内的 bytecode-identity.txt 必须记录本次包版本。
+# 历史缺口（r47 backlog 1，CA-78 裁决 2）：EXPECTED 名单只查这个文件在不在，不查 package_version
+# 内容，把旧 stage 的 identity 带进新包也放行。
+# 四条任一不符即中止：① 存在且非空；② 能取到 package_version 行；③ 整串等于 $VERSION
+# （不用 grep 子串或正则：VERSION=0.1.0-r4 会命中 0.1.0-r46）；④ 报错同时打出实际值与期望值，
+# 并回显该行 od -c 前 120 字节（区分 CRLF、尾部空格这类不可见差异）。
+if [ "$BYTECODE" = 1 ]; then
+	IDENT=$STAGE/usr/share/openlist-txiki/bytecode-identity.txt
+	if [ ! -f "$IDENT" ] || [ ! -s "$IDENT" ]; then
+		echo "FAIL: BYTECODE=1 但包内缺 bytecode-identity.txt 或文件为空：$IDENT（期望 package_version=$VERSION）" >&2
+		exit 1
+	fi
+	ident_version=$(sed -n 's/^package_version=//p' "$IDENT" | head -n 1)
+	if [ -z "$ident_version" ]; then
+		echo "FAIL: $IDENT 里读不到 package_version 行（实际：无该行；期望：package_version=$VERSION）" >&2
+		exit 1
+	fi
+	if [ "$ident_version" != "$VERSION" ]; then
+		echo "FAIL: bytecode-identity.txt 的 package_version=$ident_version 与包版本 VERSION=$VERSION 不完全相等，拒绝打包（实际：$ident_version；期望：$VERSION）" >&2
+		ident_line=$(sed -n '/^package_version=/p' "$IDENT" | head -n 1)
+		printf '%s\n' "$ident_line" | head -c 120 | od -c >&2 || true
+		exit 1
+	fi
+fi
+
 # S5 fail-closed：包内 THIRD-PARTY-NOTICES 内容门（r46-01，CA-77 方案 A）。
 # 历史事故：r44、r45 连续两版把 lite 档的四值写进全部四件发布物（含装 standard 前端的
 # linux/win 两件），构建链只查这个文件在不在（EXPECTED 名单），不查正文，所以没人拦。
@@ -136,6 +161,16 @@ elif [ "$SHARED_TJS" = 1 ]; then
 	exit 1
 else
 	OFFER_VERSION=$VERSION
+fi
+# S4c fail-closed：自带 tjs 变体（SHARED_TJS=0）的源码归档版本必须等于包版本。
+# 历史缺口（r47 backlog 1，CA-78 裁决 2）：OFFER_VERSION 可被调用方显式覆盖，自带版能打出
+# 「bundle 复用旧源码、offer 指向旧归档」的实验包（A2 就是这种形态）。
+# shared 变体不受此限，仍按 B5 与其自身 OFFER_VERSION 整串相等。
+# 出路：确实要指向旧归档的实验包，改用 shared 变体（SHARED_TJS=1）或另立显式实验开关；
+# 本门不提供旁路。
+if [ "$SHARED_TJS" = 0 ] && [ "$OFFER_VERSION" != "$VERSION" ]; then
+	echo "FAIL: 自带 tjs 变体的源码归档版本必须等于包版本（OFFER_VERSION=$OFFER_VERSION，VERSION=$VERSION）；确实要指向旧归档的实验包，改用 shared 变体或另立显式实验开关，不许绕过本门" >&2
+	exit 1
 fi
 OFFER=$STAGE/usr/share/openlist-txiki/SOURCE-OFFER
 [ -f "$OFFER" ] || { echo "FAIL: 缺 $OFFER" >&2; exit 1; }

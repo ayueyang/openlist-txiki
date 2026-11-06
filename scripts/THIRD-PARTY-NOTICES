@@ -1,6 +1,6 @@
 openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
 ================================================
-本声明对应包版本：0.1.0-r46（与包内 build-manifest.json 的 package_version 同值）。
+本声明对应包版本：0.1.0-r47（与包内 build-manifest.json 的 package_version 同值）。
 
 1. OpenList-Worker（AGPL-3.0-only）
    本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
@@ -17,14 +17,18 @@ openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
    上游 https://github.com/openpgpjs/openpgpjs/tree/v6.3.1 。
    LGPL 对未修改库允许以要约提供源码：源码即上述上游 tag，许可证全文见 LICENSE.LGPL-3.0。
 
-3. 运行时（全部静态链入 /usr/libexec/openlist-txiki/tjs，按各自上游许可证分发）
+3. 运行时（txiki.js 及其静态链接的第三方组件，按各自上游许可证分发）
    txiki.js（MIT）、libwebsockets（MIT，含例外条款）、QuickJS（MIT）、
    libuv（MIT）、libffi（MIT）、ada URL 解析器（Apache-2.0 OR MIT）、
    mbedtls（Apache-2.0 OR GPL-2.0-or-later，本包按 Apache-2.0 使用）、
    WAMR / wasm-micro-runtime（Apache-2.0，含 LLVM Exceptions）、
    mimalloc（MIT）、sqlite3（Public Domain）、tweetnacl（Public Domain）。
-   上述组件由 tjs 静态链接，可用字符串实测复核（wasm_runtime、mimalloc、sqlite3、
-   libuv、ada、mbedtls、quickjs、libffi 均命中）。
+   自带 tjs 的变体（Depends 不含 txiki-js）：上述组件静态链接进包内
+   /usr/libexec/openlist-txiki/tjs；
+   共用系统 tjs 的变体（Depends: txiki-js>=26.9.0）：上述组件由系统包
+   txiki-js 提供的 /usr/bin/tjs 承载，本包不含 tjs 二进制。
+   可用字符串实测复核（wasm_runtime、mimalloc、sqlite3、libuv、ada、mbedtls、
+   quickjs、libffi 均命中）；共用变体请在 /usr/bin/tjs 上核。
    mbedtls 含本项目 2026-10-22 的窄修复（TLS1.2 PSS，补丁 sha256
    cd1d269777facec3a07c3b0549c451c4b9d8278b8e4593e50fd9da85adbdae98），
    该修改的源码与构建方式见 SOURCE-OFFER；运行期完整源码树与构建记录按
