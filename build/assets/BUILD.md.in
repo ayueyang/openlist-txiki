@@ -119,7 +119,7 @@ stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按�
 
 ## 3.1 从源码归档复算桌面两件（linux tar.gz / win x64 zip）
 
-归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（三份模板）、
+归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（四份模板）、
 `scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.@VERSION@.json`（输入锚点）：
 
 ```sh
