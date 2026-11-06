@@ -1,0 +1,152 @@
+diff --git a/src/httpserver.c b/src/httpserver.c
+index fea2ae8..9d070e5 100644
+--- a/src/httpserver.c
++++ b/src/httpserver.c
+@@ -94,6 +94,7 @@ typedef struct TJSHttpRequest {
+     TBuf body_buf;
+     int method;
+     char url[2048];
++    size_t url_path_len; /* bytes of url before the '?' separator (0 if none) */
+     char remote_addr[64];
+     TJSHttpVersion http_version; /* wire protocol the request arrived over */
+     bool body_complete;
+@@ -500,7 +501,7 @@ static void tjs_http_invoke_handler(TJSHttpServer *s, TJSHttpRequest *req) {
+     }
+     req->dispatched = true;
+ 
+-    JSValue args[9];
++    JSValue args[11];
+     args[0] = JS_NewInt64(ctx, req->id);
+     args[1] = JS_NewString(ctx, tjs_http_method_name(req->method));
+     args[2] = JS_NewString(ctx, req->url);
+@@ -514,6 +515,11 @@ static void tjs_http_invoke_handler(TJSHttpServer *s, TJSHttpRequest *req) {
+     args[6] = JS_FALSE; /* not a WS upgrade */
+     args[7] = JS_NewBool(ctx, req->chunked);
+     args[8] = JS_NewString(ctx, tjs_http_version_name(req->http_version));
++    /* Pass path and query as separate JS strings.  A byte length would be
++     * wrong for JS String.prototype.slice on non-ASCII paths (UTF-8 bytes vs
++     * UTF-16 code units); JS_NewStringLen decodes the UTF-8 once. */
++    args[9] = JS_NewStringLen(ctx, req->url, req->url_path_len);
++    args[10] = JS_NewString(ctx, req->url + req->url_path_len);
+ 
+     tjs_call_handler(ctx, s->callback, countof(args), args);
+ 
+@@ -894,6 +900,12 @@ static int tjs_http_callback(struct lws *wsi, enum lws_callback_reasons reason,
+                 size_t copy_len = MIN((size_t) uri_len, sizeof(req->url) - 1);
+                 size_t copy_query_len = sizeof(req->url) - copy_len - 1;
+                 memcpy(req->url, uri_ptr, copy_len);
++                /* Remember where the path ends.  The JS layer needs the
++                 * decoded path separately from the full URL: it has to escape
++                 * '#' and '?' before handing the string to the WHATWG URL
++                 * parser, or those characters (from %23 / %3F) truncate the
++                 * path, and it exposes the untruncated path to fetch(). */
++                req->url_path_len = copy_len;
+ 
+                 if (lws_hdr_copy(wsi, req->url + copy_len + 1, copy_query_len, WSI_TOKEN_HTTP_URI_ARGS) > 0) {
+                     /* \0 ending is handled by lws_hdr_copy. */
+@@ -903,6 +915,8 @@ static int tjs_http_callback(struct lws *wsi, enum lws_callback_reasons reason,
+                 }
+             } else if (in) {
+                 strncpy(req->url, (const char *) in, sizeof(req->url) - 1);
++                req->url[sizeof(req->url) - 1] = '\0';
++                req->url_path_len = strcspn(req->url, "?"); /* 'in' may carry ?query */
+             }
+ 
+             /* Collect headers. */
+diff --git a/src/js/core/httpserver.js b/src/js/core/httpserver.js
+index 761a12b..5b21a1f 100644
+--- a/src/js/core/httpserver.js
++++ b/src/js/core/httpserver.js
+@@ -9,6 +9,33 @@ const kHopByHopHeaders = new Set([ 'transfer-encoding', 'connection', 'content-l
+ // `#private` field on a wrapper.
+ const wsUpgrades = new WeakMap();
+ 
++// The decoded request path, before the WHATWG URL parser normalizes it.
++// A decoded '#' or '?' (from %23 / %3F) would otherwise be treated as a
++// fragment/query delimiter and truncate the path.  Applications that need
++// the file-system path read this; it is the exact string lws produced.
++const kDecodedPath = Symbol.for('tjs.decodedPath');
++
++function splitUrl(url, path, query) {
++    // C passes path and query as separate strings (UTF-8 decoded by
++    // JS_NewStringLen).  The fallback is for callers that only have the
++    // combined URL, e.g. the WebSocket upgrade path.
++    const decodedPath = typeof path === 'string' ? path : url.split('?')[0];
++    const queryStr = typeof query === 'string'
++        ? query
++        : (url.includes('?') ? url.slice(url.indexOf('?')) : '');
++
++    return { decodedPath, query: queryStr };
++}
++
++function buildRequestUrl(scheme, host, decodedPath, query) {
++    // Re-encode only the two characters the URL parser treats as delimiters.
++    // '%' is left alone: `new URL()` accepts a literal '%' in a pathname.
++    const safePath = decodedPath.replace(/#/g, '%23').replace(/\?/g, '%3F');
++    const safeQuery = query.replace(/#/g, '%23');
++
++    return `${scheme}://${host}${safePath}${safeQuery}`;
++}
++
+ class Server {
+     #handle;
+     #handler;
+@@ -74,12 +101,14 @@ class Server {
+ 
+         const onRequest = (
+             requestId, method, url, headersArr, bodyBuffer, remoteAddr, isWsUpgrade, isStreaming, httpVersion,
++            path, query,
+         ) => {
+             if (isWsUpgrade) {
+-                this.#handleWsUpgrade(requestId, method, url, headersArr, remoteAddr);
++                this.#handleWsUpgrade(requestId, method, url, headersArr, remoteAddr, path, query);
+             } else {
+                 this.#handleRequest(
+                     requestId, method, url, headersArr, bodyBuffer, remoteAddr, isStreaming, httpVersion,
++                    path, query,
+                 );
+             }
+         };
+@@ -170,19 +199,21 @@ class Server {
+         return this.#handle.acceptUpgrade(upgradeId, data, headerNames, headerValues);
+     }
+ 
+-    #handleWsUpgrade(upgradeId, method, url, headersArr, remoteAddr) {
++    #handleWsUpgrade(upgradeId, method, url, headersArr, remoteAddr, path, query) {
+         const headers = Server.#parseHeaders(headersArr);
+         const host = headers.get('host') || 'localhost';
+         const scheme = this.#isTLS ? 'https' : 'http';
+-        const fullUrl = `${scheme}://${host}${url}`;
++        const parts = splitUrl(url, path, query);
++        const fullUrl = buildRequestUrl(scheme, host, parts.decodedPath, parts.query);
+         const request = new Request(fullUrl, { method, headers });
++        request[kDecodedPath] = parts.decodedPath;
+ 
+         wsUpgrades.set(request, upgradeId);
+         this.#handler(request, { server: this, remoteAddress: remoteAddr });
+         // server.upgrade(req) must have been called synchronously
+     }
+ 
+-    async #handleRequest(requestId, method, url, headersArr, bodyBuffer, remoteAddr, isStreaming, httpVersion) {
++    async #handleRequest(requestId, method, url, headersArr, bodyBuffer, remoteAddr, isStreaming, httpVersion, path, query) {
+         let headersSent = false;
+ 
+         try {
+@@ -191,7 +222,8 @@ class Server {
+             // Build Request.
+             const host = headers.get('host') || 'localhost';
+             const scheme = this.#isTLS ? 'https' : 'http';
+-            const fullUrl = `${scheme}://${host}${url}`;
++            const parts = splitUrl(url, path, query);
++            const fullUrl = buildRequestUrl(scheme, host, parts.decodedPath, parts.query);
+             const requestInit = { method, headers };
+ 
+             if (isStreaming && method !== 'GET' && method !== 'HEAD') {
+@@ -208,6 +240,7 @@ class Server {
+             }
+ 
+             const request = new Request(fullUrl, requestInit);
++            request[kDecodedPath] = parts.decodedPath;
+ 
+             // Call user handler.
+             let response = this.#handler(request, { server: this, remoteAddress: remoteAddr, httpVersion });

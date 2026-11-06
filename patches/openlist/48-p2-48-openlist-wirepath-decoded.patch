@@ -1,0 +1,25 @@
+--- a/src/backend/pkg/canonical-path.ts
++++ b/src/backend/pkg/canonical-path.ts
+@@ -66,13 +66,21 @@
+  *  - 不能用 new URL(...).pathname：WHATWG 解析会把 `%2e%2e` 折成 `..`、
+  *    把中文/空格重新百分号编码，丢掉进 fetch 时的原样字符。
+  *
+  * 返回的字符串就是上游路由看到的形态：裸 `%`、`%2e`、`%2F`、空格、中文
+  * 都保持不变；url 没有路径部分时返回 "/"。
+  */
+-export function wirePath(c: { req: { url: string } }): string {
++export function wirePath(c: { req: { url: string; raw?: any } }): string {
++  // txiki.js 的 URI 补丁把 lws 解码后的原始路径挂在 Request 上
++  // （Symbol.for("tjs.decodedPath")）。路径里的 '#' 与 '?'（来自 %23 / %3F）
++  // 在 URL 字符串里必须被百分号编码，否则 WHATWG 解析会把它当 fragment /
++  // query 起点而截断；所以切片 c.req.url 在这两种字符上不是无损视图。
++  // 其他运行时没有这个属性，走下面的字符串切片回退。
++  const decoded = c.req.raw?.[Symbol.for("tjs.decodedPath")]
++  if (typeof decoded === "string") return decoded || "/"
++
+   const url = String(c.req.url || "")
+   const start = url.indexOf("/", url.indexOf(":") + 4)
+   if (start < 0) return "/"
+   let end = url.length
+   const q = url.indexOf("?", start)
+   if (q >= 0) end = q

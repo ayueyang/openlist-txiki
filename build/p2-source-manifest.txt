@@ -4,7 +4,7 @@
 # 清单生成：2026-10-22 18:10 本地。取代 v1（v1 只列 3 个补丁、缺头部与行尾规则、缺 rename-fail-entry 来源）。
 # v3（2026-10-29）：只改三处 sha（internal/op/storage.ts、server/admin.ts、server/fs.ts）与两条 patch（23、24），
 #   其余 22 条 patch 与 29 条 file 条目逐字节未动。23 = /api/fs/list 认 refresh（缓存穿透），24 = driverConfigs 与 /driver/names 补 Local。
-# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 47 个补丁 + src/backend/txiki。
+# 构建树：reference/OpenList-Worker = OpenListTeam/OpenList-Worker @ 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca + 本清单 50 个补丁 + src/backend/txiki。
 #
 # 语法（build-txiki.mjs 逐行解析；无法解析的行、任何不符都 exit 非零，不 warn 放行）：
 #   2026-10-29 r23：新增 26（取链 HEAD 的 head_try/aborted/head_tries/head_total_ms，只加日志，控制流零改动）
@@ -155,8 +155,8 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 47
-file_count 40
+patch_count 50
+file_count 43
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -252,10 +252,11 @@ file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backen
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file 7a6387508311cb9b5bb8fae2855a950e8d7bf28ff3f94ef4216afb61771e6f85 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file 93468f5e401c3d98615f8f6d1d81b872c14c9be3cf5a12e738f35ee754155e61 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file e2a19d883ba697a079609d98c6f32e1f3f5af7772621bb76053735054b642c90 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file d50868832ba8764c755732669b7514e975b3fee1ddded29308012b834e9a79ce src/backend/txiki/guest-default.ts src=repo strip_header=yes eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
+file ae27a0ca9dfe2b71004385decc1406e57cc5584452284dfc876286ff3f56ab03 src/backend/txiki/readonly-gate.test.ts src=repo strip_header=no eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
 file 7f69e2c9d8d19a98f60ea8bc42c3e2538105b224775cdd27e808d6d643286f78 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
 file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
@@ -266,6 +267,8 @@ file bf3b415cb81fa4ad79d4174aaef7faf9d866879c5ee3761f73d817f7f9855f2c src/backen
 file 8c597387887f53129e45c45f112ac187d4fa06787f89873e339e20b943b64909 src/backend/txiki/upload-sweep.ts src=repo strip_header=yes eol=lf
 file f04d15cc749fe3c16169995a034c9f7e1f050ed93f4f1b9c82619721d83dc68c src/backend/pkg/upload-stream.ts src=patch strip_header=no eol=lf
 file b9b253508a840465387e9a9e5461515aaa25864f39d072d806c1ff03fadd0a89 src/backend/server/s3.ts src=patch strip_header=no eol=crlf
+file 6c40344aa5ef40e846d8df984311d78e87dfe6efda1f6eb81ac262ced98a3167 src/backend/pkg/canonical-path.ts src=patch strip_header=no eol=crlf
+file 96dc6de75a2f370310a13cdcfb83744be89dd519c0fcf7482311a21df87fadd7 src/backend/server/canonical-path.test.ts src=patch strip_header=no eol=crlf
 # 第 21 条（2026-10-28）：只改适配层 src/backend/txiki/config.ts（Windows 绝对路径
 # 判定与 %LOCALAPPDATA% 默认数据目录）。适配层按上面的 --exclude 口径不进 apply，
 # 其字节由 file src=repo 的 config.ts 条目承载；本条用于补丁链留痕与 sha 校验。
@@ -348,3 +351,20 @@ file b9b253508a840465387e9a9e5461515aaa25864f39d072d806c1ff03fadd0a89 src/backen
 #   文件回单条虚拟列表（total=1），目录仍走原 listItems。不改分享存储格式与子路径语义。
 #   patch_count 46->47，file_count 40 不变（fs.ts 已登记 file 条目，sha 随之重算）。
 patch 47 d4b11658aa1bc6eb83488f8aef606f30baca2b324b465d08d62a9fa142bc722e work/p2-47-share-singlefile-list.patch
+#
+# 第 48/49 条（2026-11-06，R45 路径编码落地）：wirePath 读 tjs.decodedPath；
+#   canonical-path.test.ts 增 4 正向 + 1 负向 node:test。0003/0004 必须同批。
+#   patch_count 47->49；file_count 40->42（两文件原未登记 file 条目，本轮补登）。
+patch 48 0fb061e5fef79b32435181ce30503573a5d5dab26179a9460e95a4dc53c269ab work/p2-48-openlist-wirepath-decoded.patch
+patch 49 19eac4731dd7668f6a808ff59c93e55d0d545b575641f6ef773b560c74b30380 work/p2-49-canonical-path-tests.patch
+#
+# 第 50 条（2026-11-06，R45 第 3 项）：entry.ts 的 apiReadonlyGate 补 /api/share 与
+#   /api/admin 前缀。readonly=1 下两个前缀只放行 GET/HEAD/OPTIONS 与显式读 POST
+#   白名单（admin 只有 message/get；share 没有读 POST，白名单为空），其余
+#   POST/PUT/PATCH/DELETE 一律 403；readonly=0 整体放行，与现状一致。
+#   storage/load_all 不在白名单：它会实例化驱动并触发初始化，部分驱动把刷新后的
+#   cookie 落库，属改持久配置。entry.ts 是 src=repo、apply 时被 --exclude 跳过，
+#   字节由上面的 file 条目承载，patch 50 是变更留痕（基线取 reference 树上一轮
+#   同步点，一次补齐 share+admin 两段）。
+#   patch_count 49->50；file_count 42->43（新增 readonly-gate.test.ts 的 file 条目）。
+patch 50 f0be42ada382c97783b737f87f46d665cfe22952ab265fd6f7a84c534cc782e0 work/p2-50-readonly-gate-share-admin.patch

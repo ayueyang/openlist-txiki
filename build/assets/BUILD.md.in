@@ -4,7 +4,7 @@
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
-    patches/openlist/01..47   应用侧补丁，按编号顺序累进应用
+    patches/openlist/01..50   应用侧补丁，按编号顺序累进应用
     patches/txiki/            txiki.js 运行时补丁（本归档不包含 txiki.js 源码树，见第 2 节）
     build/                    build-txiki.mjs、p2-source-manifest.txt
     scripts/                  apk 打包脚本与生命周期钩子
@@ -30,7 +30,7 @@ cd tree
 # CRLF 检出校验：必须是 2015
 grep -c $'\r' src/backend/server/fs.ts
 
-# 按清单顺序应用 47 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
+# 按清单顺序应用 50 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
 while read -r tag seq sha rel; do
   [ "$tag" = patch ] || continue
   echo "$sha  $PROJ/$rel" | sha256sum -c - || exit 1
@@ -43,9 +43,9 @@ TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txi
 sha256sum dist-txiki/openlist-txiki.js
 ```
 
-期望：预检打印「补丁 47/47（01..47 顺序与 sha 一致），指纹 88 条（file 40 + patch 47 + commit 1），
-checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,072,755 B、
-sha256 `27e5cb3a4cdf56aa39993648eb99cbccb965ddc26b9996dfa2f1f394df637e09`、inputs 447。
+期望：预检打印「补丁 50/50（01..50 顺序与 sha 一致），指纹 94 条（file 43 + patch 50 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,073,149 B、
+sha256 `947e6c7f8e9a5ac7c1961dd0f6ae847ece0308e6c32879ca4085ec52af74d02a`、inputs 447。
 
 第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
 `%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，
@@ -59,10 +59,16 @@ sha256 `27e5cb3a4cdf56aa39993648eb99cbccb965ddc26b9996dfa2f1f394df637e09`、inpu
 
 发布的 tjs 二进制由 txiki.js fork（26.9.0 基线，commit a07d6aa）加本轮运行期补丁编出：
 
-- `patches/txiki/p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`：Content-Length 请求体流式化与断连补全
-- `patches/txiki/mbedtls-tls12-pss.patch`：mbedtls TLS 1.2 PSS
-- `patches/txiki/lws-mbedtls-client-alpn-uaf.patch`、`mbedtls-quic.patch`、`wamr-zig.patch`：构建与依赖修补
-- `patches/txiki/libffi-aarch64-windows.patch`：仅 aarch64-windows 目标需要；本版发布的三目标（aarch64-linux-musl / x86_64-linux-musl / x86_64-windows）不打它
+补丁全集与逐条 apply 根/顺序见 `patches/txiki/TXIKI-PATCHES.md`。分组：
+
+- 服务端流式与背压：`s1a-c21-5.0.0.patch`（lws WebDAV 方法表 + httpserver.c）、`s1b-backpressure.patch`
+  （+ 生成物 `s1b-core.c`）、`p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`
+- 请求路径解码：`lws-uri-encoding.patch`（lws，`+` 在路径里保持字面）、`0002-txiki-decoded-path.patch`
+  （httpserver.c/js 把解码后原始路径挂给 JS；本归档对应产品侧 `patches/openlist/48`、`49`）
+- 运行时与构建：`txiki-wasm-module.patch`（A1 wasm Module 实例化）、`05-mbedtls-build-wiring.patch`
+  （把 `mbedtls-tls12-pss.patch` 接进 deps 构建）
+- 依赖与工具链：`mbedtls-tls12-pss.patch`、`lws-mbedtls-client-alpn-uaf.patch`、`mbedtls-quic.patch`、`wamr-zig.patch`
+- `libffi-aarch64-windows.patch`：仅 aarch64-windows 目标需要；本版发布的三目标（aarch64-linux-musl / x86_64-linux-musl / x86_64-windows）不打它
 
 构建（aarch64 交叉为例，Zig 0.16.0）：
 
@@ -71,8 +77,15 @@ git clone https://github.com/qwtel/txiki-js.git txiki
 cd txiki && git checkout a07d6aa19553a61d088bbfbd7ac2ae204d2761a6
 mkdir -p patches && cp ../patches/txiki/*.patch patches/
 # 应用补丁（p6、p6b 改 src/，其余改 deps/ 与构建文件；按上面列出的顺序）
-for p in patches/p6-stream-body.patch patches/p6b-abort-incomplete-body.patch \
-         patches/lws-mbedtls-client-alpn-uaf.patch patches/mbedtls-quic.patch \
+# 手工段按 TXIKI-PATCHES.md 的顺序：s1a -> s1b -> p6 -> p6b -> lws-uri-encoding -> 0002(3way)
+for p in patches/s1a-c21-5.0.0.patch patches/s1b-backpressure.patch \
+         patches/p6-stream-body.patch patches/p6b-abort-incomplete-body.patch; do
+  patch -p1 -N < "$p" || exit 1
+done
+(cd deps/libwebsockets && patch -p1 -N < ../../patches/lws-uri-encoding.patch) || exit 1
+git apply --3way patches/0002-txiki-decoded-path.patch || exit 1
+# A1 与 05：patch -p1 -N < patches/txiki-wasm-module.patch 等，见 TXIKI-PATCHES.md
+for p in patches/lws-mbedtls-client-alpn-uaf.patch patches/mbedtls-quic.patch \
          patches/mbedtls-tls12-pss.patch patches/wamr-zig.patch; do
   patch -p1 -N < "$p" || exit 1
 done
@@ -86,10 +99,11 @@ ls -l zig-out/bin/tjs
    以自身绝对路径开头的字符串）。要复现发布件的 sha256（aarch64：`4b931f66…f74693`，
    5,282,808 B），必须把树放在 `/home/admin/txiki-merged`（或用 `unshare -m` + `mount --bind`
    挂到该路径）。
-2. 本归档给的是**补丁与命令**，不含 txiki.js 的完整前置树（s1a/s1b 两笔服务端流式改动不在
-   上述补丁清单内）。因此「从空树照本节命令编出同 sha 的二进制」**未验证**；已在发布机上
-   验证的是：上述树状态 + `zig build` 冷缓存重建 58 s 得同 sha 同字节。运行期的完整源码与
-   构建记录随源码要约另行提供。
+2. 本归档给的是**补丁与命令**，不含 txiki.js 上游源码树本体（上游 tag `zig/v26.9.0` 需自行
+   克隆）。r45 起 s1a/s1b/p6/p6b/lws-uri-encoding/0002/A1/05 的补丁实体都在
+   `patches/txiki/`（`TXIKI-PATCHES.md` 列明顺序与根），不再是「不在清单内」的状态；但
+   「从空树照本节命令编出同 sha 的二进制」仍未在离线空树端到端验证，已验的是发布机上
+   同树状态冷缓存重建同 sha 同字节。
 
 ## 3. 打包 apk
 

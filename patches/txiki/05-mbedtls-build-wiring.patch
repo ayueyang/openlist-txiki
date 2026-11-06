@@ -1,0 +1,10 @@
+--- a/deps/build/mbedtls/build.zig
++++ b/deps/build/mbedtls/build.zig
+@@ -63,6 +63,7 @@
+     const source = b.path("../../mbedtls");
+ 
+     try patcher.ensureApplied(b, source, b.path("../../../patches/mbedtls-quic.patch"));
++    try patcher.ensureApplied(b, source, b.path("../../../patches/mbedtls-tls12-pss.patch"));
+     const artifacts = try add(b, source, target, optimize);
+     b.addNamedLazyPath("source", source);
+     b.installArtifact(artifacts.crypto);

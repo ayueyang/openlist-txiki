@@ -1,0 +1,21 @@
+--- a/src/js/polyfills/wasm.js
++++ b/src/js/polyfills/wasm.js
+@@ -686,10 +686,18 @@
+     }
+ 
+     async compile(src) {
++        if (src instanceof Module) {
++            return src;
++        }
++
+         return new Module(src);
+     }
+ 
+     async instantiate(src, importObject) {
++        if (src instanceof Module) {
++            return new Instance(src, importObject);
++        }
++
+         const module = await this.compile(src);
+         const instance = new Instance(module, importObject);
+ 

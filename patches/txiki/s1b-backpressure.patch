@@ -1,0 +1,476 @@
+--- a/src/httpserver.c
++++ b/src/httpserver.c
+@@ -43,6 +43,15 @@
+  * (matches H2SET_MAX_FRAME_SIZE / pt_serv_buf_size); handing lws one giant
+  * buffer with LWS_WRITE_HTTP_FINAL truncates h2 bodies larger than this. */
+ #define TJS_HTTP_WRITE_CHUNK_SIZE 16384
++/* Bytes a single writable callback may push before yielding back to lws.  One
++ * 16 KiB chunk per callback throttles a streaming body to the writable-callback
++ * rate, so drain a bounded batch per callback instead. */
++#define TJS_HTTP_WRITE_BUDGET (256 * 1024)
++/* Idle allowance for a streaming response.  lws arms a 15 s transaction
++ * watchdog when a request arrives; a body that takes longer than that to
++ * transmit is killed mid-response unless the watchdog is re-armed while the
++ * transfer is making progress. */
++#define TJS_HTTP_STREAM_IDLE_TIMEOUT 120
+ 
+ typedef enum {
+     TJS_HTTP_CHUNK_STATE_SIZE,
+@@ -113,6 +122,11 @@
+     bool streaming;
+     bool chunked_response; /* h1 streaming response framed with Transfer-Encoding: chunked */
+     struct list_head pending_writes;
++    size_t queued_bytes;    /* bytes queued in pending_writes, not yet written */
++    bool broken;            /* abort() called: close without an HTTP terminator */
++    bool drain_pending;     /* a waitDrain() promise is outstanding */
++    size_t drain_low;       /* resolve that promise once queued_bytes <= drain_low */
++    JSValue drain_resolve;  /* resolve function of that promise (JS_UNDEFINED if none) */
+     uint8_t *response_data; /* includes LWS_PRE padding */
+     size_t response_len;    /* total length including LWS_PRE + headers + body */
+     size_t response_offset; /* current send offset (relative to start of headers, i.e. LWS_PRE) */
+@@ -207,6 +221,7 @@
+         return;
+     }
+     JS_FreeValueRT(rt, req->headers_arr);
++    JS_FreeValueRT(rt, req->drain_resolve);
+     tbuf_free(&req->body_buf);
+     js_free_rt(rt, req->response_data);
+ 
+@@ -228,6 +243,43 @@
+  * the wsi for another transaction (a new req via LWS_CALLBACK_HTTP), and
+  * without this cleanup the previous req leaks until the connection closes.
+  */
++/*
++ * Settle the promise returned by HttpServer.prototype.waitDrain().  Called from
++ * the writable callback once the queue has drained to the low-water mark, and
++ * with ok=false when the connection dies or the producer aborts.
++ */
++static void tjs_http_req_settle_drain(JSContext *ctx, TJSHttpRequest *req, bool ok) {
++    if (!req->drain_pending) {
++        return;
++    }
++    req->drain_pending = false;
++
++    JSValue resolve = req->drain_resolve;
++    req->drain_resolve = JS_UNDEFINED;
++    req->drain_low = 0;
++
++    if (JS_IsFunction(ctx, resolve)) {
++        JSValue arg = JS_NewBool(ctx, ok);
++        JSValue ret = JS_Call(ctx, resolve, JS_UNDEFINED, 1, &arg);
++        if (JS_IsException(ret)) {
++            /* Nothing useful to do with it here; clear so it does not leak into
++             * the next JS entry. */
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
++        JS_FreeValue(ctx, ret);
++        JS_FreeValue(ctx, arg);
++    }
++    JS_FreeValue(ctx, resolve);
++}
++
++/* Resolve the drain promise only if the queue actually reached the low mark. */
++static void tjs_http_req_maybe_settle_drain(JSContext *ctx, TJSHttpRequest *req) {
++    if (!req->drain_pending || req->queued_bytes > req->drain_low) {
++        return;
++    }
++    tjs_http_req_settle_drain(ctx, req, true);
++}
++
+ static void tjs_http_req_complete(TJSHttpServer *s, TJSHttpRequest *req) {
+     if (!req) {
+         return;
+@@ -881,6 +933,7 @@
+ 
+             lws_set_wsi_user(wsi, req);
+             init_list_head(&req->pending_writes);
++            req->drain_resolve = JS_UNDEFINED;
+             req->wsi = wsi;
+             req->id = s->next_req_id++;
+             tbuf_init(s->ctx, &req->body_buf);
+@@ -1124,62 +1177,86 @@
+             }
+ 
+             if (req->streaming) {
+-                /* Streaming path: send the head chunk, in pieces the connection
+-                 * can flush and within the h2 send window (same constraints as
+-                 * the buffered path below). */
+-                if (list_empty(&req->pending_writes)) {
+-                    return 0;
++                /* abort() was called: the body did not complete (upstream error,
++                 * driver read failure).  Never flush anything more, in particular
++                 * not the chunked terminator, because a terminated chunked body is
++                 * a *complete* response to the client.  Returning -1 closes the
++                 * connection mid-response so the client reports a truncated body. */
++                if (req->broken) {
++                    return -1;
+                 }
+ 
+-                TJSHttpPendingWrite *pw = list_entry(req->pending_writes.next, TJSHttpPendingWrite, link);
++                /* Streaming path: drain the queue in bounded batches.  The
++                 * writable callback is the only place the queue can shrink, so
++                 * one 16 KiB write per callback throttles the transfer far below
++                 * what the link can carry (and makes a producer parked on the
++                 * high-water mark wait for many event-loop turns). */
++                size_t budget = TJS_HTTP_WRITE_BUDGET;
++
++                while (budget > 0 && !list_empty(&req->pending_writes)) {
++                    TJSHttpPendingWrite *pw = list_entry(req->pending_writes.next, TJSHttpPendingWrite, link);
++
++                    size_t to_write = MIN(pw->len - pw->sent, TJS_HTTP_WRITE_CHUNK_SIZE);
++                    if (to_write > budget) {
++                        to_write = budget;
++                    }
+ 
+-                /* One chunk per callback (see the buffered path). */
+-                size_t to_write = MIN(pw->len - pw->sent, TJS_HTTP_WRITE_CHUNK_SIZE);
++                    /* Respect the peer's HTTP/2 receive window. lws_write() does NOT
++                     * clamp to it, so writing past it overruns the window; for a body
++                     * that spans more than one window that desyncs flow control and the
++                     * transfer fails (the peer closes the connection mid-response). This
++                     * mirrors the client tx path (httpclient.c). A zero-length FINAL
++                     * (END_STREAM) carries no payload and consumes no window, so only
++                     * clamp when there is data to send. */
++                    if (to_write > 0) {
++                        lws_fileofs_t allow = lws_get_peer_write_allowance(wsi);
++                        if (allow == 0) {
++                            /* No send credit now; lws re-fires writable on WINDOW_UPDATE. */
++                            break;
++                        }
++                        if (allow > 0 && (lws_fileofs_t) to_write > allow) {
++                            to_write = (size_t) allow;
++                        }
++                    }
+ 
+-                /* Respect the peer's HTTP/2 receive window. lws_write() does NOT
+-                 * clamp to it, so writing past it overruns the window; for a body
+-                 * that spans more than one window that desyncs flow control and the
+-                 * transfer fails (the peer closes the connection mid-response). This
+-                 * mirrors the client tx path (httpclient.c). A zero-length FINAL
+-                 * (END_STREAM) carries no payload and consumes no window, so only
+-                 * clamp when there is data to send. */
+-                if (to_write > 0) {
+-                    lws_fileofs_t allow = lws_get_peer_write_allowance(wsi);
+-                    if (allow == 0) {
+-                        /* No send credit now; lws re-fires writable on WINDOW_UPDATE. */
+-                        return 0;
++                    /* FINAL only on the piece that carries this chunk's last byte
++                     * of a final chunk, so h2 sets END_STREAM on the right frame. */
++                    bool chunk_done = pw->sent + to_write >= pw->len;
++                    enum lws_write_protocol wp = (pw->is_final && chunk_done) ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;
++                    int n = lws_write(wsi, pw->data + LWS_PRE + pw->sent, to_write, wp);
++                    if (n < 0) {
++                        return -1;
+                     }
+-                    if (allow > 0 && (lws_fileofs_t) to_write > allow) {
+-                        to_write = (size_t) allow;
++                    pw->sent += (size_t) n;
++                    req->queued_bytes -= MIN(req->queued_bytes, (size_t) n);
++                    budget -= MIN(budget, (size_t) n);
++
++                    if (n > 0) {
++                        /* Progress: keep the response watchdog from firing on a
++                         * slow but healthy transfer. */
++                        lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_RESPONSE, TJS_HTTP_STREAM_IDLE_TIMEOUT);
+                     }
+-                }
+ 
+-                /* FINAL only on the piece that carries this chunk's last byte
+-                 * of a final chunk, so h2 sets END_STREAM on the right frame. */
+-                bool chunk_done = pw->sent + to_write >= pw->len;
+-                enum lws_write_protocol wp = (pw->is_final && chunk_done) ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;
+-                int n = lws_write(wsi, pw->data + LWS_PRE + pw->sent, to_write, wp);
+-                if (n < 0) {
+-                    return -1;
+-                }
+-                pw->sent += (size_t) n;
++                    if (pw->sent < pw->len) {
++                        /* Chunk only partly sent; finish it on the next callback. */
++                        break;
++                    }
+ 
+-                if (pw->sent < pw->len) {
+-                    /* Chunk only partly sent; finish it on the next callback. */
+-                    lws_callback_on_writable(wsi);
+-                    return 0;
++                    bool is_final = pw->is_final;
++                    list_del(&pw->link);
++                    js_free(s->ctx, pw->data);
++                    js_free(s->ctx, pw);
++
++                    if (is_final) {
++                        int must_close = lws_http_transaction_completed(wsi);
++                        tjs_http_req_settle_drain(s->ctx, req, true);
++                        tjs_http_req_complete(s, req);
++                        return must_close ? -1 : 0;
++                    }
+                 }
+ 
+-                bool is_final = pw->is_final;
+-                list_del(&pw->link);
+-                js_free(s->ctx, pw->data);
+-                js_free(s->ctx, pw);
+-
+-                if (is_final) {
+-                    int must_close = lws_http_transaction_completed(wsi);
+-                    tjs_http_req_complete(s, req);
+-                    return must_close ? -1 : 0;
+-                }
++                /* Wake a producer parked above the high-water mark. */
++                tjs_http_req_maybe_settle_drain(s->ctx, req);
+ 
+                 if (!list_empty(&req->pending_writes)) {
+                     lws_callback_on_writable(wsi);
+@@ -1251,6 +1328,10 @@
+                 return 0;
+             }
+ 
++            /* A producer may be parked in waitDrain(); release it so the JS
++             * reader loop can stop instead of hanging on a dead connection. */
++            tjs_http_req_settle_drain(s->ctx, req, false);
++
+             /* If streaming body was in progress, signal end-of-stream. */
+             if (req->chunked && !req->body_complete) {
+                 req->body_complete = true;
+@@ -1975,6 +2056,9 @@
+     req->responded = true;
+     req->streaming = true;
+ 
++    /* Replace the short request watchdog with the streaming one. */
++    lws_set_timeout(req->wsi, PENDING_TIMEOUT_HTTP_RESPONSE, TJS_HTTP_STREAM_IDLE_TIMEOUT);
++
+     int status;
+     if (JS_ToInt32(ctx, &status, argv[1])) {
+         return JS_EXCEPTION;
+@@ -2090,8 +2174,9 @@
+     }
+ 
+     TJSHttpRequest *req = tjs_http_find_request(s, req_id);
+-    if (!req) {
+-        return JS_UNDEFINED; /* Connection already closed, silently ignore. */
++    if (!req || req->broken) {
++        /* Connection already closed (or aborted), silently ignore. */
++        return JS_UNDEFINED;
+     }
+ 
+     bool is_final = JS_ToBool(ctx, argv[2]);
+@@ -2178,8 +2263,138 @@
+     /* Enqueue and request writable callback. */
+     init_list_head(&pw->link);
+     list_add_tail(&pw->link, &req->pending_writes);
++    req->queued_bytes += out_len;
+     lws_callback_on_writable(req->wsi);
+ 
++    /* Hand the queue depth back so the JS producer can apply backpressure. */
++    return JS_NewInt64(ctx, (int64_t) req->queued_bytes);
++}
++
++/*
++ * HttpServer.prototype.bufferedAmount(requestId)
++ *
++ * Bytes queued for this streaming response but not yet written to the socket.
++ * Returns 0 when the request is already gone.
++ */
++static JSValue tjs_httpserver_buffered_amount(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
++    TJSHttpServer *s = tjs_httpserver_get(ctx, this_val);
++    if (!s) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t req_id;
++    if (JS_ToInt64(ctx, &req_id, argv[0])) {
++        return JS_EXCEPTION;
++    }
++
++    TJSHttpRequest *req = tjs_http_find_request(s, req_id);
++    if (!req) {
++        return JS_NewInt64(ctx, 0);
++    }
++
++    return JS_NewInt64(ctx, (int64_t) req->queued_bytes);
++}
++
++/*
++ * HttpServer.prototype.waitDrain(requestId, lowWater)
++ *
++ * Resolves true once the queued bytes fall to lowWater (or below), false when
++ * the connection is gone or abort() was called, so the producer can stop.
++ */
++static JSValue tjs_httpserver_wait_drain(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
++    TJSHttpServer *s = tjs_httpserver_get(ctx, this_val);
++    if (!s) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t req_id;
++    if (JS_ToInt64(ctx, &req_id, argv[0])) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t low_water = 0;
++    if (argc > 1 && JS_ToInt64(ctx, &low_water, argv[1])) {
++        return JS_EXCEPTION;
++    }
++    if (low_water < 0) {
++        low_water = 0;
++    }
++
++    JSValue resolving_funcs[2];
++    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
++    if (JS_IsException(promise)) {
++        return JS_EXCEPTION;
++    }
++
++    TJSHttpRequest *req = tjs_http_find_request(s, req_id);
++
++    if (!req || req->broken || req->queued_bytes <= (size_t) low_water) {
++        /* Nothing to wait for: settle immediately. */
++        JSValue arg = JS_NewBool(ctx, req && !req->broken);
++        JSValue ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &arg);
++        if (JS_IsException(ret)) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
++        JS_FreeValue(ctx, ret);
++        JS_FreeValue(ctx, arg);
++        JS_FreeValue(ctx, resolving_funcs[0]);
++        JS_FreeValue(ctx, resolving_funcs[1]);
++        return promise;
++    }
++
++    /* One waiter per request: supersede an older one with false. */
++    tjs_http_req_settle_drain(ctx, req, false);
++
++    req->drain_pending = true;
++    req->drain_low = (size_t) low_water;
++    req->drain_resolve = resolving_funcs[0]; /* ownership moves into req */
++    JS_FreeValue(ctx, resolving_funcs[1]);
++
++    return promise;
++}
++
++/*
++ * HttpServer.prototype.abort(requestId)
++ *
++ * Marks a streaming response as failed and closes the connection without
++ * writing a terminator, so the client sees a truncated body (an error) instead
++ * of a well-formed but short response.
++ */
++static JSValue tjs_httpserver_abort(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
++    TJSHttpServer *s = tjs_httpserver_get(ctx, this_val);
++    if (!s) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t req_id;
++    if (JS_ToInt64(ctx, &req_id, argv[0])) {
++        return JS_EXCEPTION;
++    }
++
++    TJSHttpRequest *req = tjs_http_find_request(s, req_id);
++    if (!req) {
++        return JS_UNDEFINED;
++    }
++
++    req->broken = true;
++
++    /* Drop anything queued, above all a pending final chunk: the zero-length
++     * chunk terminating a chunked body would make the short body look
++     * complete. */
++    struct list_head *el, *el1;
++    list_for_each_safe(el, el1, &req->pending_writes) {
++        TJSHttpPendingWrite *pw = list_entry(el, TJSHttpPendingWrite, link);
++        list_del(&pw->link);
++        js_free(ctx, pw->data);
++        js_free(ctx, pw);
++    }
++    req->queued_bytes = 0;
++    tjs_http_req_settle_drain(ctx, req, false);
++
++    /* Outside the protocol callback: LWS_TO_KILL_ASYNC force-closes at the next
++     * timeout check. */
++    lws_wsi_close(req->wsi, LWS_TO_KILL_ASYNC);
++
+     return JS_UNDEFINED;
+ }
+ 
+@@ -2360,6 +2575,9 @@
+     TJS_CFUNC_DEF("sendResponse", 4, tjs_httpserver_send_response),
+     TJS_CFUNC_DEF("sendHeaders", 3, tjs_httpserver_send_headers),
+     TJS_CFUNC_DEF("sendBody", 3, tjs_httpserver_send_body),
++    TJS_CFUNC_DEF("bufferedAmount", 1, tjs_httpserver_buffered_amount),
++    TJS_CFUNC_DEF("waitDrain", 2, tjs_httpserver_wait_drain),
++    TJS_CFUNC_DEF("abort", 1, tjs_httpserver_abort),
+     TJS_CFUNC_DEF("acceptUpgrade", 4, tjs_httpserver_accept_upgrade),
+ };
+ 
+--- a/src/js/core/httpserver.js
++++ b/src/js/core/httpserver.js
+@@ -4,6 +4,13 @@
+ // Hop-by-hop headers managed by lws; must not be passed through for streaming responses.
+ const kHopByHopHeaders = new Set([ 'transfer-encoding', 'connection', 'content-length', 'keep-alive' ]);
+ 
++// Streaming response backpressure.  The C layer queues body chunks until the
++// socket can take them, so the producer must stop reading the source stream
++// once the queue is deep, and resume only after it has drained: without this
++// the whole file is buffered in memory before the first byte leaves.
++const kStreamHighWater = 512 * 1024;
++const kStreamLowWater = 128 * 1024;
++
+ // Pending WebSocket upgrade IDs are attached to the Request handed to the user.
+ // Request is a foreign class we don't own, so a WeakMap is used rather than a
+ // `#private` field on a wrapper.
+@@ -239,7 +246,7 @@
+                 headersSent = true;
+ 
+                 const reader = response.body.getReader();
+-
++                let aborted = false;
+ 
+                 while (true) {
+                     const { done, value } = await reader.read();
+@@ -249,7 +256,29 @@
+                         break;
+                     }
+ 
+-                    this.#handle.sendBody(requestId, value, false);
++                    const queued = this.#handle.sendBody(requestId, value, false);
++
++                    if (queued === undefined) {
++                        // Request already gone (connection closed).
++                        aborted = true;
++                        break;
++                    }
++
++                    if (queued > kStreamHighWater) {
++                        const drained = await this.#handle.waitDrain(requestId, kStreamLowWater);
++
++                        if (!drained) {
++                            // Connection closed or abort()ed while we waited.
++                            aborted = true;
++                            break;
++                        }
++                    }
++                }
++
++                if (aborted) {
++                    reader.cancel().catch(() => {});
++
++                    this.#handle.abort(requestId);
+                 }
+             } else {
+                 // Buffered: read entire body and send at once.
+@@ -265,9 +294,12 @@
+             }
+         } catch (_error) {
+             if (headersSent) {
+-                // Headers already sent, close the stream.
++                // Headers already sent and the body did not complete: close the
++                // connection instead of writing the final chunk. A terminated
++                // chunked body is a valid, complete response, so flushing the
++                // terminator here would hand the client a silently short file.
+                 try {
+-                    this.#handle.sendBody(requestId, null, true);
++                    this.#handle.abort(requestId);
+                 } catch {
+                     // Nothing we can do.
+                 }

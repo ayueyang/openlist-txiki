@@ -1,0 +1,39 @@
+diff --git a/src/backend/server/canonical-path.test.ts b/src/backend/server/canonical-path.test.ts
+index a381634..13dd4b2 100644
+--- a/src/backend/server/canonical-path.test.ts
++++ b/src/backend/server/canonical-path.test.ts
+@@ -129,3 +129,34 @@ test("wirePath：只切字符串、不再解码", () => {
+     assert.equal(wirePath({ req: { url } }), want, `wirePath(${url})`)
+   }
+ })
++
++test("wirePath：有 tjs.decodedPath 时优先使用（# / ? 不被截断）", () => {
++  // 运行时把 lws 解码后的原始路径挂在 Request 上（Symbol.for("tjs.decodedPath")）。
++  // 这里的 decoded 是补丁 0002 传给 JS 的那个字符串；url 是转义后的 URL 形态。
++  const sym = Symbol.for("tjs.decodedPath")
++  const table: Array<[string, string, string]> = [
++    ["http://h/a%23b.txt", "/a#b.txt", "/a#b.txt"],
++    ["http://h/a%3Fb.txt", "/a?b.txt", "/a?b.txt"],
++    ["http://h/100%.txt", "/100%.txt", "/100%.txt"],
++    ["http://h", "", "/"],
++  ]
++  for (const [url, decoded, want] of table) {
++    const req = { url, raw: { [sym]: decoded } } as any
++    assert.equal(wirePath({ req }), want, `wirePath(${url}, decoded=${JSON.stringify(decoded)})`)
++  }
++})
++
++test("wirePath：没有 tjs.decodedPath 时回退表不变（负向）", () => {
++  const table: Array<[string, string]> = [
++    ["http://h/dav/t/pub/100%.txt", "/dav/t/pub/100%.txt"],
++    ["http://h/100%25.txt", "/100%25.txt"],
++    ["http://h/a%2Fb.txt", "/a%2Fb.txt"],
++    ["http://h/中文 x.txt", "/中文 x.txt"],
++    ["http://h/x?a=1#f", "/x"],
++    ["http://h", "/"],
++  ]
++  for (const [url, want] of table) {
++    const req = { url, raw: undefined } as any
++    assert.equal(wirePath({ req }), want, `fallback wirePath(${url})`)
++  }
++})

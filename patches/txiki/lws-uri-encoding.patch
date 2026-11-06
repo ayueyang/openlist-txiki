@@ -1,0 +1,38 @@
+diff --git a/lib/roles/http/parsers.c b/lib/roles/http/parsers.c
+index 15ffb37..364c37a 100644
+--- a/lib/roles/http/parsers.c
++++ b/lib/roles/http/parsers.c
+@@ -909,8 +909,15 @@ lws_parse_urldecode(struct lws *wsi, uint8_t *_c)
+ 		if (c == '=' && !enc)
+ 			ah->post_literal_equal = 1;
+ 
+-		/* + to space */
+-		if (c == '+' && !enc) {
++		/*
++		 * '+' is a literal plus in the path (RFC 3986); only the query
++		 * string uses application/x-www-form-urlencoded semantics, where
++		 * '+' means space.  Decoding it in the path turns a legal file
++		 * name such as "a+b.txt" into "a b.txt" before the application
++		 * ever sees it.
++		 */
++		if (c == '+' && !enc &&
++		    ah->frag_index[WSI_TOKEN_HTTP_URI_ARGS]) {
+ 			c = ' ';
+ 			*_c = c;
+ 		}
+@@ -1564,7 +1571,14 @@ set_parsing_complete:
+ forbid:
+ 	lwsl_info(" forbidding on uri sanitation\n");
+ #if defined(LWS_WITH_SERVER)
+-	lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, NULL);
++	/*
++	 * Every path that reaches here is a malformed request line (invalid
++	 * percent escape, NUL, truncated escape, unknown method), not an
++	 * authorization failure.  RFC 9110 calls that 400 Bad Request; Go's
++	 * net/http also answers 400 for a bare '%'.  Keep 403 for real
++	 * policy denials elsewhere.
++	 */
++	lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, NULL);
+ #endif
+ 
+ 	return LPR_FORBIDDEN;

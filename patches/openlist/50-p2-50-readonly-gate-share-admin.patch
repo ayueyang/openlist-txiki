@@ -1,0 +1,84 @@
+diff --git a/src/backend/txiki/entry.ts b/src/backend/txiki/entry.ts
+index e8ac47a..84adbff 100644
+--- a/src/backend/txiki/entry.ts
++++ b/src/backend/txiki/entry.ts
+@@ -127,6 +127,9 @@ function davGate(req: Request, readonly: boolean): Response | null {
+  * /dav 由上面的 davGate 按方法白名单拦；这里管 API 侧：
+  *   - /api/fs：默认拒绝，只放行 GET/HEAD/OPTIONS 与 7 条核心读 POST；
+  *   - /api/task：默认拒绝，只放行 GET/HEAD/OPTIONS 与 1 条纯读 POST（copy/info）；
++ *   - /api/share：默认拒绝，只放行 GET/HEAD/OPTIONS（读只有 GET /list、/get，
++ *     没有读 POST，白名单为空）；
++ *   - /api/admin：默认拒绝，只放行 GET/HEAD/OPTIONS 与 1 条纯读 POST（message/get）；
+  *   - /s3/* 的写方法：S3 网关的 PutObject / DeleteObject。
+  *
+  * 只拦入口，不改上游业务代码，也不依赖上游权限位。选 403 不选 405：路由和
+@@ -141,6 +144,12 @@ function davGate(req: Request, readonly: boolean): Response | null {
+  *
+  * seed 的 capabilities 与 parse 是只读 POST，但 P1 用不到 seed，一起关；P2 需要
+  * 时再加白名单，不许在门里悄悄放行。
++ *
++ * /api/admin 的 38 条 POST 都是管理写（storage/setting/meta/cache/index/scan/
++ * plugin/message/audit）。唯一放行的是 message/get：只从进程内 messageQueue
++ * 取一条消息，不碰数据库与持久配置。storage/load_all 名字像读，实际会对每个
++ * 存储实例化驱动并触发初始化（登录/刷新令牌，部分驱动把新 cookie 落库），
++ * 会改持久配置，所以不放行。
+  */
+ const READONLY_MESSAGE = "read-only deployment: write operations are disabled in P1"
+ const S3_WRITE_METHODS = new Set(["PUT", "POST", "PATCH", "DELETE"])
+@@ -162,6 +171,13 @@ const FS_READ_POST = new Set([
+  */
+ const TASK_READ_POST = new Set(["/api/task/copy/info"])
+ 
++/**
++ * /api/admin 下允许的只读 POST：只有 message/get（进程内消息队列出队，不读写
++ * 数据库、不改持久配置）。storage/load_all 会实例化驱动并触发登录/令牌刷新
++ * （部分驱动把新 cookie 写回存储配置），不在白名单。
++ */
++const ADMIN_READ_POST = new Set(["/api/admin/message/get"])
++
+ /**
+  * 归一化 pathname：能解码就解码（防 %2F 绕过），合并重复斜杠、去掉末尾斜杠。
+  * 只用于入口判定，不改变转发给 Hono 的原始请求。
+@@ -182,7 +198,7 @@ function gatePath(req: Request): string {
+ }
+ 
+ function apiReadonlyGate(req: Request, readonly: boolean): Response | null {
+-  // readonly=0：/api/fs 与 /s3 写门整体放行，写不写由上游权限与驱动决定。
++  // readonly=0：/api/fs、/api/share、/api/admin 与 /s3 写门整体放行，写不写由上游权限与驱动决定。
+   if (!readonly) return null
+   const pathname = gatePath(req)
+   if (!pathname) return null
+@@ -198,6 +214,33 @@ function apiReadonlyGate(req: Request, readonly: boolean): Response | null {
+       { status: 403, headers: { "Content-Type": "application/json" } },
+     )
+   }
++  // P6-2e2：分享管理的写路由（create/update/delete/enable/disable）此前不在门里，
++  // READONLY=1 时仍能建分享并落库（S14）。GET/HEAD/OPTIONS 放行，其余方法一律 403。
++  if (pathname === "/api/share" || pathname.startsWith("/api/share/")) {
++    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
++      return null
++    }
++    return new Response(
++      JSON.stringify({ code: 403, message: READONLY_MESSAGE, data: null }),
++      { status: 403, headers: { "Content-Type": "application/json" } },
++    )
++  }
++  // R45 第 3 项（0730 派工）：/api/admin 的 38 条 POST 全是管理写（storage/
++  // setting/meta/cache/index/scan/plugin/message/audit），此前完全没拦；
++  // READONLY=1 下 admin token 可直接改库、装插件、重建索引。GET/HEAD/OPTIONS
++  // 放行，POST 只放 message/get（进程内队列出队，不改持久配置），其余 403。
++  if (pathname === "/api/admin" || pathname.startsWith("/api/admin/")) {
++    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
++      return null
++    }
++    if (req.method === "POST" && ADMIN_READ_POST.has(pathname)) {
++      return null
++    }
++    return new Response(
++      JSON.stringify({ code: 403, message: READONLY_MESSAGE, data: null }),
++      { status: 403, headers: { "Content-Type": "application/json" } },
++    )
++  }
+   if (pathname === "/api/task" || pathname.startsWith("/api/task/")) {
+     // 查询（undone/done）走 GET；copy/info 是纯读 POST；其余 POST（建任务/取消/
+     // 删除/清理）在只读部署下拒绝。readonly=0 已在上面提前返回，这里够不到。
