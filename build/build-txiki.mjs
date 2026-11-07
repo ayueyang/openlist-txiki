@@ -198,7 +198,7 @@ function normalizeEol(text, eol) {
  * 源码指纹预检 v2（fail-closed，2026-10-22 P3-1b 补齐三个缺口）。
  *
  * 输入 work/p2-source-manifest.txt（manifest_version 3）：
- *   - 50 个补丁的 sha256 与应用顺序（patch <序号>）；
+ *   - 52 个补丁的 sha256 与应用顺序（patch <序号>）；
  *   - 28 条源码指纹，每条带 src=（upstream/repo/patch/显式路径）、strip_header=、eol=；
  *   - rename-fail-entry.ts 的来源固定为 work/fault/rename-fail-entry.ts。
  *
@@ -276,7 +276,7 @@ function verifySourceManifest() {
   if (!entries.files.length) problems.push("清单缺少 file 条目")
   if (entries.patchCount !== entries.patches.length) problems.push("patch_count " + entries.patchCount + " 与实际 patch 条目 " + entries.patches.length + " 不符")
   if (entries.fileCount !== entries.files.length) problems.push("file_count " + entries.fileCount + " 与实际 file 条目 " + entries.files.length + " 不符")
-  if (entries.patches.length !== 50) problems.push("补丁栈应为 50 个，实际 " + entries.patches.length + " 个")
+  if (entries.patches.length !== 52) problems.push("补丁栈应为 52 个，实际 " + entries.patches.length + " 个")
   entries.patches.forEach((p, idx) => {
     const want = String(idx + 1).padStart(2, "0")
     if (p.seq !== want) problems.push("补丁顺序断档：第 " + (idx + 1) + " 条序号 " + p.seq + "，期望 " + want)
@@ -329,7 +329,7 @@ function verifySourceManifest() {
     const abs = path.join(root, e.rel)
     if (e.src === "patch") {
       if (!fs.existsSync(abs)) {
-        problems.push(e.rel + ": 补丁产物缺失（50 个补丁是否按清单顺序 apply 过？）")
+        problems.push(e.rel + ": 补丁产物缺失（52 个补丁是否按清单顺序 apply 过？）")
         continue
       }
       const before = fs.readFileSync(abs)
@@ -406,7 +406,7 @@ function verifySourceManifest() {
       entries.commit.slice(0, 8) +
       "，补丁 " +
       entries.patches.length +
-      "/50（01..50 顺序与 sha 一致），指纹 " +
+      "/52（01..52 顺序与 sha 一致），指纹 " +
       info.fingerprint_entries +
       " 条（file " +
       info.fingerprint_files +
@@ -464,7 +464,50 @@ function assert189TransportInPlace() {
   }
   console.error("189 传输栈在位断言通过：curl-http.ts 存在，util.ts 含 httpRequest，curl-http.ts 含 headersOnly")
 }
+
+/**
+ * Q1/Q2 在位断言（2026-11-07，r51）：manifest 只校验补丁文件自身的 sha256，
+ * 不校验补丁是否真的 apply 过。补丁 51/52 改的四个文件都不在 file 条目里，
+ * 漏打就会静默出包，所以这里按标记逐个检查，缺一个就非零退出。
+ */
+function assertDriverPatchesInPlace() {
+  const problems = []
+  const read = (rel) => {
+    const p = path.join(root, rel)
+    return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : ""
+  }
+  const quarkUtil = read("src/backend/drivers/quark/util.ts")
+  const quarkDriver = read("src/backend/drivers/quark/driver.ts")
+  const storageTs = read("src/backend/internal/op/storage.ts")
+  const aliUtil = read("src/backend/drivers/aliyundrive_open/util.ts")
+  if (!quarkUtil.includes("noRotationStreak")) {
+    problems.push("quark/util.ts 不含 noRotationStreak（补丁 51 未落地）")
+  }
+  if (!quarkUtil.includes("isAutoRefreshRunning")) {
+    problems.push("quark/util.ts 不含 isAutoRefreshRunning（补丁 51 未落地）")
+  }
+  if (!quarkDriver.includes("stop(): void")) {
+    problems.push("quark/driver.ts 不含 stop()（补丁 51 未落地）")
+  }
+  if (!storageTs.includes("stopCachedDriver")) {
+    problems.push("storage.ts 不含 stopCachedDriver（补丁 51 未落地）")
+  }
+  if (!aliUtil.includes("refreshPromise")) {
+    problems.push("aliyundrive_open/util.ts 不含 refreshPromise（补丁 52 未落地）")
+  }
+  if (!aliUtil.includes("AliyunRefreshSubMismatchError")) {
+    problems.push("aliyundrive_open/util.ts 不含 sub 校验（补丁 52 未落地）")
+  }
+  if (problems.length) {
+    console.error("FAIL: Q1/Q2 驱动补丁在位断言不通过（" + problems.length + " 项）— 构建中止")
+    for (const p of problems) console.error("  - " + p)
+    process.exit(1)
+  }
+  console.error("Q1/Q2 驱动补丁在位断言通过：quark 刷新生命周期 + 阿里刷新退避/sub 校验")
+}
+
 assert189TransportInPlace()
+assertDriverPatchesInPlace()
 
 if (process.env.TXIKI_PRECHECK_ONLY) {
   console.error("TXIKI_PRECHECK_ONLY=1：预检通过，跳过 esbuild")

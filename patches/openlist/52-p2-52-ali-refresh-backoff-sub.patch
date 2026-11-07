@@ -1,0 +1,323 @@
+diff --git a/src/backend/drivers/aliyundrive_open/util.ts b/src/backend/drivers/aliyundrive_open/util.ts
+index d37e488..25a81e9 100644
+--- a/src/backend/drivers/aliyundrive_open/util.ts
++++ b/src/backend/drivers/aliyundrive_open/util.ts
+@@ -16,6 +16,38 @@ export interface AliyunTokenUpdate {
+ 
+ const ALI_OPEN_API = "https://openapi.aliyundrive.com/adrive/v1.0"
+ 
++// 刷新等待上限：单次等 15 秒、整轮 30 秒（alist 同口径），防止一次用户请求
++// 被多个限流端点拖死。
++const MAX_REFRESH_WAIT_MS = 15_000
++const MAX_REFRESH_TOTAL_MS = 30_000
++
++/** sub 不一致是终止错误，不能被当成「这个端点不行」吞掉。 */
++class AliyunRefreshSubMismatchError extends Error {}
++
++/** 整轮刷新超预算，直接终止，不再换端点。 */
++class AliyunRefreshBudgetExceededError extends Error {}
++
++function parseRetryAfter(header: string | null): number {
++  if (!header) return 0
++  const s = header.trim()
++  if (/^\d+$/.test(s)) return Math.min(Number(s) * 1000, MAX_REFRESH_WAIT_MS)
++  const at = Date.parse(s)
++  if (Number.isFinite(at)) return Math.max(0, Math.min(at - Date.now(), MAX_REFRESH_WAIT_MS))
++  return 0
++}
++
++function isRetryableStatus(status: number): boolean {
++  return status === 429 || status >= 500
++}
++
++/** 日志与错误文案里抹掉 refresh_token 值，避免泄密（验收 A10）。 */
++function redactTokenEcho(text: string): string {
++  return String(text || "").replace(
++    /("?refresh_token"?\s*[:=]\s*"?)([^"&\s,}]+)/gi,
++    "$1***",
++  )
++}
++
+ // ============================================================
+ // AliyunOpenClient - 阿里云盘 OAuth2 OpenAPI 客户端
+ // 优先通过在线 API 中转：自定义中转先 POST JSON，失败退回 GET + query params；
+@@ -111,7 +143,64 @@ export class AliyunOpenClient {
+     }
+   }
+ 
++  private refreshPromise: Promise<void> | null = null
++  private subCheckWarned = false
++
++  /**
++   * 单飞（Q2/F2）：同一实例同一时刻只允许一个刷新在飞，其他调用等同一个
++   * Promise，避免并发 401 把刷新请求放大成 429。
++   */
+   public async refreshAccessToken(): Promise<void> {
++    if (this.refreshPromise) return this.refreshPromise
++    this.refreshPromise = this.doRefreshAccessToken().finally(() => {
++      this.refreshPromise = null
++    })
++    return this.refreshPromise
++  }
++
++  /** JWT payload 的 sub；不是 JWT 返回 null。只解码不验签（F1）。 */
++  private static jwtSub(token: string): string | null {
++    const parts = (token || "").split(".")
++    if (parts.length !== 3) return null
++    try {
++      const payload = JSON.parse(
++        Buffer.from(
++          parts[1].replace(/-/g, "+").replace(/_/g, "/"),
++          "base64",
++        ).toString("utf8"),
++      )
++      return typeof payload?.sub === "string" ? payload.sub : null
++    } catch {
++      return null
++    }
++  }
++
++  /** 成功后统一赋值并落库；sub 校验不通过时不赋值、不落库。 */
++  private async applyTokens(
++    newAccess: string,
++    newToken: string,
++    expiresIn?: number,
++  ): Promise<void> {
++    const oldSub = AliyunOpenClient.jwtSub(this.refreshTokenVal)
++    const newSub = newToken ? AliyunOpenClient.jwtSub(newToken) : null
++    if (oldSub && newSub && oldSub !== newSub) {
++      throw new AliyunRefreshSubMismatchError(
++        `[AliyundriveOpen] refresh token subject mismatch: old=${oldSub.slice(0, 8)} new=${newSub.slice(0, 8)}`,
++      )
++    }
++    if (!oldSub && !newSub && !this.subCheckWarned) {
++      this.subCheckWarned = true
++      console.warn(
++        "[AliyundriveOpen] refresh token is not a JWT; sub check skipped",
++      )
++    }
++    this.accessToken = newAccess
++    if (newToken) this.refreshTokenVal = newToken
++    this.tokenExpiresAt = Date.now() + (expiresIn || 7200) * 1000 - 60000
++    await this.emitTokenUpdate()
++  }
++
++  private async doRefreshAccessToken(): Promise<void> {
+     if (!this.refreshTokenVal || !this.refreshTokenVal.trim()) {
+       return
+     }
+@@ -153,17 +242,24 @@ export class AliyunOpenClient {
+ 
+     const driverTxt =
+       this.addition.alipan_type === "alipanTV" ? "alicloud_tv" : "alicloud_qr"
++    const startedAtTotal = Date.now()
++    let lastRetryAfterMs = 0
+ 
+     for (const api of onlineApis) {
++      if (Date.now() - startedAtTotal > MAX_REFRESH_TOTAL_MS) {
++        console.warn(
++          `[AliyundriveOpen] refresh budget exceeded before endpoint=${api.url}`
++        )
++        throw new AliyunRefreshBudgetExceededError(
++          "[AliyundriveOpen] refresh budget exceeded",
++        )
++      }
+       const apiUrl = api.url
+-      try {
+-        // POST 分支同样过 SSRF 校验，不因换方法绕过
+-        if (api.post) {
+-          assertSafeUrl(apiUrl, "AliyundriveOpen token endpoint")
+-        }
+-        let res: Response
++      const mode = api.post ? "POST" : "GET"
++      // 同一端点的 POST/GET 两种形态共用一份请求构造，429 重试只重发一次。
++      const doFetch = (): Promise<Response> => {
+         if (api.post) {
+-          res = await fetch(apiUrl, {
++          return fetch(apiUrl, {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+             body: JSON.stringify({
+@@ -171,23 +267,57 @@ export class AliyunOpenClient {
+               refresh_token: token,
+             }),
+           })
+-        } else {
+-          const params = new URLSearchParams({
+-            refresh_ui: token,
+-            refresh_token: token,
+-            server_use: "true",
+-            driver_txt: driverTxt,
+-          })
+-          res = await fetch(`${apiUrl}?${params.toString()}`, {
+-            method: "GET",
+-            headers: { "Content-Type": "application/json" },
+-          })
++        }
++        const params = new URLSearchParams({
++          refresh_ui: token,
++          refresh_token: token,
++          server_use: "true",
++          driver_txt: driverTxt,
++        })
++        return fetch(`${apiUrl}?${params.toString()}`, {
++          method: "GET",
++          headers: { "Content-Type": "application/json" },
++        })
++      }
++      try {
++        // POST 分支同样过 SSRF 校验，不因换方法绕过
++        if (api.post) {
++          assertSafeUrl(apiUrl, "AliyundriveOpen token endpoint")
++        }
++        const startedAt = Date.now()
++        let res = await doFetch()
++        if (res.status === 429) {
++          const waitMs = parseRetryAfter(res.headers.get("retry-after"))
++          console.warn(
++            `[AliyundriveOpen] refresh 429 endpoint=${apiUrl} wait_ms=${waitMs}`,
++          )
++          if (waitMs > 0) {
++            await new Promise((r) => setTimeout(r, waitMs))
++          }
++          if (Date.now() - startedAtTotal > MAX_REFRESH_TOTAL_MS) {
++            throw new AliyunRefreshBudgetExceededError(
++              "[AliyundriveOpen] refresh budget exceeded",
++            )
++          }
++          // 同一端点只重试一次；再失败就换下一个端点。
++          res = await doFetch()
+         }
+         if (!res.ok) {
++          const retryable = isRetryableStatus(res.status)
+           const detail = await res.text().catch(() => "")
+-          throw new Error(
+-            `[Status ${res.status}]${detail ? " " + detail.slice(0, 200) : ""}`,
++          console.warn(
++            `[AliyundriveOpen] refresh failed endpoint=${apiUrl} status=${res.status} ` +
++              `retryable=${retryable} elapsed_ms=${Date.now() - startedAt}`,
+           )
++          if (res.status === 429) {
++            lastRetryAfterMs = parseRetryAfter(res.headers.get("retry-after"))
++          }
++          if (detail) {
++            console.warn(
++              `[AliyundriveOpen] refresh detail ${redactTokenEcho(detail).slice(0, 200)}`,
++            )
++          }
++          continue
+         }
+         const data: any = await res.json()
+         const newToken: string =
+@@ -196,19 +326,16 @@ export class AliyunOpenClient {
+           data.access_token || data.data?.access_token || ""
+         if (!newAccess) {
+           throw new Error(
+-            `Empty access_token from online API: ${JSON.stringify(data)}`,
++            `Empty access_token from online API: ${redactTokenEcho(JSON.stringify(data)).slice(0, 200)}`,
+           )
+         }
+-        this.accessToken = newAccess
+-        if (newToken) this.refreshTokenVal = newToken
+-        this.tokenExpiresAt =
+-          Date.now() + (data.expires_in || 7200) * 1000 - 60000
+-        await this.emitTokenUpdate()
++        await this.applyTokens(newAccess, newToken, data.expires_in)
+         return // Success!
+       } catch (err: any) {
+-        const mode = api.post ? "POST" : "GET"
++        if (err instanceof AliyunRefreshSubMismatchError) throw err
++        if (err instanceof AliyunRefreshBudgetExceededError) throw err
+         console.warn(
+-          `[AliyundriveOpen] Online API (${mode}) '${apiUrl}' failed: ${err.message}`,
++          `[AliyundriveOpen] Online API (${mode}) ${apiUrl} failed: ${redactTokenEcho(String(err.message || err))}`,
+         )
+       }
+     }
+@@ -219,6 +346,11 @@ export class AliyunOpenClient {
+       "25ab4837190e48718a28f80073574a4d"
+     const clientSecret = (this.addition.client_secret || "").trim()
+ 
++    if (Date.now() - startedAtTotal > MAX_REFRESH_TOTAL_MS) {
++      throw new AliyunRefreshBudgetExceededError(
++        "[AliyundriveOpen] refresh budget exceeded",
++      )
++    }
+     try {
+       const payload: any = {
+         grant_type: "refresh_token",
+@@ -227,32 +359,61 @@ export class AliyunOpenClient {
+       }
+       if (clientSecret) payload.client_secret = clientSecret
+ 
+-      const res = await fetch(
+-        "https://openapi.aliyundrive.com/oauth/access_token",
+-        {
++      const doFetch = (): Promise<Response> =>
++        fetch("https://openapi.aliyundrive.com/oauth/access_token", {
+           method: "POST",
+           headers: { "Content-Type": "application/json" },
+           body: JSON.stringify(payload),
+-        },
+-      )
++        })
++      const startedAt = Date.now()
++      let res = await doFetch()
++      if (res.status === 429) {
++        const waitMs = parseRetryAfter(res.headers.get("retry-after"))
++        console.warn(
++          `[AliyundriveOpen] refresh 429 endpoint=oauth wait_ms=${waitMs}`,
++        )
++        if (waitMs > 0) {
++          await new Promise((r) => setTimeout(r, waitMs))
++        }
++        res = await doFetch()
++      }
+       if (!res.ok) {
+         const text = await res.text().catch(() => "")
+-        throw new Error(`[Status ${res.status}] ${text}`)
++        console.warn(
++          `[AliyundriveOpen] refresh failed endpoint=oauth status=${res.status} ` +
++            `retryable=${isRetryableStatus(res.status)} elapsed_ms=${Date.now() - startedAt}`,
++        )
++        if (res.status === 429) {
++          lastRetryAfterMs = parseRetryAfter(res.headers.get("retry-after"))
++        }
++        throw new Error(
++          `[Status ${res.status}]${text ? " " + redactTokenEcho(text).slice(0, 200) : ""}`,
++        )
+       }
+       const data: AliyunTokenResp = await res.json()
+       if (!data.access_token) {
+-        throw new Error(`Invalid response: ${JSON.stringify(data)}`)
++        throw new Error(`Invalid response: ${JSON.stringify(data).slice(0, 200)}`)
+       }
+-      this.accessToken = data.access_token
+-      if (data.refresh_token) this.refreshTokenVal = data.refresh_token
+-      this.tokenExpiresAt =
+-        Date.now() + (data.expires_in || 7200) * 1000 - 60000
+-      await this.emitTokenUpdate()
++      await this.applyTokens(
++        data.access_token,
++        data.refresh_token || "",
++        data.expires_in,
++      )
+       return // Success!
+     } catch (err: any) {
+-      console.warn(`[AliyundriveOpen] Direct OAuth failed: ${err.message}`)
++      if (err instanceof AliyunRefreshSubMismatchError) throw err
++      console.warn(
++        `[AliyundriveOpen] Direct OAuth failed: ${redactTokenEcho(String(err.message || err))}`,
++      )
+     }
+ 
++    if (lastRetryAfterMs > 0) {
++      const e: any = new Error(
++        `[AliyundriveOpen] refresh rate limited; retry_after_ms=${lastRetryAfterMs}`,
++      )
++      e.retryAfterMs = lastRetryAfterMs
++      throw e
++    }
+     throw new Error(
+       "[AliyundriveOpen] All token refresh strategies failed. " +
+         "Please check: 1) refresh_token is valid and not expired, " +

@@ -7,5 +7,8 @@ for f in /etc/rc.d/*openlist-txiki; do
 	[ -L "$f" ] && rm -f "$f" && logger -t openlist-txiki "post-deinstall: removed $f"
 done
 rm -rf /tmp/openlist-txiki
+# r52：升级前状态记录只在一次 pre-upgrade -> post-upgrade 之间有效，卸载时清掉，
+# 免得下次重装的 post-install 读到残留 running 而擅自启动。
+rm -f /etc/openlist-txiki/.upgrade-state
 logger -t openlist-txiki "post-deinstall: package files removed by apk; DATA KEPT at /etc/openlist-txiki (data.db, -wal, -shm, env, rollback/)"
 exit 0

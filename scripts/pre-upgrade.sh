@@ -55,6 +55,49 @@ else
 	TAG_SRC=timestamp
 fi
 
+# r52：升级前记录服务状态，供 post-upgrade 决定是否自动拉起。
+# r51 实测在线升级停服 12 分 29 秒，原因是 post-upgrade 只 enable 不 start。
+# 判定不依赖 procd 的瞬时状态：status 只是第一条证据，另两条是进程名与端口 LISTEN。
+# source 形态的进程名是 tjs（与 alist-encrypt 共用），不能靠 pidof，所以端口这条必须有。
+STATE_FILE=$DATA_DIR/.upgrade-state
+
+read_listen_port() {
+	_P=$(sed -n 's/^[[:space:]]*LISTEN_PORT[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	_P=${_P%%#*}
+	_P=$(printf '%s' "$_P" | tr -d '[:space:]')
+	_P=${_P#\"}; _P=${_P%\"}; _P=${_P#\'}; _P=${_P%\'}
+	case "$_P" in ''|*[!0-9]*) _P=5345 ;; esac
+	printf '%s' "$_P"
+}
+
+port_listening() {
+	_hex=$(printf '%04X' "$1")
+	for _f in /proc/net/tcp /proc/net/tcp6; do
+		[ -r "$_f" ] || continue
+		awk -v p="$_hex" 'NR > 1 { split($2, a, ":"); if (a[2] == p && $4 == "0A") found = 1 } END { exit !found }' "$_f" && return 0
+	done
+	return 1
+}
+
+PRE_PORT=$(read_listen_port)
+PRE_PID=$(pidof openlist-txiki-bin 2>/dev/null | awk '{print $1}')
+if [ "$(/etc/init.d/openlist-txiki status 2>/dev/null)" = running ] || [ -n "$PRE_PID" ] || port_listening "$PRE_PORT"; then
+	PRE_STATE=running
+else
+	PRE_STATE=stopped
+fi
+mkdir -p "$DATA_DIR" 2>/dev/null
+if { printf 'PRE_STATE=%s\n' "$PRE_STATE"
+     printf 'PRE_PORT=%s\n' "$PRE_PORT"
+     printf 'PRE_PID=%s\n' "${PRE_PID:-none}"
+     printf 'PRE_TS=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+   } > "$STATE_FILE" 2>/dev/null; then
+	chmod 600 "$STATE_FILE" 2>/dev/null
+	logger -t openlist-txiki "pre-upgrade: service state=$PRE_STATE port=$PRE_PORT pid=${PRE_PID:-none} -> $STATE_FILE"
+else
+	logger -t openlist-txiki "WARN: pre-upgrade: 写不了 $STATE_FILE，升级后不会自动拉起（保持停止）"
+fi
+
 [ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki stop 2>/dev/null
 
 prune_db_backups() {

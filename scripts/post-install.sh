@@ -1,8 +1,10 @@
 #!/bin/sh
-# apk post-install：建数据目录、生成引导口令、只在缺失时复制 env 模板、enable 服务。装完不自动启动。
+# apk post-install：建数据目录、生成引导口令、只在缺失时复制 env 模板、enable 服务。
+# r52 起与 post-upgrade 同段逻辑：只有 pre-upgrade 记录了升级前在跑才自动拉起，首次安装保持停止。
 # admin.pass 是首次建 admin 的引导凭据（0600 root:root），init 启动前读它做 bootstrap probe。
 set -u
 DATA_DIR=/etc/openlist-txiki
+ENV_FILE=$DATA_DIR/openlist-txiki.env
 MANIFEST=/usr/share/openlist-txiki/build-manifest.json
 DIST=/usr/share/openlist-txiki/dist
 
@@ -47,6 +49,67 @@ ensure_admin_pass() {
 	fi
 }
 
+# r52：与 post-upgrade 同一段逻辑。首次安装没有 pre-upgrade 状态文件，保持停止；
+# 只有状态文件明确记录 running（重装等场景）才拉起并等首个 200，失败不阻塞安装。
+STATE_FILE=$DATA_DIR/.upgrade-state
+
+now_ms() {
+	awk '{ printf "%d", $1 * 1000 }' /proc/uptime 2>/dev/null || echo "$(date +%s)000"
+}
+
+read_state() {
+	sed -n "s/^$1=//p" "$STATE_FILE" 2>/dev/null | head -n 1
+}
+
+probe_host() {
+	case "$1" in
+		0.0.0.0|''|'*') printf '127.0.0.1' ;;
+		::|'[::]') printf '[::1]' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+resume_if_was_running() {
+	if [ ! -f "$STATE_FILE" ]; then
+		log "auto-start: 首次安装，无 pre-upgrade 状态记录，保持停止"
+		return 0
+	fi
+	_pre_state=$(read_state PRE_STATE)
+	_pre_port=$(read_state PRE_PORT)
+	case "$_pre_port" in ''|*[!0-9]*) _pre_port=5345 ;; esac
+	if [ "$_pre_state" != running ]; then
+		log "pre=${_pre_state:-unknown} -> post=stopped (kept stopped)"
+		rm -f "$STATE_FILE"
+		return 0
+	fi
+	_addr=$(sed -n 's/^[[:space:]]*LISTEN_ADDR[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	_addr=${_addr%%#*}; _addr=$(printf '%s' "$_addr" | tr -d '[:space:]')
+	_addr=${_addr#\"}; _addr=${_addr%\"}; _addr=${_addr#\'}; _addr=${_addr%\'}
+	_host=$(probe_host "$_addr")
+	_start_out=$(/etc/init.d/openlist-txiki start 2>&1)
+	_start_rc=$?
+	_t0=$(now_ms)
+	_first200=none
+	while :; do
+		if wget -q -T 1 -O /dev/null "http://$_host:$_pre_port/api/public/settings" 2>/dev/null; then
+			_first200=$(( $(now_ms) - _t0 ))
+			break
+		fi
+		[ $(( $(now_ms) - _t0 )) -ge 3000 ] && break
+		sleep 1
+	done
+	if [ "$_first200" != none ]; then
+		log "pre=running -> post=started, first200=${_first200}ms (port=$_pre_port rc=$_start_rc)"
+	else
+		log "pre=running -> post=start-failed rc=$_start_rc first200=none (port=$_pre_port, 保持 enable，不阻塞安装)"
+		[ -n "$_start_out" ] && log "auto-start: start output: $(printf '%s' "$_start_out" | tr '\n' ' ')"
+		_tail=$(logread -e openlist-txiki 2>/dev/null | tail -n 3 | tr '\n' ' ')
+		[ -n "$_tail" ] && log "auto-start: last log: $_tail"
+	fi
+	rm -f "$STATE_FILE"
+	return 0
+}
+
 mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"
 ensure_admin_pass
@@ -55,8 +118,9 @@ if [ ! -f "$DATA_DIR/openlist-txiki.env" ]; then
 	chmod 600 "$DATA_DIR/openlist-txiki.env"
 fi
 [ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki enable
+resume_if_was_running
 check_web_dist
-logger -t openlist-txiki "post-install done: data dir $DATA_DIR kept, admin.pass ensured, env template applied only if missing, service enabled (not started)"
+logger -t openlist-txiki "post-install done: data dir $DATA_DIR kept, admin.pass ensured, env template applied only if missing, service enabled, auto-start per pre-upgrade state"
 # 默认只绑 127.0.0.1：装完不主动对 LAN 开放，首次使用见 env 文件头部注释
 logger -t openlist-txiki "服务默认只监听 127.0.0.1（未对 LAN 开放）；首次使用先读 $DATA_DIR/admin.pass，见 env 文件头部三步说明"
 exit 0

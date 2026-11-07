@@ -1,13 +1,14 @@
 #!/bin/sh
 # apk post-upgrade：先校验装后字节与 build-manifest 一致，再生成引导口令并 enable（幂等）。
-# 不自动 start：新版首次启动由管理员决定，出问题能立刻回滚。
-# sha 不符时不 enable（init 启动前也会再校验一次，双保险），等人工处置。
+# r52 起：pre-upgrade 记录了升级前服务在跑时，装完立即 start 并等首个 200（≤3 秒）；
+# 升级前是停的就保持停止。sha 不符时不 enable 也不 start（init 启动前也会再校验一次），等人工处置。
 set -u
 MANIFEST=/usr/share/openlist-txiki/build-manifest.json
 PKG_DIR=/usr/libexec/openlist-txiki
 BUNDLE=$PKG_DIR/openlist-txiki.js
 TJS=$PKG_DIR/tjs
 DATA_DIR=/etc/openlist-txiki
+ENV_FILE=$DATA_DIR/openlist-txiki.env
 DIST=/usr/share/openlist-txiki/dist
 
 log() { logger -t openlist-txiki "$*"; }
@@ -59,6 +60,68 @@ ensure_admin_pass() {
 	fi
 }
 
+# r52：在线升级自动拉起。pre-upgrade 在 stop 之前把服务状态写进 $STATE_FILE，
+# 这里只按那份记录决定：running 才 start，stopped 或无记录一律保持停止，
+# 不擅自启动用户没开的服务。3 秒内拿不到 200 只记日志，保持 enable，不阻塞升级。
+STATE_FILE=$DATA_DIR/.upgrade-state
+
+now_ms() {
+	awk '{ printf "%d", $1 * 1000 }' /proc/uptime 2>/dev/null || echo "$(date +%s)000"
+}
+
+read_state() {
+	sed -n "s/^$1=//p" "$STATE_FILE" 2>/dev/null | head -n 1
+}
+
+probe_host() {
+	case "$1" in
+		0.0.0.0|''|'*') printf '127.0.0.1' ;;
+		::|'[::]') printf '[::1]' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+resume_if_was_running() {
+	if [ ! -f "$STATE_FILE" ]; then
+		log "auto-start: 无 pre-upgrade 状态记录，保持停止（老包升级或手工执行钩子）"
+		return 0
+	fi
+	_pre_state=$(read_state PRE_STATE)
+	_pre_port=$(read_state PRE_PORT)
+	case "$_pre_port" in ''|*[!0-9]*) _pre_port=5345 ;; esac
+	if [ "$_pre_state" != running ]; then
+		log "pre=${_pre_state:-unknown} -> post=stopped (kept stopped)"
+		rm -f "$STATE_FILE"
+		return 0
+	fi
+	_addr=$(sed -n 's/^[[:space:]]*LISTEN_ADDR[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	_addr=${_addr%%#*}; _addr=$(printf '%s' "$_addr" | tr -d '[:space:]')
+	_addr=${_addr#\"}; _addr=${_addr%\"}; _addr=${_addr#\'}; _addr=${_addr%\'}
+	_host=$(probe_host "$_addr")
+	_start_out=$(/etc/init.d/openlist-txiki start 2>&1)
+	_start_rc=$?
+	_t0=$(now_ms)
+	_first200=none
+	while :; do
+		if wget -q -T 1 -O /dev/null "http://$_host:$_pre_port/api/public/settings" 2>/dev/null; then
+			_first200=$(( $(now_ms) - _t0 ))
+			break
+		fi
+		[ $(( $(now_ms) - _t0 )) -ge 3000 ] && break
+		sleep 1
+	done
+	if [ "$_first200" != none ]; then
+		log "pre=running -> post=started, first200=${_first200}ms (port=$_pre_port rc=$_start_rc)"
+	else
+		log "pre=running -> post=start-failed rc=$_start_rc first200=none (port=$_pre_port, 保持 enable，不阻塞升级)"
+		[ -n "$_start_out" ] && log "auto-start: start output: $(printf '%s' "$_start_out" | tr '\n' ' ')"
+		_tail=$(logread -e openlist-txiki 2>/dev/null | tail -n 3 | tr '\n' ' ')
+		[ -n "$_tail" ] && log "auto-start: last log: $_tail"
+	fi
+	rm -f "$STATE_FILE"
+	return 0
+}
+
 if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -x "$TJS" ]; then
 	want_b=$(manifest_sha bundle_sha256)
 	got_b=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
@@ -66,7 +129,6 @@ if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -x "$TJS" ]; then
 		# shared-tjs：包内没有 tjs，不校验 tjs sha；只校验 bundle 与系统运行时存在。
 		if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ]; then
 			log "post-upgrade: bundle sha256 ok ($got_b), runtime=shared tjs=$TJS $("$TJS" --version 2>/dev/null | head -n 1)"
-			check_web_dist
 		else
 			log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b (runtime=shared); not enabling, 等人工处置"
 			[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null
@@ -77,7 +139,6 @@ if [ -f "$MANIFEST" ] && [ -f "$BUNDLE" ] && [ -x "$TJS" ]; then
 		got_t=$(sha256sum "$TJS" | cut -d' ' -f1)
 		if [ -n "$want_b" ] && [ "$got_b" = "$want_b" ] && [ -n "$want_t" ] && [ "$got_t" = "$want_t" ]; then
 			log "post-upgrade: sha256 ok (bundle $got_b, tjs $got_t)"
-			check_web_dist
 		else
 			log "post-upgrade: SHA MISMATCH bundle=$got_b want=$want_b tjs=$got_t want=$want_t; not enabling, 等人工处置"
 			[ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki disable 2>/dev/null
@@ -91,5 +152,8 @@ fi
 
 ensure_admin_pass
 [ -x /etc/init.d/openlist-txiki ] && /etc/init.d/openlist-txiki enable
-log "post-upgrade done: service enabled, not started (start manually or on next boot)"
+# 先拉起再校验前端：dist 校验是软检查（不符只记 ERROR），放在 start 后面可以少占停服窗口。
+resume_if_was_running
+check_web_dist
+log "post-upgrade done: service enabled, auto-start per pre-upgrade state"
 exit 0

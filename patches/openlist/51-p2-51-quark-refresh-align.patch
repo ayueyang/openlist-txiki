@@ -1,0 +1,145 @@
+diff --git a/src/backend/drivers/quark/driver.ts b/src/backend/drivers/quark/driver.ts
+index 1014da9..3695eeb 100644
+--- a/src/backend/drivers/quark/driver.ts
++++ b/src/backend/drivers/quark/driver.ts
+@@ -41,6 +41,14 @@ export class QuarkDriver implements StorageDriver {
+     this.client.startAutoRefresh()
+   }
+ 
++  /**
++   * 生命周期收口（F7）：驱动被缓存淘汰或同存储重建时停掉定时器，
++   * 避免旧实例继续用旧 cookie 打上游。
++   */
++  stop(): void {
++    this.client.stopAutoRefresh()
++  }
++
+   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+     const folderId = await this.resolveFileId(physicalPath)
+     const files = await this.client.getFiles(folderId)
+diff --git a/src/backend/drivers/quark/util.ts b/src/backend/drivers/quark/util.ts
+index 49111b3..3b21831 100644
+--- a/src/backend/drivers/quark/util.ts
++++ b/src/backend/drivers/quark/util.ts
+@@ -354,6 +354,7 @@ export class QuarkClient {
+   // __puus 后请求 /config，让服务端重新下发；否则 __puus 约 3 小时后过期，
+   // 下载先 403、随后列表也失败，只能重新粘 cookie。
+   private refreshTimer: any = null
++  private noRotationStreak = 0
+ 
+   public startAutoRefresh(): void {
+     if (this.refreshTimer) return
+@@ -366,9 +367,13 @@ export class QuarkClient {
+     if (Number.isFinite(override) && override > 0) {
+       // 只给测试用；生产不设这个变量。
+       period = Math.max(1000, Math.floor(override))
++      console.log(
++        `[Quark/UC] (${this.addition.variant || "Quark"}) refresh period override active ms=${period}`,
++      )
+     } else {
+       period += Math.floor((Math.random() * 10 - 5) * 60 * 1000)
+     }
++    this.noRotationStreak = 0
+     this.refreshTimer = setInterval(() => {
+       void this.refreshCookie()
+     }, period)
+@@ -382,28 +387,46 @@ export class QuarkClient {
+     )
+   }
+ 
++  /** 定时器是否在跑；给验收脚本与单测用，不参与业务判断。 */
++  public isAutoRefreshRunning(): boolean {
++    return this.refreshTimer !== null
++  }
++
+   public stopAutoRefresh(): void {
+     if (!this.refreshTimer) return
+     clearInterval(this.refreshTimer)
+     this.refreshTimer = null
++    console.log(
++      `[Quark/UC] (${this.addition.variant || "Quark"}) cookie refresh loop stopped`,
++    )
+   }
+ 
+   /**
+-   * 主动刷新一次：删掉旧 __puus/__pus 再请求 /config，服务端通过 Set-Cookie
+-   * 下发新值；request() 负责合并并触发 onCookieUpdate 落库。
++   * 主动刷新一次：带原 cookie 请求 /config 做保活/轮换；request() 负责合并
++   * Set-Cookie 并触发 onCookieUpdate 落库。
++   *
++   * 设备实测（2026-11-05）：删掉 __puus 再请求 /config 会直接 401
++   * require login [guest]，与 alist 的 quark_uc 不同。因此保留 alist 的周期
++   * （100 分钟 ±5 分钟）但加停止条件：连续 3 个周期没有换到新 cookie 就停表，
++   * 避免空转打上游（F5/F7）。
+    */
+   public async refreshCookie(): Promise<boolean> {
+     if (!this.cookie?.trim()) return false
+     const before = this.cookie
+-    // 设备实测（2026-11-05）：删掉 __puus 再请求 /config 会直接 401
+-    // require login [guest]，与 alist 的 quark_uc 不同。改为带原 cookie 请求
+-    // /config 做保活/轮换；服务端下发的新 Set-Cookie 由同一路径合并并落库。
+     try {
+       await this.request("/config", "GET")
+       const changed = this.cookie !== before
++      if (changed) this.noRotationStreak = 0
++      else this.noRotationStreak++
+       console.log(
+-        `[Quark/UC] (${this.addition.variant || "Quark"}) cookie refresh ok changed=${changed} cookie_len=${this.cookie.length}`,
++        `[Quark/UC] (${this.addition.variant || "Quark"}) cookie refresh ok changed=${changed} streak=${this.noRotationStreak} cookie_len=${this.cookie.length}`,
+       )
++      if (this.noRotationStreak >= 3) {
++        console.log(
++          "[Quark/UC] cookie refresh loop stopped: no rotation in 3 cycles",
++        )
++        this.stopAutoRefresh()
++      }
+       return changed
+     } catch (e: any) {
+       console.warn(`[Quark/UC] cookie refresh failed:`, e.message)
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 026b240..fff6122 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -144,10 +144,31 @@ const deferredTokenPersistence = new WeakSet<object>()
+ // 长生命周期 isolate 中会无限累积。超出上限时按插入顺序淘汰最旧条目。
+ const MAX_DRIVER_CACHE = 100
+ 
++/** 淘汰/替换前先停驱动自己的资源（定时器等）；实例接口的可选 stop。 */
++function stopCachedDriver(key: string, reason: string): void {
++  const d: any = driverCache.get(key)
++  if (!d) return
++  try {
++    d.stop?.()
++  } catch (e) {
++    console.warn(`[driver-cache] stop failed key=${key}`, e)
++  }
++  driverCache.delete(key)
++  console.log(`[driver-cache] stop storage=${key} reason=${reason}`)
++}
++
++/** 同一存储配置改动后 cacheKey 会变；建新实例前清掉该存储的旧实例。 */
++function stopCachedDriversForStorage(storageId: string): void {
++  if (!storageId) return
++  for (const key of Array.from(driverCache.keys())) {
++    if (key.startsWith(`${storageId}_`)) stopCachedDriver(key, "replace")
++  }
++}
++
+ function setDriverCache(key: string, driver: StorageDriver): void {
+   if (driverCache.size >= MAX_DRIVER_CACHE) {
+     const oldestKey = driverCache.keys().next().value
+-    if (oldestKey !== undefined) driverCache.delete(oldestKey)
++    if (oldestKey !== undefined) stopCachedDriver(oldestKey, "evict")
+   }
+   driverCache.set(key, driver)
+ }
+@@ -1303,6 +1324,9 @@ export async function getDriver(
+     const cached = driverCache.get(cacheKey)
+     if (cached) return cached
+ 
++    // F7：同存储 id 的旧 cacheKey 先停掉，避免旧实例的定时器继续跑。
++    stopCachedDriversForStorage(String(storageConfig.id || ""))
++
+     return getOrCreateDriver(driverInitCache, cacheKey, async () => {
+       const ready = driverCache.get(cacheKey)
+       if (ready) return ready

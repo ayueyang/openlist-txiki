@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 50
+patch_count 52
 file_count 43
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file b8c98e2708d26d4677b09bfc7d7efcb95600a494ec4b83f6dc1ce9a20b81e6be src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file 062f4da6d6d68834ecb1738e50e74b7375876798ab0825721e5f4d2abab8796b src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -259,7 +259,7 @@ file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backen
 file ae27a0ca9dfe2b71004385decc1406e57cc5584452284dfc876286ff3f56ab03 src/backend/txiki/readonly-gate.test.ts src=repo strip_header=no eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
 file 7f69e2c9d8d19a98f60ea8bc42c3e2538105b224775cdd27e808d6d643286f78 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
-file 6ab4e43950ec04797df05542351e15a105ba8e360729852aae781315b092a46a src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
+file b0b7915452150eb5b9f1b19d7177d6679fbfa604b1fbdaff21172cd40898b9b7 src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
 file c15a27dac45238029a945fe2e692915dffb62887a291d49383fa16a76e32512d src/backend/txiki/sqlite-d1.ts src=repo strip_header=yes eol=lf
@@ -368,3 +368,17 @@ patch 49 19eac4731dd7668f6a808ff59c93e55d0d545b575641f6ef773b560c74b30380 work/p
 #   同步点，一次补齐 share+admin 两段）。
 #   patch_count 49->50；file_count 42->43（新增 readonly-gate.test.ts 的 file 条目）。
 patch 50 f0be42ada382c97783b737f87f46d665cfe22952ab265fd6f7a84c534cc782e0 work/p2-50-readonly-gate-share-admin.patch
+#
+# 第 51/52 条（2026-11-07，r51 Q1+Q2）：
+#   51 夸克（Q1/F5+F7）：定时器与驱动实例同生命周期——QuarkDriver.stop() 停表；
+#      storage.ts 淘汰（evict）与同存储重建（replace）前调 stop；刷新语义保留 alist 周期
+#      （100 分钟 ±5 分钟），加「连续 3 个周期没换到新 cookie 就停表」，并保留
+#      OPENLIST_QUARK_REFRESH_MS 测试覆盖（只给设备验收用）。
+#   52 阿里云盘 Open（Q2/F2+F1）：refreshAccessToken 拆成单飞 + doRefreshAccessToken；
+#      429 读 Retry-After（单次上限 15 秒、整轮 30 秒）同端点重试一次，5xx/网络错误换端点，
+#      400/401/403 不重试；成功后统一走 applyTokens，先比对新旧 refresh_token 的 JWT sub，
+#      不一致抛错、不赋值、不落库；opaque token 跳过并记一次日志。
+#   patch_count 50->52；file_count 43 不变（两个驱动文件都不登记 file 条目，
+#   由补丁 sha 与 build-txiki.mjs 的 Q1/Q2 在位断言校验）。
+patch 51 274a44858f48b2ce37bcf62b7e4458aba161259f954b57f228671b61df788e2b work/p2-51-quark-refresh-align.patch
+patch 52 b69c790026245bac84ca327e178b5c06b55ed4fc37430cf5d00ad4b9bdb5f212 work/p2-52-ali-refresh-backoff-sub.patch
