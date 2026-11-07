@@ -54,7 +54,7 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 三、要约有效期与联系方式
 
   有效期：自本包分发之日起 3 年；本版分发日 2026-11-06，覆盖至 2029-11-06。
-  联系人：84396@163.com（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
+  联系人：https://github.com/ayueyang/openlist-txiki/issues（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
   两个二进制归档内不含该文件，也可从 Release 页文件名读取）。
 
 四、组件来源与许可
