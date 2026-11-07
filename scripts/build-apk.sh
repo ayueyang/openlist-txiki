@@ -391,6 +391,13 @@ else
 	set -- -I "depends:curl"
 	echo "DEPENDS=curl"
 fi
+# r49：可选签名。SIGN_KEY 是容器内可见的 PEM 私钥路径（无口令）；不给就不出签名块，
+# 命令行与 r48 逐字节同形。给错路径直接失败，不静默出未签名包。
+if [ -n "${SIGN_KEY:-}" ]; then
+	[ -f "$SIGN_KEY" ] || { echo "FAIL: SIGN_KEY=$SIGN_KEY 不存在" >&2; exit 1; }
+	set -- "$@" --sign-key "$SIGN_KEY"
+	echo "SIGN_KEY=$SIGN_KEY"
+fi
 "$APK" mkpkg --compat 3.0.0_pre1 \
 	-I "name:openlist-txiki" \
 	-I "version:$VERSION" \

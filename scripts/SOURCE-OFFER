@@ -1,15 +1,15 @@
 openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 ================================================================
 
-包名与版本：openlist-txiki 0.1.0-r48（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
+包名与版本：openlist-txiki 0.1.0-r49（OpenWrt apk；同名 Windows / Linux 压缩包同源同字节）
 
 本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js），
 按 AGPL-3.0 第 13 条向与本服务交互的网络用户提供对应源码。本包按对外分发口径发布。
 
 一、源码归档（对外可达地址）
 
-  归档文件名：openlist-txiki-source-0.1.0-r48.tar.gz
-  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r48/openlist-txiki-source-0.1.0-r48.tar.gz
+  归档文件名：openlist-txiki-source-0.1.0-r49.tar.gz
+  下载地址：https://github.com/ayueyang/openlist-txiki/releases/download/v0.1.0-r49/openlist-txiki-source-0.1.0-r49.tar.gz
   sha256 与字节数：apk 包内 build-manifest.json 有 source_archive_sha256 / source_archive_bytes
   （打包时现算，与归档文件逐字节一致）。两个二进制归档（Linux tar / Windows zip）内不含该
   文件；要核源码归档的 sha256 与字节数，看 Release 页 SHA256SUMS.txt（列有该归档一行），
@@ -53,8 +53,8 @@ openlist-txiki 对应源码获取声明（AGPL-3.0 第 13 条书面要约）
 
 三、要约有效期与联系方式
 
-  有效期：自本包分发之日起 3 年；本版分发日 2026-11-06，覆盖至 2029-11-06。
-  联系人：https://github.com/ayueyang/openlist-txiki/issues（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
+  有效期：自本包分发之日起 3 年；本版分发日 2026-11-07，覆盖至 2029-11-07。
+  联系人：https://github.com/ayueyang/openlist-txiki/issues（在仓库提 issue）（注明包版本；版本号见 apk 包内 build-manifest.json 的 package_version，
   两个二进制归档内不含该文件，也可从 Release 页文件名读取）。
 
 四、组件来源与许可

@@ -2,7 +2,7 @@
 
 ## 上游与版本
 
-- 当前版本：**0.1.0-r48**（与同版 apk 包内 `build-manifest.json` 的 `package_version` 同值）
+- 当前版本：**0.1.0-r49**（与同版 apk 包内 `build-manifest.json` 的 `package_version` 同值）
 - 应用：**OpenListTeam/OpenList-Worker**，许可证 AGPL-3.0
   固定基线 commit：`5f53f58dd0f5e5d03eb6079da7f637fa151d8dca`
   应用补丁：50 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）

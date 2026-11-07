@@ -328,10 +328,10 @@ const out = {
   source_archive_url: opt["source-archive-url"] || "",
   source_archive_sha256: archive ? sha256(archive) : "",
   source_archive_bytes: archive ? fs.statSync(archive).size : 0,
-  contact_email: opt["contact-email"] || "https://github.com/ayueyang/openlist-txiki/issues",
-  // S2/S3：要约有效期按「自分发之日起 3 年」。r47 分发日 2026-11-06，覆盖至 2029-11-06；
+  contact_email: opt["contact-email"] || "https://github.com/ayueyang/openlist-txiki/issues（在仓库提 issue）",
+  // S2/S3：要约有效期按「自分发之日起 3 年」。r49 分发日 2026-11-07，覆盖至 2029-11-07；
   // 后续分发另给 --offer-valid-until 覆盖，不沿用旧日期。
-  offer_valid_until: opt["offer-valid-until"] || "2029-11-06",
+  offer_valid_until: opt["offer-valid-until"] || "2029-11-07",
   build_date: new Date().toISOString().slice(0, 10),
 }
 if (webDist) out.web_dist = webDist
