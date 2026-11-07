@@ -2,38 +2,38 @@
   "version": "0.1.0-r49",
   "patch_count": 50,
   "bundle": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r45-assets-0930/bin/openlist-txiki.js",
+    "path": "${BUNDLE}",
     "sha256": "947e6c7f8e9a5ac7c1961dd0f6ae847ece0308e6c32879ca4085ec52af74d02a",
     "bytes": 2073149
   },
   "tjs_linux": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/artifacts/porter-r45-encode-land-0702/tjs-x86_64-linux-musl",
+    "path": "${TJS_LINUX}",
     "sha256": "869143554c5dd91b50a7310c829551b24cd9c1fc92a5cecf05dcc7ec214c876c",
     "bytes": 5359312
   },
   "tjs_win": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/artifacts/release-r29-0745/bin/tjs-x86_64-windows.exe",
+    "path": "${TJS_WIN}",
     "sha256": "61a0f41cb38198c2f3ec8a986971d87b405150eae106d5445a4908329f03edf1",
     "bytes": 5303808
   },
   "dist": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/frontend/standard/dist",
+    "path": "${DIST}",
     "tree_sha256": "c107306c3f3d760d65bf9f615d92d9a9a67485d72e024b0e0d061178f63c5137",
     "bytes": 58517793,
     "files": 452
   },
   "offer": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r49-0840/source/openlist-txiki-0.1.0-r49/scripts/SOURCE-OFFER",
+    "path": "${OFFER}",
     "sha256": "e320275a185f8526dbe64f883f57ef97efc2f3ecd23be93ea3e2c199e9fa2b81",
     "bytes": 5391
   },
   "notices": {
-    "path": "C:/Users/admin/Desktop/openlist-txiki/work/porter-r49-0840/source/openlist-txiki-0.1.0-r49/scripts/THIRD-PARTY-NOTICES",
+    "path": "${NOTICES}",
     "sha256": "aecaec31b2ebafde1a2d7c44ed60f2261de825d9afc0f59349e4c580f7dfe62b",
     "bytes": 4140
   },
   "templates": {
-    "dir": "C:/Users/admin/Desktop/openlist-txiki-public/build/assets",
+    "dir": "${TEMPLATES_DIR}",
     "files": {
       "run.sh.in": {
         "sha256": "414e52733ee637c8d28a269b550fe16927cf48d23de24f0aa09a7615bffe6ba6",

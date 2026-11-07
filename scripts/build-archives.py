@@ -49,7 +49,12 @@ inputs.json 必填字段：
   offer{path,sha256,bytes}, notices{path,sha256,bytes},
   templates{dir, files{run.sh.in{sha256,bytes}, run.cmd.in{sha256,bytes},
                        README-Windows.md.in{sha256,bytes}}}
-路径可为绝对路径，或相对当前工作目录。
+路径写法（r50 起）：
+  - 推荐 ${NAME} 占位符，由 --vars <vars.json> 或环境变量
+    BUILD_ARCHIVES_VAR_<NAME> 展开（见 build-archives.vars.example.json）；
+  - 相对路径按 --inputs-root 解析，默认仓库根（scripts/apk 的上两级）；
+  - 绝对路径仍接受（兼容旧 json），但 --record 会打印 WARN_INPUT_ABS_PATH。
+--record 只回写 sha256/bytes，不改 path 原文，所以占位符写法不会被写成本机路径。
 """
 import argparse
 import hashlib
@@ -72,6 +77,11 @@ PATCH_RE = re.compile(r"(\d+) 个补丁")
 TEMPLATE_NAMES = ("README-Windows.md", "run.cmd", "run.sh", "BUILD.md")
 # FIX-2：进 inputs.json 并逐项核身份的三件模板（带 .in 后缀）
 TEMPLATE_IDS = ("run.sh.in", "run.cmd.in", "README-Windows.md.in")
+# r50：inputs.json 不再写本机绝对路径。path 可写 ${NAME} 占位符（--vars 或
+# BUILD_ARCHIVES_VAR_<NAME> 展开），相对路径按 --inputs-root 解析，默认仓库根。
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VAR_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
+PATH_FIELDS = ("bundle", "tjs_linux", "tjs_win", "dist", "offer", "notices")
 
 # 五份许可证全文与固定身份（与 r46 一次性脚本同一组锚点）
 LICENSES = {
@@ -126,7 +136,52 @@ def need(obj, key, typ, where):
     return val
 
 
-def load_inputs(path):
+def load_vars(path):
+    """--vars：占位符到路径的映射（本地文件，不进交付件）。"""
+    if not path:
+        return {}
+    if not os.path.isfile(path):
+        raise UsageError("VARS_MISSING %s" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:  # noqa: BLE001 - 语法错一律 usage 错
+        raise UsageError("VARS_JSON %s" % e)
+    if not isinstance(raw, dict):
+        raise UsageError("VARS_NOT_OBJECT root")
+    out = {}
+    for k, v in raw.items():
+        if not isinstance(v, str):
+            raise UsageError("VARS_FIELD_TYPE %s want=str got=%s"
+                             % (k, type(v).__name__))
+        out[k] = v
+    return out
+
+
+def resolve_input_path(value, field, vars_map, inputs_root):
+    """把 inputs.json 的 path 解析成盘面路径。
+
+    - ${NAME} 先按 --vars 文件、再按环境变量 BUILD_ARCHIVES_VAR_<NAME> 展开；
+    - 展开后仍是相对路径时按 --inputs-root（默认仓库根）解析；
+    - 绝对路径原样保留（兼容旧 json，样例不再这么写）。
+    """
+    def _sub(m):
+        key = m.group(1)
+        if key in vars_map:
+            return vars_map[key]
+        env = os.environ.get("BUILD_ARCHIVES_VAR_" + key)
+        if env:
+            return env
+        raise UsageError("INPUT_VAR_MISSING var=%s field=%s" % (key, field))
+
+    v = VAR_RE.sub(_sub, value)
+    v = os.path.expanduser(v)
+    if not os.path.isabs(v):
+        v = os.path.join(inputs_root, v)
+    return os.path.normpath(v)
+
+
+def load_inputs(path, vars_map=None, inputs_root=None):
     if not os.path.isfile(path):
         raise UsageError("INPUTS_MISSING %s" % path)
     try:
@@ -163,6 +218,14 @@ def load_inputs(path):
             "bytes": need(spec, "bytes", int, "templates.files." + n),
         }
     out["templates"] = tpl_out
+    # r50：先按占位符/相对仓根解析，再把盘面路径写进 cfg；cfg_raw 保持原文，
+    # --record 只回写 sha256/bytes，不会把绝对路径写进 json。
+    vars_map = vars_map or {}
+    inputs_root = inputs_root or REPO_ROOT
+    for name in PATH_FIELDS:
+        out[name]["path"] = resolve_input_path(out[name]["path"], name, vars_map, inputs_root)
+    out["templates"]["dir"] = resolve_input_path(
+        out["templates"]["dir"], "templates.dir", vars_map, inputs_root)
     return out, cfg
 
 
@@ -533,14 +596,34 @@ def record_inputs(path, cfg_raw, cfg, dist_files, dist_bytes, dist_tree):
         b = read(os.path.join(tpl_dir, n))
         cfg_raw["templates"]["files"][n]["sha256"] = sha(b)
         cfg_raw["templates"]["files"][n]["bytes"] = len(b)
+    # r50：path 仍写成本机绝对路径时只告警、不阻断（历史 json 仍能跑），
+    # 新样例一律写 ${NAME} 占位符或相对仓根的路径。
+    for name in PATH_FIELDS:
+        if os.path.isabs(cfg_raw[name]["path"]):
+            print("WARN_INPUT_ABS_PATH field=%s" % name)
+    if os.path.isabs(cfg_raw["templates"]["dir"]):
+        print("WARN_INPUT_ABS_PATH field=templates.dir")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(cfg_raw, f, ensure_ascii=False, indent=2)
         f.write("\n")
     print("RECORD path=%s sha256=%s" % (path, sha(read(path))))
 
 
+def count_placeholders(cfg_raw):
+    n = 0
+    for name in PATH_FIELDS:
+        n += len(VAR_RE.findall(cfg_raw[name]["path"]))
+    n += len(VAR_RE.findall(cfg_raw["templates"]["dir"]))
+    return n
+
+
 def run(args):
-    cfg, cfg_raw = load_inputs(args.inputs)
+    vars_map = load_vars(args.vars)
+    inputs_root = args.inputs_root or REPO_ROOT
+    cfg, cfg_raw = load_inputs(args.inputs, vars_map, inputs_root)
+    print("inputs_resolved root_source=%s vars=%d placeholders=%d"
+          % ("cli" if args.inputs_root else "repo", len(vars_map),
+             count_placeholders(cfg_raw)))
     if not os.path.isfile(args.renderer):
         raise UsageError("RENDERER_MISSING %s" % args.renderer)
     version = cfg["version"]
@@ -609,6 +692,10 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="产物输出目录")
     ap.add_argument("--renderer", required=True, help="公开仓 build/make-archives.py")
     ap.add_argument("--record", action="store_true", help="把当前输入身份写回 json（默认关）")
+    ap.add_argument("--vars", default=None,
+                    help="占位符映射 json（name->path；本地文件，不进交付件）")
+    ap.add_argument("--inputs-root", default=None,
+                    help="inputs.json 里相对路径的基准目录（默认仓库根）")
     args = ap.parse_args(argv)
     try:
         return run(args)

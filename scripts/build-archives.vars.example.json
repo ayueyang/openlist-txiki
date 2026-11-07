@@ -1,0 +1,10 @@
+{
+  "_comment": "复制成 build-archives.vars.json 后按本机实际位置填写；本文件只给相对仓根（或 --inputs-root）的示例，不写本机绝对路径。",
+  "BUNDLE": "dist-txiki/openlist-txiki.js",
+  "TJS_LINUX": "tjs-x86_64-linux-musl",
+  "TJS_WIN": "tjs-x86_64-windows.exe",
+  "DIST": "dist",
+  "OFFER": "scripts/SOURCE-OFFER",
+  "NOTICES": "scripts/THIRD-PARTY-NOTICES",
+  "TEMPLATES_DIR": "build/assets"
+}

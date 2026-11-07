@@ -120,17 +120,35 @@ stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按�
 ## 3.1 从源码归档复算桌面两件（linux tar.gz / win x64 zip）
 
 归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（四份模板）、
-`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.@VERSION@.json`（输入锚点）：
+`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.@VERSION@.json`（输入锚点）。
+inputs.json 里的七个路径一律写 `${NAME}` 占位符，不含任何本机路径；复算前自己填一份变量文件：
 
 ```sh
-python scripts/build-archives.py --inputs scripts/build-archives.inputs.@VERSION@.json   --out /tmp/desktop --renderer build/make-archives.py
+cp scripts/build-archives.vars.example.json /tmp/vars.json
+# 按下面的字段来源改 /tmp/vars.json 的七个值（相对仓根或绝对路径都行）
+python scripts/build-archives.py \
+  --inputs scripts/build-archives.inputs.@VERSION@.json \
+  --out /tmp/desktop --renderer build/make-archives.py \
+  --vars /tmp/vars.json
 ```
 
-- inputs.json 的字段来源：`bundle` 指第 1 节 `dist-txiki/openlist-txiki.js`，`tjs_linux`/`tjs_win`
-  指第 2 节编出的两个二进制；`dist` 是 `fetch-frontend.sh` 拉取的官方前端 dist 目录
-  （文件数/字节/树 sha256 已钉在 json 里）；`offer`/`notices` 指归档 `scripts/SOURCE-OFFER`
-  与 `scripts/THIRD-PARTY-NOTICES`；`templates.dir` 指归档 `build/assets/`。
-  路径可写绝对路径或相对当前工作目录，换机器复算时按实际位置改这几条。
+要自填的七个输入：
+
+| 占位符 | 指向 | 怎么来 |
+|---|---|---|
+| `${BUNDLE}` | `dist-txiki/openlist-txiki.js` | 第 1 节出 bundle |
+| `${TJS_LINUX}` | linux x86_64 的 tjs 二进制 | 第 2 节编译 |
+| `${TJS_WIN}` | windows x64 的 tjs 可执行 | 第 2 节编译 |
+| `${DIST}` | 官方前端 dist 目录 | `scripts/fetch-frontend.sh` 拉取 |
+| `${OFFER}` | `scripts/SOURCE-OFFER` | 归档自带 |
+| `${NOTICES}` | `scripts/THIRD-PARTY-NOTICES` | 归档自带 |
+| `${TEMPLATES_DIR}` | `build/assets/` | 归档自带 |
+
+- 相对路径按 `--inputs-root` 解析，默认仓根（或归档根）；不写 `--vars` 时也可用环境变量
+  `BUILD_ARCHIVES_VAR_<NAME>` 逐个给。
+- 身份不匹配就停：json 里钉了五件输入的 sha256 与字节数，`dist` 另钉文件数、字节与树 sha256。
+  换过 bundle 或 dist 的复算会以 `BUILD=FAIL reason=INPUT_IDENTITY` 收场，这是预期。
+- `--record` 只回写 sha256 与字节数，不改 `path` 原文，所以不会把本机路径写进 json。
 - 期望输出一行 `BUILD=PASS`，另两行给出两件的 `bytes` 与 `sha256`；任一项入身份不符即
   `BUILD=FAIL reason=...`、exit 1，输出目录零新文件。
 - 核对方式：与同一版本的 `SHA256SUMS.txt`（或 Release 资产页）逐件 `sha256sum -c`；文件名是
