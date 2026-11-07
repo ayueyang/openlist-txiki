@@ -396,6 +396,13 @@ start_service() {
 	[ -n "${RAW_RANGE_BUFFER_BUDGET:-}" ] && ENV_ARGS="$ENV_ARGS RAW_RANGE_BUFFER_BUDGET=$RAW_RANGE_BUFFER_BUDGET"
 	# guest 默认停用迁移（r30 F1）：只认 keep（不设=首次启动把默认形状的 guest 行置 disabled=1，一次性写 marker）；其它值不做校验，原样转发
 	[ -n "${OPENLIST_TXIKI_GUEST_DEFAULT:-}" ] && ENV_ARGS="$ENV_ARGS OPENLIST_TXIKI_GUEST_DEFAULT=$OPENLIST_TXIKI_GUEST_DEFAULT"
+	# 零拷贝文件体（r54，C 侧 TJS_FILE_BODY）：只转发 0|1；不设=该变量不进进程环境（运行时默认关）。
+	# 其它值（含空格/换行）不转发并记一条日志：值域与 C 侧一致，也避免向 procd 塞裸参数。
+	case "${TJS_FILE_BODY:-}" in
+		'') ;;
+		0|1) ENV_ARGS="$ENV_ARGS TJS_FILE_BODY=$TJS_FILE_BODY" ;;
+		*) log "ignore TJS_FILE_BODY value (expect 0|1)" ;;
+	esac
 	# 故意不加引号：procd_set_param 要的是逐个 KEY=VALUE 参数；上面这些值都是数字或路径，不含空白。
 	procd_set_param env $ENV_ARGS
 	procd_set_param respawn 3600 5 5

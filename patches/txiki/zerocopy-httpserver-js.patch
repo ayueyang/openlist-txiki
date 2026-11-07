@@ -1,0 +1,44 @@
+--- backup/httpserver.js	2026-11-07 09:04:07.319431857 +0800
++++ /home/admin/txiki-r269r3/src/js/core/httpserver.js	2026-11-07 16:03:32.920387580 +0800
+@@ -29,6 +29,12 @@
+ // the file-system path read this; it is the exact string lws produced.
+ const kDecodedPath = Symbol.for('tjs.decodedPath');
+ 
++// Marker the local-file shim puts on the ReadableStream it returns.
++// Only whole-file GET/HEAD responses take the zero-copy path; a stream
++// without the marker (encrypted/proxied/transformed bytes) keeps the
++// existing JS streaming path.
++const kFileBody = Symbol.for('tjs.fileBody');
++
+ function splitUrl(url, path, query) {
+     // C passes path and query as separate strings (UTF-8 decoded by
+     // JS_NewStringLen).  The fallback is for callers that only have the
+@@ -363,6 +369,28 @@
+                 responseHeaders.push([ name, value ]);
+             });
+ 
++            const fileBody = response.body?.[kFileBody];
++
++            if (
++                fileBody &&
++                (method === 'GET' || method === 'HEAD') &&
++                (status === 200 || status === 206) &&
++                fileBody.offset === 0 && fileBody.length === -1 &&
++                !response.headers.has('content-encoding') &&
++                !response.headers.has('transfer-encoding')
++            ) {
++                const sent = this.#handle.sendFile(
++                    requestId, status, responseHeaders, fileBody.path,
++                    fileBody.offset, fileBody.length, method === 'HEAD',
++                );
++
++                if (sent) {
++                    headersSent = true;
++                    this.#settleRequestBody(requestId);
++                    return;
++                }
++            }
++
+             if (response.body && response.bodySize < 0) {
+                 // Streaming: send headers first, then stream body chunks.
+                 // Filter hop-by-hop headers that lws manages itself.

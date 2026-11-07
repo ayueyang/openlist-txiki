@@ -1,0 +1,151 @@
+--- /tmp/httpserver.c.pre-zcfix	2026-11-07 19:20:36.993680274 +0800
++++ src/httpserver.c	2026-11-07 19:20:37.004910912 +0800
+@@ -30,6 +30,7 @@
+ #include "utils.h"
+ 
+ #include <string.h>
++#include <stdlib.h>
+ #include <errno.h>
+ #if defined(__linux__)
+ #include <sys/sendfile.h>
+@@ -60,6 +61,16 @@
+  * transmit is killed mid-response unless the watchdog is re-armed while the
+  * transfer is making progress. */
+ #define TJS_HTTP_STREAM_IDLE_TIMEOUT 120
++/* Stage-2 zero-copy file body is opt-in: /usr/bin/tjs is shared with
++ * alist-encrypt, so the feature must stay inert unless TJS_FILE_BODY=1. */
++static int tjs_file_body_enabled(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char *v = getenv("TJS_FILE_BODY");
++        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
++    }
++    return cached == 1;
++}
+ 
+ typedef enum {
+     TJS_HTTP_CHUNK_STATE_SIZE,
+@@ -150,7 +161,7 @@
+     lws_fileofs_t file_offset;
+     size_t file_remaining;
+     bool file_head_only;
+-    uint8_t *file_buf;   /* relay buffer (LWS_PRE + 64 KiB), lazy */
++    uint8_t *file_buf;   /* relay buffer (LWS_PRE + TJS_HTTP_WRITE_CHUNK_SIZE), lazy */
+     size_t file_buf_len;
+     size_t file_buf_sent;
+ } TJSHttpRequest;
+@@ -1293,6 +1304,15 @@
+             /* Zero-copy file body: headers were already sent by sendFile(). */
+             if (req->file_fd >= 0) {
+                 if (req->file_remaining == 0) {
++                    /* F2: HTTP/2 and HTTP/3 need an explicit END_STREAM even
++                     * for an empty body; HTTP/1 is framed by Content-Length. */
++                    if (req->http_version != TJS_HTTP_1_1) {
++                        uint8_t *zbuf = js_malloc(s->ctx, LWS_PRE);
++                        if (zbuf) {
++                            lws_write(wsi, zbuf + LWS_PRE, 0, LWS_WRITE_HTTP_FINAL);
++                            js_free(s->ctx, zbuf);
++                        }
++                    }
+                     int must_close = lws_http_transaction_completed(wsi);
+                     tjs_http_req_complete(s, req);
+                     return must_close ? -1 : 0;
+@@ -1375,7 +1395,7 @@
+                 /* Relay path (TLS / HTTP/2 / HTTP/3 / non-Linux): one copy into
+                  * a fixed buffer, then lws_write. */
+                 if (!req->file_buf) {
+-                    req->file_buf = js_malloc(s->ctx, LWS_PRE + 64 * 1024);
++                    req->file_buf = js_malloc(s->ctx, LWS_PRE + TJS_HTTP_WRITE_CHUNK_SIZE);
+                     if (!req->file_buf) {
+                         return -1;
+                     }
+@@ -1384,7 +1404,7 @@
+                 }
+ 
+                 if (req->file_buf_len == req->file_buf_sent) {
+-                    size_t want = MIN(req->file_remaining, (size_t) (64 * 1024));
++                    size_t want = MIN(req->file_remaining, (size_t) TJS_HTTP_WRITE_CHUNK_SIZE);
+                     uv_fs_t rd;
+                     uv_buf_t b = uv_buf_init((char *) req->file_buf + LWS_PRE, want);
+                     int r = uv_fs_read(NULL, &rd, req->file_fd, &b, 1, req->file_offset, NULL);
+@@ -2324,6 +2344,17 @@
+         return JS_FALSE;
+     }
+ 
++    /* F3/F5: opt-in only (TJS_FILE_BODY=1); the default keeps the JS stream. */
++    if (!tjs_file_body_enabled()) {
++        return JS_FALSE;
++    }
++
++    /* F1/F2: the relay path for multiplexed protocols is not validated yet.
++     * HTTP/2 and HTTP/3 keep the existing JS stream until it is. */
++    if (req->http_version != TJS_HTTP_1_1) {
++        return JS_FALSE;
++    }
++
+     int status;
+     if (JS_ToInt32(ctx, &status, argv[1])) {
+         return JS_EXCEPTION;
+@@ -2406,8 +2437,6 @@
+         ok = false;
+     }
+ 
+-    bool has_content_length = false;
+-
+     if (ok && JS_IsArray(argv[2])) {
+         int64_t headers_len;
+         JS_GetLength(ctx, argv[2], &headers_len);
+@@ -2422,17 +2451,18 @@
+             const char *value = JS_ToCStringLen(ctx, &value_len, value_val);
+ 
+             if (name && value) {
+-                if (strcasecmp(name, "content-length") == 0) {
+-                    has_content_length = true;
+-                }
+-
+-                if (lws_add_http_header_by_name(req->wsi,
+-                                                (const unsigned char *) name,
+-                                                (const unsigned char *) value,
+-                                                (int) value_len,
+-                                                &p,
+-                                                end)) {
+-                    ok = false;
++                /* F4: the application's Content-Length comes from a separate
++                 * stat and may be stale; the fstat-derived send_len below is
++                 * the only value that keeps h1 keep-alive framing correct. */
++                if (strcasecmp(name, "content-length") != 0) {
++                    if (lws_add_http_header_by_name(req->wsi,
++                                                    (const unsigned char *) name,
++                                                    (const unsigned char *) value,
++                                                    (int) value_len,
++                                                    &p,
++                                                    end)) {
++                        ok = false;
++                    }
+                 }
+             }
+ 
+@@ -2444,7 +2474,7 @@
+         }
+     }
+ 
+-    if (ok && !has_content_length) {
++    if (ok) {
+         if (lws_add_http_header_content_length(req->wsi, (lws_filepos_t) send_len, &p, end)) {
+             ok = false;
+         }
+@@ -2473,6 +2503,14 @@
+     req->file_head_only = head_only;
+ 
+     if (req->file_remaining == 0) {
++        /* F2: same END_STREAM requirement as the writable-callback arm. */
++        if (req->http_version != TJS_HTTP_1_1) {
++            uint8_t *zbuf = js_malloc(ctx, LWS_PRE);
++            if (zbuf) {
++                lws_write(req->wsi, zbuf + LWS_PRE, 0, LWS_WRITE_HTTP_FINAL);
++                js_free(ctx, zbuf);
++            }
++        }
+         int must_close = lws_http_transaction_completed(req->wsi);
+         (void) must_close;
+         tjs_http_req_complete(s, req);

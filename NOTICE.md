@@ -2,16 +2,19 @@
 
 ## 上游与版本
 
-- 当前版本：**0.1.0-r52**（与同版 apk 包内 `build-manifest.json` 的 `package_version` 同值）
+- 当前版本：**0.1.0-r54**（与同版 apk 包内 `build-manifest.json` 的 `package_version` 同值）
 - 应用：**OpenListTeam/OpenList-Worker**，许可证 AGPL-3.0
   固定基线 commit：`5f53f58dd0f5e5d03eb6079da7f637fa151d8dca`
-  应用补丁：52 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）
+  应用补丁：53 个，见 `patches/openlist/`（按文件名编号顺序累进 `git apply`）
 - 运行时：**qwtel/txiki-js** fork（txiki.js 26.9.0），许可证 MIT
-  tjs 侧补丁：7 个，见 `patches/txiki/`，逐个如下（前 6 个用于本版发布的三目标
-  aarch64-linux-musl / x86_64-linux-musl / x86_64-windows，第 7 个只用于 aarch64-windows）：
-  `p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`、`mbedtls-tls12-pss.patch`、
-  `lws-mbedtls-client-alpn-uaf.patch`、`mbedtls-quic.patch`、`wamr-zig.patch`、
-  `libffi-aarch64-windows.patch`（仅 aarch64-windows，本版三目标不发它）
+  tjs 侧补丁：16 个，见 `patches/txiki/`，清单与 apply 顺序见 `patches/txiki/TXIKI-PATCHES.md`
+  （三目标 aarch64-linux-musl / x86_64-linux-musl / x86_64-windows 不发 `libffi-aarch64-windows.patch`）：
+  `lws-mbedtls-client-alpn-uaf.patch`、`lws-uri-encoding.patch`、`mbedtls-quic.patch`、
+  `mbedtls-tls12-pss.patch`、`wamr-zig.patch`、`libffi-aarch64-windows.patch`、
+  `s1a-c21-5.0.0.patch`、`s1b-backpressure.patch`、`txiki-wasm-module.patch`、
+  `05-mbedtls-build-wiring.patch`、`p6-stream-body.patch`、`p6b-abort-incomplete-body.patch`、
+  `0002-txiki-decoded-path.patch`、`zerocopy-http-file-body.patch`、
+  `zerocopy-httpserver-js.patch`、`f1f5-on-c4bd7a0c.patch`
 
 ## 许可证归属
 

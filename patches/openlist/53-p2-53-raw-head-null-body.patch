@@ -1,0 +1,22 @@
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -756,6 +756,9 @@
+             if (size > 0) c.header("Content-Length", size.toString())
+             c.header("Accept-Ranges", "bytes")
+             c.header("Content-Type", "application/octet-stream")
++            // HEAD 不造流：Hono 的 HEAD 包装会把 body 换成 null，造出来的流没人读，
++            // 文件句柄只能等 GC（r54 fd 泄漏修复，见 arch-r54-fdleak-0230）。
++            if (c.req.method === "HEAD") return c.body(null)
+             const stream = await (driver as any).createReadStream(
+               resolved.physical,
+             )
+@@ -835,6 +838,8 @@
+     }
+     c.header("Content-Length", stat.size.toString())
+     c.header("Accept-Ranges", "bytes")
++    // HEAD 不造流（同驱动分支）：头已在上面设好，body 由 Hono 换 null。
++    if (c.req.method === "HEAD") return c.body(null)
+     const stream = createReadStream(resolved.physical)
+     return c.body(stream as any)
+   } catch (err: any) {

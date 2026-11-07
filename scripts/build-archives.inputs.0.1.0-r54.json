@@ -1,0 +1,52 @@
+{
+  "version": "0.1.0-r54",
+  "patch_count": 53,
+  "bundle": {
+    "sha256": "62273822f49c003178cb8a207a63a2360e5cfe32bde6a65843ff62f329ce5992",
+    "bytes": 2076754,
+    "path": "${BUNDLE}"
+  },
+  "tjs_linux": {
+    "sha256": "869143554c5dd91b50a7310c829551b24cd9c1fc92a5cecf05dcc7ec214c876c",
+    "bytes": 5359312,
+    "path": "${TJS_LINUX}"
+  },
+  "tjs_win": {
+    "sha256": "61a0f41cb38198c2f3ec8a986971d87b405150eae106d5445a4908329f03edf1",
+    "bytes": 5303808,
+    "path": "${TJS_WIN}"
+  },
+  "dist": {
+    "path": "${DIST}",
+    "tree_sha256": "c107306c3f3d760d65bf9f615d92d9a9a67485d72e024b0e0d061178f63c5137",
+    "bytes": 58517793,
+    "files": 452
+  },
+  "offer": {
+    "path": "${OFFER}",
+    "sha256": "df428b15d463e00e1c5ecb2b291646c2273b30ae0c2d8595bfa4d0cbae499fa1",
+    "bytes": 5447
+  },
+  "notices": {
+    "path": "${NOTICES}",
+    "sha256": "0b80470f5b1f2fa49fe0df090e87723cff39e692556eec732644efe5c342fbb6",
+    "bytes": 4140
+  },
+  "templates": {
+    "dir": "${TEMPLATES_DIR}",
+    "files": {
+      "run.sh.in": {
+        "sha256": "414e52733ee637c8d28a269b550fe16927cf48d23de24f0aa09a7615bffe6ba6",
+        "bytes": 2941
+      },
+      "run.cmd.in": {
+        "sha256": "081b598c8e05852bd08f9ab9578c54772fe74f070ada66bea2a71de2975a3f2c",
+        "bytes": 4222
+      },
+      "README-Windows.md.in": {
+        "sha256": "e07e5900165a49c82e6ca322405a000ad9de7a87d172751a964b314d2e157a38",
+        "bytes": 2970
+      }
+    }
+  }
+}

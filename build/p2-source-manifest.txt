@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 52
+patch_count 53
 file_count 43
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -247,7 +247,7 @@ file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backen
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
 file 25ef8c10d05897cec00c42ef23820a962bb9b16e19287ac85a677d7e1f5d383c src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
-file 472cddeaaa10b2ef2d1f79e7e82b47f31b7dd560d03156c1fd96f5c5c6d70225 src/backend/server/raw.ts src=patch strip_header=no eol=lf
+file d24a2dc841d324f1d12cb881bb9abbcb00282a7f31d352bc4bf3ea642bea6d7b src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
 file 7a6387508311cb9b5bb8fae2855a950e8d7bf28ff3f94ef4216afb61771e6f85 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
@@ -259,7 +259,7 @@ file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backen
 file ae27a0ca9dfe2b71004385decc1406e57cc5584452284dfc876286ff3f56ab03 src/backend/txiki/readonly-gate.test.ts src=repo strip_header=no eol=lf
 file a38d341cbee89cb41d515b9cbdbfd27a1149b838e315db02553303f243de6b23 src/backend/txiki/rename-fail-entry.ts src=work/fault/rename-fail-entry.ts strip_header=no eol=lf
 file 7f69e2c9d8d19a98f60ea8bc42c3e2538105b224775cdd27e808d6d643286f78 src/backend/txiki/response-fixup.ts src=repo strip_header=yes eol=crlf
-file b0b7915452150eb5b9f1b19d7177d6679fbfa604b1fbdaff21172cd40898b9b7 src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
+file 11a8b1e712157dee68653e47358926a1e634c2feb36053343b4415c032ad600c src/backend/txiki/shims/fs.ts src=repo strip_header=yes eol=lf
 file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backend/txiki/shims/fs-promises.ts src=repo strip_header=yes eol=lf
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
 file c15a27dac45238029a945fe2e692915dffb62887a291d49383fa16a76e32512d src/backend/txiki/sqlite-d1.ts src=repo strip_header=yes eol=lf
@@ -382,3 +382,8 @@ patch 50 f0be42ada382c97783b737f87f46d665cfe22952ab265fd6f7a84c534cc782e0 work/p
 #   由补丁 sha 与 build-txiki.mjs 的 Q1/Q2 在位断言校验）。
 patch 51 274a44858f48b2ce37bcf62b7e4458aba161259f954b57f228671b61df788e2b work/p2-51-quark-refresh-align.patch
 patch 52 b69c790026245bac84ca327e178b5c06b55ed4fc37430cf5d00ad4b9bdb5f212 work/p2-52-ali-refresh-backoff-sub.patch
+#
+# 第 53 条（2026-11-08，r54 F2）：raw.ts 的本地文件分支与驱动分支在 HEAD 时直接返 c.body(null)，
+#   不再 createReadStream（Hono 的 HEAD 包装会把 body 换成 null，流没人读只能等 GC）；
+#   头与 Content-Length / Accept-Ranges 保留不变。patch_count 52->53，file_count 43 不变。
+patch 53 71ea7c2eb736a5d5575c18605aaa893ab2f833c3c98835f0ff86cdf5d68a56dc work/p2-53-raw-head-null-body.patch

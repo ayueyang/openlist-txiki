@@ -1,0 +1,400 @@
+--- backup/httpserver.c	2026-11-07 09:04:07.319431857 +0800
++++ /home/admin/txiki-r269r3/src/httpserver.c	2026-11-07 16:03:32.918873397 +0800
+@@ -30,6 +30,10 @@
+ #include "utils.h"
+ 
+ #include <string.h>
++#include <errno.h>
++#if defined(__linux__)
++#include <sys/sendfile.h>
++#endif
+ 
+ #define TJS_HTTP_PROTOCOL_NAME "tjs-http"
+ #ifndef MIN
+@@ -139,6 +143,16 @@
+     size_t response_len;    /* total length including LWS_PRE + headers + body */
+     size_t response_offset; /* current send offset (relative to start of headers, i.e. LWS_PRE) */
+     size_t header_len;      /* length of headers portion */
++
++    /* Zero-copy file body (whole-file GET/HEAD only).  file_fd is -1
++     * unless the JS layer handed this response to sendFile(). */
++    int file_fd;
++    lws_fileofs_t file_offset;
++    size_t file_remaining;
++    bool file_head_only;
++    uint8_t *file_buf;   /* relay buffer (LWS_PRE + 64 KiB), lazy */
++    size_t file_buf_len;
++    size_t file_buf_sent;
+ } TJSHttpRequest;
+ 
+ /*
+@@ -232,6 +246,13 @@
+     JS_FreeValueRT(rt, req->drain_resolve);
+     tbuf_free(&req->body_buf);
+     js_free_rt(rt, req->response_data);
++    if (req->file_fd >= 0) {
++        uv_fs_t close_req;
++        uv_fs_close(NULL, &close_req, req->file_fd, NULL);
++        uv_fs_req_cleanup(&close_req);
++        req->file_fd = -1;
++    }
++    js_free_rt(rt, req->file_buf);
+ 
+     /* Free any pending streaming writes. */
+     struct list_head *el, *el1;
+@@ -991,6 +1012,7 @@
+             lws_set_wsi_user(wsi, req);
+             init_list_head(&req->pending_writes);
+             req->drain_resolve = JS_UNDEFINED;
++            req->file_fd = -1;
+             req->wsi = wsi;
+             req->id = s->next_req_id++;
+             tbuf_init(s->ctx, &req->body_buf);
+@@ -1268,6 +1290,148 @@
+                 return 0;
+             }
+ 
++            /* Zero-copy file body: headers were already sent by sendFile(). */
++            if (req->file_fd >= 0) {
++                if (req->file_remaining == 0) {
++                    int must_close = lws_http_transaction_completed(wsi);
++                    tjs_http_req_complete(s, req);
++                    return must_close ? -1 : 0;
++                }
++
++                bool plain_h1 = (req->http_version == TJS_HTTP_1_1) && !lws_is_ssl(wsi);
++
++#if defined(__linux__)
++                if (plain_h1) {
++                    int sock = lws_get_socket_fd(wsi);
++                    if (sock < 0) {
++                        return -1;
++                    }
++
++                    size_t budget = 256 * 1024;
++
++                    while (budget > 0 && req->file_remaining > 1) {
++                        size_t to_send = MIN(req->file_remaining - 1, budget);
++                        off_t off = (off_t) req->file_offset;
++                        ssize_t n = sendfile(sock, req->file_fd, &off, to_send);
++
++                        if (n < 0) {
++                            if (errno == EINTR) {
++                                continue;
++                            }
++                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
++                                lws_callback_on_writable(wsi);
++                                return 0;
++                            }
++                            lwsl_wsi_err(wsi, "sendfile failed: errno %d", errno);
++                            return -1;
++                        }
++                        if (n == 0) {
++                            lwsl_wsi_err(wsi, "sendfile hit EOF with %zu bytes left", req->file_remaining);
++                            return -1;
++                        }
++
++                        req->file_offset += n;
++                        req->file_remaining -= (size_t) n;
++                        budget -= (size_t) n;
++                    }
++
++                    if (req->file_remaining == 1) {
++                        /* lws must see the final byte through lws_write() so it
++                         * frames the response and updates keep-alive state. */
++                        if (!req->file_buf) {
++                            req->file_buf = js_malloc(s->ctx, LWS_PRE + 1);
++                            if (!req->file_buf) {
++                                return -1;
++                            }
++                        }
++
++                        uv_fs_t rd;
++                        uv_buf_t b = uv_buf_init((char *) req->file_buf + LWS_PRE, 1);
++                        int r = uv_fs_read(NULL, &rd, req->file_fd, &b, 1, req->file_offset, NULL);
++                        uv_fs_req_cleanup(&rd);
++                        if (r != 1) {
++                            return -1;
++                        }
++
++                        int n = lws_write(wsi, req->file_buf + LWS_PRE, 1, LWS_WRITE_HTTP_FINAL);
++                        if (n < 0) {
++                            return -1;
++                        }
++
++                        req->file_offset += 1;
++                        req->file_remaining = 0;
++
++                        int must_close = lws_http_transaction_completed(wsi);
++                        tjs_http_req_complete(s, req);
++                        return must_close ? -1 : 0;
++                    }
++
++                    lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_RESPONSE, TJS_HTTP_STREAM_IDLE_TIMEOUT);
++                    lws_callback_on_writable(wsi);
++                    return 0;
++                }
++#endif
++
++                /* Relay path (TLS / HTTP/2 / HTTP/3 / non-Linux): one copy into
++                 * a fixed buffer, then lws_write. */
++                if (!req->file_buf) {
++                    req->file_buf = js_malloc(s->ctx, LWS_PRE + 64 * 1024);
++                    if (!req->file_buf) {
++                        return -1;
++                    }
++                    req->file_buf_len = 0;
++                    req->file_buf_sent = 0;
++                }
++
++                if (req->file_buf_len == req->file_buf_sent) {
++                    size_t want = MIN(req->file_remaining, (size_t) (64 * 1024));
++                    uv_fs_t rd;
++                    uv_buf_t b = uv_buf_init((char *) req->file_buf + LWS_PRE, want);
++                    int r = uv_fs_read(NULL, &rd, req->file_fd, &b, 1, req->file_offset, NULL);
++                    uv_fs_req_cleanup(&rd);
++                    if (r <= 0) {
++                        return -1;
++                    }
++                    req->file_buf_len = (size_t) r;
++                    req->file_buf_sent = 0;
++                }
++
++                size_t to_write = req->file_buf_len - req->file_buf_sent;
++
++                {
++                    lws_fileofs_t allow = lws_get_peer_write_allowance(wsi);
++                    if (allow == 0) {
++                        return 0;
++                    }
++                    if (allow > 0 && (lws_fileofs_t) to_write > allow) {
++                        to_write = (size_t) allow;
++                    }
++                }
++
++                bool last_chunk = (to_write == req->file_remaining);
++                int n = lws_write(wsi,
++                                  req->file_buf + LWS_PRE + req->file_buf_sent,
++                                  to_write,
++                                  last_chunk ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP);
++                if (n < 0) {
++                    return -1;
++                }
++
++                req->file_buf_sent += (size_t) n;
++                req->file_offset += n;
++                req->file_remaining -= (size_t) n;
++
++                if (last_chunk && req->file_buf_sent >= req->file_buf_len) {
++                    int must_close = lws_http_transaction_completed(wsi);
++                    tjs_http_req_complete(s, req);
++                    return must_close ? -1 : 0;
++                }
++
++                lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_RESPONSE, TJS_HTTP_STREAM_IDLE_TIMEOUT);
++                lws_callback_on_writable(wsi);
++                return 0;
++            }
++
+             if (req->streaming) {
+                 /* abort() was called: the body did not complete (upstream error,
+                  * driver read failure).  Never flush anything more, in particular
+@@ -2136,6 +2300,190 @@
+ }
+ 
+ /*
++ * HttpServer.prototype.sendFile(requestId, status, headersArray, path,
++ *                                offset, length, headOnly) -> boolean
++ *
++ * Zero-copy whole-file response.  Returns false when nothing has been written
++ * and the caller must fall back to the JS stream; returns true when the
++ * response has been taken over (headers queued, body follows from the
++ * writable callback).
++ */
++static JSValue tjs_httpserver_send_file(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
++    TJSHttpServer *s = tjs_httpserver_get(ctx, this_val);
++    if (!s) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t req_id;
++    if (JS_ToInt64(ctx, &req_id, argv[0])) {
++        return JS_EXCEPTION;
++    }
++
++    TJSHttpRequest *req = tjs_http_find_request(s, req_id);
++    if (!req || req->responded) {
++        return JS_FALSE;
++    }
++
++    int status;
++    if (JS_ToInt32(ctx, &status, argv[1])) {
++        return JS_EXCEPTION;
++    }
++
++    const char *path = JS_ToCString(ctx, argv[3]);
++    if (!path) {
++        return JS_EXCEPTION;
++    }
++
++    int64_t offset = 0;
++    int64_t length = -1;
++    if (JS_ToInt64(ctx, &offset, argv[4]) || JS_ToInt64(ctx, &length, argv[5])) {
++        JS_FreeCString(ctx, path);
++        return JS_EXCEPTION;
++    }
++    bool head_only = JS_ToBool(ctx, argv[6]);
++
++    /* Open + fstat synchronously.  Any failure means "fall back to JS". */
++    uv_fs_t open_req;
++    int fd = uv_fs_open(NULL, &open_req, path, O_RDONLY, 0, NULL);
++    uv_fs_req_cleanup(&open_req);
++    JS_FreeCString(ctx, path);
++    if (fd < 0) {
++        return JS_FALSE;
++    }
++
++    uv_fs_t stat_req;
++    int rc = uv_fs_fstat(NULL, &stat_req, fd, NULL);
++    uv_stat_t st;
++    if (rc == 0) {
++        st = stat_req.statbuf;
++    }
++    uv_fs_req_cleanup(&stat_req);
++
++    if (rc != 0 || !S_ISREG(st.st_mode)) {
++        uv_fs_t close_req;
++        uv_fs_close(NULL, &close_req, fd, NULL);
++        uv_fs_req_cleanup(&close_req);
++        return JS_FALSE;
++    }
++
++    uint64_t fsize = (uint64_t) st.st_size;
++    if (offset < 0 || (uint64_t) offset > fsize) {
++        uv_fs_t close_req;
++        uv_fs_close(NULL, &close_req, fd, NULL);
++        uv_fs_req_cleanup(&close_req);
++        return JS_FALSE;
++    }
++
++    uint64_t avail = fsize - (uint64_t) offset;
++    uint64_t send_len = avail;
++    if (length >= 0) {
++        send_len = (uint64_t) length;
++        if (send_len > avail) {
++            send_len = avail;
++        }
++    }
++
++    /* Build and send the response headers (same shape as sendResponse). */
++    size_t hdr_buf_size = LWS_PRE + TJS_MAX_HEADER_SIZE;
++    unsigned char *header_buf = js_malloc(ctx, hdr_buf_size);
++    if (!header_buf) {
++        uv_fs_t close_req;
++        uv_fs_close(NULL, &close_req, fd, NULL);
++        uv_fs_req_cleanup(&close_req);
++        return JS_ThrowOutOfMemory(ctx);
++    }
++
++    unsigned char *start = &header_buf[LWS_PRE];
++    unsigned char *p = start;
++    unsigned char *end = header_buf + hdr_buf_size - 1;
++    bool ok = true;
++
++    if (lws_add_http_header_status(req->wsi, (unsigned int) status, &p, end)) {
++        ok = false;
++    }
++
++    if (ok && tjs_http_add_altsvc(s, req, &p, end)) {
++        ok = false;
++    }
++
++    bool has_content_length = false;
++
++    if (ok && JS_IsArray(argv[2])) {
++        int64_t headers_len;
++        JS_GetLength(ctx, argv[2], &headers_len);
++
++        for (int64_t i = 0; i < headers_len && ok; i++) {
++            JSValue pair = JS_GetPropertyUint32(ctx, argv[2], i);
++            JSValue name_val = JS_GetPropertyUint32(ctx, pair, 0);
++            JSValue value_val = JS_GetPropertyUint32(ctx, pair, 1);
++
++            const char *name = JS_ToCString(ctx, name_val);
++            size_t value_len;
++            const char *value = JS_ToCStringLen(ctx, &value_len, value_val);
++
++            if (name && value) {
++                if (strcasecmp(name, "content-length") == 0) {
++                    has_content_length = true;
++                }
++
++                if (lws_add_http_header_by_name(req->wsi,
++                                                (const unsigned char *) name,
++                                                (const unsigned char *) value,
++                                                (int) value_len,
++                                                &p,
++                                                end)) {
++                    ok = false;
++                }
++            }
++
++            JS_FreeCString(ctx, name);
++            JS_FreeCString(ctx, value);
++            JS_FreeValue(ctx, name_val);
++            JS_FreeValue(ctx, value_val);
++            JS_FreeValue(ctx, pair);
++        }
++    }
++
++    if (ok && !has_content_length) {
++        if (lws_add_http_header_content_length(req->wsi, (lws_filepos_t) send_len, &p, end)) {
++            ok = false;
++        }
++    }
++
++    if (ok && lws_finalize_write_http_header(req->wsi, start, &p, end)) {
++        ok = false;
++    }
++
++    js_free(ctx, header_buf);
++
++    if (!ok) {
++        uv_fs_t close_req;
++        uv_fs_close(NULL, &close_req, fd, NULL);
++        uv_fs_req_cleanup(&close_req);
++        return JS_FALSE;
++    }
++
++    req->responded = true;
++    tjs_http_discard_unread_body(req);
++    lws_set_timeout(req->wsi, PENDING_TIMEOUT_HTTP_RESPONSE, TJS_HTTP_STREAM_IDLE_TIMEOUT);
++
++    req->file_fd = fd;
++    req->file_offset = (lws_fileofs_t) offset;
++    req->file_remaining = head_only ? 0 : (size_t) send_len;
++    req->file_head_only = head_only;
++
++    if (req->file_remaining == 0) {
++        int must_close = lws_http_transaction_completed(req->wsi);
++        (void) must_close;
++        tjs_http_req_complete(s, req);
++        return JS_TRUE;
++    }
++
++    lws_callback_on_writable(req->wsi);
++    return JS_TRUE;
++}
++
++/*
+  * HttpServer.prototype.sendHeaders(requestId, status, headersArray)
+  *
+  * Send only the HTTP headers for a streaming response (no Content-Length).
+@@ -2748,6 +3096,7 @@
+     TJS_CFUNC_DEF("sendResponse", 4, tjs_httpserver_send_response),
+     TJS_CFUNC_DEF("sendHeaders", 3, tjs_httpserver_send_headers),
+     TJS_CFUNC_DEF("sendBody", 3, tjs_httpserver_send_body),
++    TJS_CFUNC_DEF("sendFile", 7, tjs_httpserver_send_file),
+     TJS_CFUNC_DEF("bufferedAmount", 1, tjs_httpserver_buffered_amount),
+     TJS_CFUNC_DEF("waitDrain", 2, tjs_httpserver_wait_drain),
+     TJS_CFUNC_DEF("abort", 1, tjs_httpserver_abort),
