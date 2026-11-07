@@ -1,6 +1,6 @@
 openlist-txiki 第三方声明（THIRD-PARTY-NOTICES）
 ================================================
-本声明对应包版本：0.1.0-r54（与包内 build-manifest.json 的 package_version 同值）。
+本声明对应包版本：0.1.0-r55（与包内 build-manifest.json 的 package_version 同值）。
 
 1. OpenList-Worker（AGPL-3.0-only）
    本包包含 OpenListTeam/OpenList-Worker 的修改版本（bundle: openlist-txiki.js）。
