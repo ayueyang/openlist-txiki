@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 53
+patch_count 55
 file_count 43
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file 062f4da6d6d68834ecb1738e50e74b7375876798ab0825721e5f4d2abab8796b src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file aabcf3f7e830f36165dd065411101d961dcedaf957e3d010cdeb0395708ad511 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -387,3 +387,30 @@ patch 52 b69c790026245bac84ca327e178b5c06b55ed4fc37430cf5d00ad4b9bdb5f212 work/p
 #   不再 createReadStream（Hono 的 HEAD 包装会把 body 换成 null，流没人读只能等 GC）；
 #   头与 Content-Length / Accept-Ranges 保留不变。patch_count 52->53，file_count 43 不变。
 patch 53 71ea7c2eb736a5d5575c18605aaa893ab2f833c3c98835f0ff86cdf5d68a56dc work/p2-53-raw-head-null-body.patch
+#
+# 第 54 条（2026-11-08，F10）：139 驱动的 move/copy/put 从「只打 console.warn 后正常返回」
+#   改为 personal_new 真实调用。driver.ts 新增 resolveCatalogIdStrict / resolveItem /
+#   assertPersonalNew：move 走 /file/batchMove、copy 走 /file/batchCopy（body 均为
+#   {fileIds:[源 id],toParentFileId:目标父目录 id}），put 走 /file/create -> 逐片 PUT ->
+#   /file/complete；family/group/旧版 personal 与多名称调用显式抛错。util.ts 新增
+#   batchMove/batchCopy/uploadPersonalNew（串行，请求体固定 parallelUpload:false，分片
+#   100MiB/512MiB，>100 片按批 /file/getUploadUrl，同名冲突按 A 的改名-删除-改回处理），
+#   并把 request() 的失败判定从「success===false 且有 message」改成「success===false」
+#   （无 message 的失败以前会被当成功返回）。types.ts 新增 PersonalPartInfo /
+#   PersonalUploadResp / PersonalUploadUrlResp。新增 driver.movecopy.test.ts（node:http
+#   本地 mock，零真实账号）。139 三个文件与测试都不登记 file 条目，靠补丁 sha 校验。
+#   patch_count 53->55，file_count 43 不变。
+#
+# 第 55 条（2026-11-08，F11）：aliyundrive_share 的 refresh_token 从「声明了但零引用」变成
+#   可用凭据。util.ts 新增 refreshAccessToken（单飞 promise，auth.alipan.com/v2/account/token，
+#   grant_type=refresh_token）、ensureAccessToken / ensureShareToken、authHost / apiHost；
+#   getDownloadUrl 注入 Authorization: "Bearer\t"+access_token（字面 tab，对齐 A/O），
+#   AccessTokenInvalid 刷新后重试一次、ShareLinkTokenInvalid 重取 share_token 后重试一次，
+#   重试有界不递归；getFiles 保持不带 Authorization，只对 ShareLinkTokenInvalid 重试一次，
+#   AccessTokenInvalid 直接上抛（旧代码会无意义循环）。driver.ts 透传 onTokenRefreshed；
+#   internal/op/storage.ts 的 aliyundrive_share 构造处照 Dropbox 范式把轮换后的
+#   refresh_token 落库并同步 storageConfig.addition。新增 driver.token.test.ts。
+#   storage.ts 的 file 条目 sha 随本次改动更新（062f4da6… -> aabcf3f7…）。
+#   patch_count 53->55，file_count 43 不变。
+patch 54 23ff85f05c6fbe7f8f30ebbe61dd1569080d3e6935bc0050695fe5ffabefcf5d work/p2-54-f10-139-movecopy-put.patch
+patch 55 7e7c03ae4c882578d30ad2fb3e45ab97e071b3247431d1b427ced048c00eae5b work/p2-55-f11-ali-share-refresh.patch

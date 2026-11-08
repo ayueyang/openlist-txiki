@@ -1,0 +1,735 @@
+diff --git a/src/backend/drivers/139/types.ts b/src/backend/drivers/139/types.ts
+--- a/src/backend/drivers/139/types.ts
++++ b/src/backend/drivers/139/types.ts
+@@ -135,3 +135,36 @@
+     cdnSwitch?: boolean
+   }
+ }
++
++/** /file/getUploadUrl 与 /file/create 响应里的分片地址。 */
++export interface PersonalPartInfo {
++  partNumber: number
++  uploadUrl: string
++}
++
++/** /file/create 的响应（A types.go:267-277）。 */
++export interface PersonalUploadResp {
++  success: boolean
++  code?: string
++  message?: string
++  data?: {
++    fileId?: string
++    fileName?: string
++    uploadId?: string
++    exist?: boolean
++    rapidUpload?: boolean
++    partInfos?: PersonalPartInfo[]
++  }
++}
++
++/** /file/getUploadUrl 的响应（超过 100 片时按批补拉）。 */
++export interface PersonalUploadUrlResp {
++  success: boolean
++  code?: string
++  message?: string
++  data?: {
++    fileId?: string
++    uploadId?: string
++    partInfos?: PersonalPartInfo[]
++  }
++}
+diff --git a/src/backend/drivers/139/util.ts b/src/backend/drivers/139/util.ts
+--- a/src/backend/drivers/139/util.ts
++++ b/src/backend/drivers/139/util.ts
+@@ -9,6 +9,9 @@
+   PersonalListResp,
+   PersonalDownloadResp,
+   PersonalFileItem,
++  PersonalPartInfo,
++  PersonalUploadResp,
++  PersonalUploadUrlResp,
+   Yun139TokenRefreshResp,
+ } from "./types"
+ 
+@@ -48,6 +51,21 @@
+ export function formatTime(d: Date): string {
+   const pad = (n: number) => String(n).padStart(2, "0")
+   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
++}
++
++/** 分片请求体：A types.go:229-237 的 PartInfo（partSize + parallelHashCtx）。 */
++type UploadPartInfo = {
++  partNumber: number
++  partSize: number
++  parallelHashCtx: { partOffset: number }
++}
++
++/** 整文件 SHA256，小写 hex；用 WebCrypto，txiki 没有 node:crypto。 */
++async function sha256Hex(data: Uint8Array): Promise<string> {
++  const digest = await crypto.subtle.digest("SHA-256", data as any)
++  return Array.from(new Uint8Array(digest))
++    .map((b) => b.toString(16).padStart(2, "0"))
++    .join("")
+ }
+ 
+ export class Yun139ApiClient {
+@@ -173,8 +191,12 @@
+     }
+ 
+     const json = (await res.json()) as any
+-    if (json.success === false && json.message) {
+-      throw new Error(`139 Cloud API error: ${json.message}`)
++    // success===false 且没有 message 时也必须失败：以前只看 message，
++    // 无 message 的失败会被当成功返回，调用方随后清缓存，用户看到假成功。
++    if (json.success === false) {
++      throw new Error(
++        `139 Cloud API error: ${json.message || json.code || "unknown"}`,
++      )
+     }
+     return json as T
+   }
+@@ -519,6 +541,182 @@
+     )
+   }
+ 
++  /** personal_new 的移动：POST /file/batchMove（A driver.go:205-218）。 */
++  async batchMove(fileIds: string[], toParentFileId: string): Promise<void> {
++    await this.request("/file/batchMove", { fileIds, toParentFileId })
++  }
++
++  /** personal_new 的复制：POST /file/batchCopy（A driver.go:381-392）。 */
++  async batchCopy(fileIds: string[], toParentFileId: string): Promise<void> {
++    await this.request("/file/batchCopy", { fileIds, toParentFileId })
++  }
++
++  /**
++   * personal_new 的串行上传，对齐 A driver.go:513-708：
++   * /file/create -> 逐片 PUT -> /file/complete -> 同名冲突修正。
++   * 并行上传（parallel_upload）不在本期，请求体固定 parallelUpload:false。
++   */
++  async uploadPersonalNew(
++    parentFileId: string,
++    name: string,
++    content: Uint8Array,
++    partSizeOverride?: number,
++  ): Promise<void> {
++    const size = content.length
++    const contentHash = await sha256Hex(content)
++    const partSize = this.getPartSize(size, partSizeOverride)
++    const partCount = size === 0 ? 1 : Math.ceil(size / partSize)
++
++    const partInfos: UploadPartInfo[] = []
++    for (let i = 0; i < partCount; i++) {
++      const start = i * partSize
++      partInfos.push({
++        partNumber: i + 1,
++        partSize: Math.min(partSize, size - start),
++        // A 的 PartInfo 没有 omitempty，串行请求也带这个对象。
++        parallelHashCtx: { partOffset: start },
++      })
++    }
++
++    // 只带前 100 片；其余分片等 create 返回 fileId/uploadId 后按批补拉地址。
++    const createResp = await this.request<PersonalUploadResp>("/file/create", {
++      contentHash,
++      contentHashAlgorithm: "SHA256",
++      contentType: "application/octet-stream",
++      parallelUpload: false,
++      partInfos: partInfos.slice(0, 100),
++      size,
++      parentFileId: parentFileId || this.addition.root_folder_id || "/",
++      name,
++      type: "file",
++      fileRenameMode: "auto_rename",
++    })
++
++    const data = createResp.data
++    if (!data || !data.fileId || !data.uploadId) {
++      throw new Error(
++        `139 upload: /file/create returned no fileId/uploadId for ${name}`,
++      )
++    }
++
++    // 同内容文件已存在，云端不会重复新增，直接成功。
++    if (data.exist) return
++
++    // A 的口径：partInfos 为空表示没有可上传的分片，连 complete 都不发。
++    if (data.partInfos) {
++      const uploadPartInfos: PersonalPartInfo[] = [...data.partInfos]
++
++      for (let i = 100; i < partInfos.length; i += 100) {
++        const moreResp = await this.request<PersonalUploadUrlResp>(
++          "/file/getUploadUrl",
++          {
++            fileId: data.fileId,
++            uploadId: data.uploadId,
++            partInfos: partInfos.slice(i, i + 100),
++            commonAccountInfo: {
++              account: this.account,
++              accountType: 1,
++            },
++          },
++        )
++        const moreParts = moreResp.data?.partInfos
++        if (!moreParts || moreParts.length === 0) {
++          throw new Error(
++            `139 upload: /file/getUploadUrl returned no partInfos for ${name}`,
++          )
++        }
++        uploadPartInfos.push(...moreParts)
++      }
++
++      for (const part of uploadPartInfos) {
++        const info = partInfos[part.partNumber - 1]
++        if (!info || !part.uploadUrl) {
++          throw new Error(
++            `139 upload: invalid part ${part.partNumber} for ${name}`,
++          )
++        }
++        const start = info.parallelHashCtx.partOffset
++        // subarray 零拷贝，不复制整片。
++        const chunk = content.subarray(start, start + info.partSize)
++        const res = await fetch(part.uploadUrl, {
++          method: "PUT",
++          headers: {
++            "Content-Type": "application/octet-stream",
++            "Content-Length": String(info.partSize),
++            Origin: "https://yun.139.com",
++            Referer: "https://yun.139.com/",
++          },
++          body: chunk as any,
++        })
++        if (res.status !== 200) {
++          throw new Error(
++            `139 upload: part ${part.partNumber} PUT failed with HTTP ${res.status} for ${name}`,
++          )
++        }
++      }
++
++      await this.request("/file/complete", {
++        contentHash,
++        contentHashAlgorithm: "SHA256",
++        fileId: data.fileId,
++        uploadId: data.uploadId,
++      })
++    }
++
++    if (data.fileName && data.fileName !== name) {
++      await this.resolveNameConflict(parentFileId, name, data.fileName)
++    }
++  }
++
++  /**
++   * 同名冲突修正（A driver.go:668-712）：服务端把新文件存成别的名字时，
++   * 把旧同名项改名后删除，再把新文件改回原名。
++   */
++  private async resolveNameConflict(
++    parentFileId: string,
++    name: string,
++    serverName: string,
++  ): Promise<void> {
++    // 等 500ms 让服务端列表刷新，与 A 一致。
++    await new Promise((resolve) => setTimeout(resolve, 500))
++    const disk = await this.listFiles(parentFileId)
++
++    const oldFolder = disk.folders.find((f) => f.catalogName === name)
++    const oldFile = disk.files.find((f) => f.contentName === name)
++    if (!oldFolder && !oldFile) {
++      // 找不到旧项时不能静默：新文件已经以 serverName 落库，交给用户处理。
++      throw new Error(
++        `139 upload: conflict for ${name} but the old item was not found (server stored it as ${serverName})`,
++      )
++    }
++
++    const tempName = `${name}${randomString(4)}`
++    if (oldFolder) {
++      await this.rename(oldFolder.catalogID, tempName)
++      await this.deleteCatalog(oldFolder.catalogID)
++    } else if (oldFile && oldFile.contentID) {
++      await this.rename(oldFile.contentID, tempName)
++      await this.deleteFile(oldFile.contentID)
++    }
++
++    const newFolder = disk.folders.find((f) => f.catalogName === serverName)
++    const newFile = disk.files.find((f) => f.contentName === serverName)
++    const newId = newFolder?.catalogID || newFile?.contentID
++    if (!newId) {
++      throw new Error(
++        `139 upload: uploaded file ${serverName} not found after conflict handling (requested ${name})`,
++      )
++    }
++    await this.rename(newId, name)
++  }
++
++  /** A driver.go:502-511：custom 优先；否则 >30GB 用 512MiB，其余 100MiB。 */
++  private getPartSize(size: number, override?: number): number {
++    if (override && override > 0) return override
++    if (size > 30 * 1024 * 1024 * 1024) return 512 * 1024 * 1024
++    return 100 * 1024 * 1024
++  }
++
+   async getStorageDetails(): Promise<{ total?: number; used?: number }> {
+     try {
+       const res = await this.request<Yun139StorageDetailsResp>(
+diff --git a/src/backend/drivers/139/driver.ts b/src/backend/drivers/139/driver.ts
+--- a/src/backend/drivers/139/driver.ts
++++ b/src/backend/drivers/139/driver.ts
+@@ -55,6 +55,68 @@
+     }
+ 
+     return currentCatalogId
++  }
++
++  /**
++   * 严格目录解析：任何一段目录不存在都抛错。
++   * 不能复用 resolveCatalogId——它在中间段缺失时 break 返回上一层，
++   * move/copy 会把目标当成上级目录，文件被移进错误位置。
++   */
++  private async resolveCatalogIdStrict(physicalPath: string): Promise<string> {
++    const clean = this.cleanPath(physicalPath)
++    if (clean === "/") {
++      return this.getRootId()
++    }
++
++    const parts = clean.split("/").filter(Boolean)
++    let currentCatalogId = this.getRootId()
++
++    for (const part of parts) {
++      const disk = await this.client.listFiles(currentCatalogId)
++      const foundFolder = disk.folders.find((f) => f.catalogName === part)
++      if (!foundFolder) {
++        throw new Error(`139 catalog not found: ${clean}`)
++      }
++      currentCatalogId = foundFolder.catalogID
++    }
++
++    return currentCatalogId
++  }
++
++  /** 解析源项：末段名 + 父目录列表里按名字命中；找不到抛错，不静默。 */
++  private async resolveItem(
++    physicalPath: string,
++  ): Promise<{ id: string; name: string; isDir: boolean }> {
++    const clean = this.cleanPath(physicalPath)
++    if (clean === "/") {
++      throw new Error(`Cannot move or copy the storage root: ${clean}`)
++    }
++
++    const name = clean.substring(clean.lastIndexOf("/") + 1)
++    const parentPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
++    const parentCatalogId = await this.resolveCatalogIdStrict(parentPath)
++    const disk = await this.client.listFiles(parentCatalogId)
++
++    const folder = disk.folders.find((f) => f.catalogName === name)
++    if (folder) {
++      return { id: folder.catalogID, name: folder.catalogName, isDir: true }
++    }
++
++    const file = disk.files.find((f) => f.contentName === name)
++    if (file && file.contentID) {
++      return { id: file.contentID, name: file.contentName || name, isDir: false }
++    }
++
++    throw new Error(`Item not found: ${clean}`)
++  }
++
++  /** 本期只实现 personal_new；family/group/旧版 personal 一律显式失败。 */
++  private assertPersonalNew(action: string): void {
++    if (!this.client.isPersonalNew()) {
++      throw new Error(
++        `139 ${this.addition.type || "unknown"}: ${action} is not implemented for this storage type`,
++      )
++    }
+   }
+ 
+   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+@@ -234,7 +296,17 @@
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    console.warn(`[139] move from ${srcPhys} to ${dstPhys}`)
++    this.assertPersonalNew("move")
++    // op/storage.ts:1807 恒传单项；多名称不做「部分成功」，直接失败。
++    if (names.length !== 1) {
++      throw new Error(`139 move supports exactly one item, got ${names.length}`)
++    }
++
++    const item = await this.resolveItem(srcPhys)
++    const dstClean = this.cleanPath(dstPhys)
++    const dstParentPath = dstClean.substring(0, dstClean.lastIndexOf("/")) || "/"
++    const dstParentId = await this.resolveCatalogIdStrict(dstParentPath)
++    await this.client.batchMove([item.id], dstParentId)
+   }
+ 
+   async copy(
+@@ -244,7 +316,17 @@
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    console.warn(`[139] copy from ${srcPhys} to ${dstPhys}`)
++    this.assertPersonalNew("copy")
++    if (names.length !== 1) {
++      throw new Error(`139 copy supports exactly one item, got ${names.length}`)
++    }
++
++    const item = await this.resolveItem(srcPhys)
++    // dstPhys 已含改名后的目标名，父目录取 dirname 即可。
++    const dstClean = this.cleanPath(dstPhys)
++    const dstParentPath = dstClean.substring(0, dstClean.lastIndexOf("/")) || "/"
++    const dstParentId = await this.resolveCatalogIdStrict(dstParentPath)
++    await this.client.batchCopy([item.id], dstParentId)
+   }
+ 
+   async put(
+@@ -252,7 +334,21 @@
+     physicalPath: string,
+     content: Buffer | Uint8Array,
+   ): Promise<void> {
+-    console.warn(`[139] put for ${physicalPath}`)
++    this.assertPersonalNew("put")
++    const clean = this.cleanPath(physicalPath)
++    if (clean === "/") {
++      throw new Error(`139 put requires a file path, got the storage root`)
++    }
++
++    const name = clean.substring(clean.lastIndexOf("/") + 1)
++    const parentPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
++    const parentId = await this.resolveCatalogIdStrict(parentPath)
++    await this.client.uploadPersonalNew(
++      parentId,
++      name,
++      content,
++      this.addition.custom_upload_part_size,
++    )
+   }
+ 
+   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {
+diff --git a/src/backend/drivers/139/driver.movecopy.test.ts b/src/backend/drivers/139/driver.movecopy.test.ts
+new file mode 100644
+--- /dev/null
++++ b/src/backend/drivers/139/driver.movecopy.test.ts
+@@ -0,0 +1,324 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { createHash } from "node:crypto"
++import { createServer } from "node:http"
++import type { IncomingMessage, ServerResponse } from "node:http"
++import type { AddressInfo } from "node:net"
++import { Yun139Driver } from "./driver"
++import { Yun139Addition } from "./types"
++
++/**
++ * 本地 mock，不登录真实账号：只按路径返回固定 JSON，并记录方法/路径/头/字节。
++ * 不校验 mcloud-sign（签名算法有独立用例）。
++ */
++type MockRoute = (ctx: {
++  body: any
++  raw: Buffer
++  headers: Record<string, any>
++  count: number
++}) => { status?: number; json?: any }
++
++type Recorded = {
++  method: string
++  path: string
++  headers: Record<string, any>
++  body: any
++  raw: Buffer
++}
++
++async function startMock(routes: Record<string, MockRoute>) {
++  const calls: Recorded[] = []
++  const counts = new Map<string, number>()
++
++  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
++    const chunks: Buffer[] = []
++    req.on("data", (c: Buffer) => chunks.push(c))
++    req.on("end", () => {
++      const raw = Buffer.concat(chunks)
++      const path = req.url || "/"
++      const key = `${req.method} ${path}`
++      const count = (counts.get(key) || 0) + 1
++      counts.set(key, count)
++
++      let body: any = null
++      const text = raw.toString("utf8")
++      if (text) {
++        try {
++          body = JSON.parse(text)
++        } catch {
++          body = text
++        }
++      }
++      calls.push({
++        method: req.method || "",
++        path,
++        headers: req.headers as Record<string, any>,
++        body,
++        raw,
++      })
++
++      const route = routes[key] ?? routes[path]
++      if (!route) {
++        res.writeHead(404, { "content-type": "application/json" })
++        res.end(JSON.stringify({ error: `no mock route for ${key}` }))
++        return
++      }
++      const result = route({ body, raw, headers: req.headers, count })
++      const status = result.status ?? 200
++      if (result.json === undefined) {
++        res.writeHead(status)
++        res.end()
++        return
++      }
++      const payload = JSON.stringify(result.json)
++      res.writeHead(status, {
++        "content-type": "application/json",
++        "content-length": String(Buffer.byteLength(payload)),
++      })
++      res.end(payload)
++    })
++  })
++
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
++  const port = (server.address() as AddressInfo).port
++
++  return {
++    port,
++    calls,
++    count: (method: string, path: string) => counts.get(`${method} ${path}`) || 0,
++    callsTo: (path: string) => calls.filter((c) => c.path === path),
++    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
++  }
++}
++
++function makeDriver(port: number, extra: Partial<Yun139Addition> = {}) {
++  // token 的第四个字段是毫秒到期时间；放 30 天后，避免触发 PC 刷新分支。
++  const token = `tok|1|RCS|${Date.now() + 30 * 24 * 3600 * 1000}|opaque`
++  const addition: Yun139Addition = {
++    authorization: Buffer.from(`13800138000:acct:${token}`).toString("base64"),
++    type: "personal_new",
++    ...extra,
++  }
++  const driver = new Yun139Driver(addition)
++  ;(driver as any).client.personalHost = `http://127.0.0.1:${port}`
++  return driver
++}
++
++/** personal_new 的 /file/list 响应：items 里 folder/file 混排。 */
++function listResp(items: any[]) {
++  return {
++    json: { success: true, code: "0000", data: { items, nextPageCursor: "" } },
++  }
++}
++
++test("139 move: personal_new 走 /file/batchMove，body 为源 id 与目标父目录 id", async () => {
++  const mock = await startMock({
++    "POST /file/list": () =>
++      listResp([
++        { fileId: "cnt1", name: "a.txt", type: "file" },
++        { fileId: "catDst", name: "dst", type: "folder" },
++      ]),
++    "POST /file/batchMove": () => ({ json: { success: true, code: "0000" } }),
++  })
++  const driver = makeDriver(mock.port)
++  try {
++    await driver.move("/", "/dst", ["a.txt"], "/a.txt", "/dst/a.txt")
++    const call = mock.callsTo("/file/batchMove")[0]
++    assert.ok(call, "没有发 /file/batchMove")
++    assert.deepEqual(call.body, {
++      fileIds: ["cnt1"],
++      toParentFileId: "catDst",
++    })
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 copy: personal_new 走 /file/batchCopy，改名复制仍解析目标父目录", async () => {
++  const mock = await startMock({
++    "POST /file/list": () =>
++      listResp([
++        { fileId: "cnt1", name: "a.txt", type: "file" },
++        { fileId: "catDst", name: "dst", type: "folder" },
++      ]),
++    "POST /file/batchCopy": () => ({ json: { success: true, code: "0000" } }),
++  })
++  const driver = makeDriver(mock.port)
++  try {
++    await driver.copy("/", "/dst", ["b.txt"], "/a.txt", "/dst/b.txt")
++    const call = mock.callsTo("/file/batchCopy")[0]
++    assert.ok(call, "没有发 /file/batchCopy")
++    assert.deepEqual(call.body, {
++      fileIds: ["cnt1"],
++      toParentFileId: "catDst",
++    })
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 put: create 带整文件 SHA256/分片表，PUT 字节全等，complete 带同一 hash", async () => {
++  const content = Buffer.from("hello 139 upload")
++  const expectedHash = createHash("sha256").update(content).digest("hex")
++  let uploadUrl = ""
++
++  const mock = await startMock({
++    "POST /file/list": () => listResp([]),
++    "POST /file/create": () => ({
++      json: {
++        success: true,
++        code: "0000",
++        data: {
++          exist: false,
++          fileId: "f1",
++          fileName: "a.txt",
++          uploadId: "u1",
++          partInfos: [{ partNumber: 1, uploadUrl }],
++        },
++      },
++    }),
++    "PUT /up/1": () => ({ status: 200 }),
++    "POST /file/complete": () => ({ json: { success: true, code: "0000" } }),
++  })
++  uploadUrl = `http://127.0.0.1:${mock.port}/up/1`
++
++  const driver = makeDriver(mock.port)
++  try {
++    await driver.put("/a.txt", "/a.txt", content)
++
++    const create = mock.callsTo("/file/create")[0]
++    assert.ok(create, "没有发 /file/create")
++    assert.equal(create.body.contentHash, expectedHash)
++    assert.equal(create.body.contentHashAlgorithm, "SHA256")
++    assert.equal(create.body.size, content.length)
++    assert.equal(create.body.name, "a.txt")
++    assert.equal(create.body.parallelUpload, false)
++    assert.equal(create.body.fileRenameMode, "auto_rename")
++    assert.equal(create.body.partInfos[0].partNumber, 1)
++    assert.equal(create.body.partInfos[0].partSize, content.length)
++    assert.equal(create.body.partInfos[0].parallelHashCtx.partOffset, 0)
++
++    const put = mock.callsTo("/up/1")[0]
++    assert.ok(put, "没有 PUT 分片")
++    assert.equal(put.method, "PUT")
++    assert.equal(put.headers["content-length"], String(content.length))
++    assert.equal(put.headers["content-type"], "application/octet-stream")
++    assert.ok(put.raw.equals(content), "PUT 字节与入参不一致")
++
++    const complete = mock.callsTo("/file/complete")[0]
++    assert.ok(complete, "没有发 /file/complete")
++    assert.deepEqual(complete.body, {
++      contentHash: expectedHash,
++      contentHashAlgorithm: "SHA256",
++      fileId: "f1",
++      uploadId: "u1",
++    })
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 put: data.exist 为 true 时不 PUT、不 complete", async () => {
++  const mock = await startMock({
++    "POST /file/list": () => listResp([]),
++    "POST /file/create": () => ({
++      json: {
++        success: true,
++        code: "0000",
++        data: { exist: true, fileId: "f1", fileName: "a.txt", uploadId: "u1" },
++      },
++    }),
++    "PUT /up/1": () => ({ status: 200 }),
++    "POST /file/complete": () => ({ json: { success: true } }),
++  })
++  const driver = makeDriver(mock.port)
++  try {
++    await driver.put("/a.txt", "/a.txt", Buffer.from("same"))
++    assert.equal(mock.callsTo("/up/1").length, 0, "秒传不应 PUT 分片")
++    assert.equal(mock.callsTo("/file/complete").length, 0, "秒传不应 complete")
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 put: 同名冲突按 改名旧项 -> 删除旧项 -> 新项改回原名 处理", async () => {
++  let uploadUrl = ""
++  const mock = await startMock({
++    "POST /file/list": () =>
++      listResp([
++        { fileId: "cntOld", name: "a.txt", type: "file" },
++        { fileId: "cntNew", name: "a (1).txt", type: "file" },
++      ]),
++    "POST /file/create": () => ({
++      json: {
++        success: true,
++        code: "0000",
++        data: {
++          exist: false,
++          fileId: "f1",
++          fileName: "a (1).txt",
++          uploadId: "u1",
++          partInfos: [{ partNumber: 1, uploadUrl }],
++        },
++      },
++    }),
++    "PUT /up/1": () => ({ status: 200 }),
++    "POST /file/complete": () => ({ json: { success: true } }),
++    "POST /file/update": () => ({ json: { success: true } }),
++    "POST /file/delete": () => ({ json: { success: true } }),
++  })
++  uploadUrl = `http://127.0.0.1:${mock.port}/up/1`
++  const driver = makeDriver(mock.port)
++  try {
++    await driver.put("/a.txt", "/a.txt", Buffer.from("x"))
++
++    const updates = mock.callsTo("/file/update")
++    const deletes = mock.callsTo("/file/delete")
++    assert.equal(updates.length, 2, "应当有两次 /file/update")
++    assert.equal(deletes.length, 1, "应当有一次 /file/delete")
++    assert.equal(updates[0].body.fileId, "cntOld")
++    assert.match(String(updates[0].body.name), /^a\.txt.{4}$/)
++    assert.deepEqual(deletes[0].body, { fileIds: ["cntOld"] })
++    assert.equal(updates[1].body.fileId, "cntNew")
++    assert.equal(updates[1].body.name, "a.txt")
++
++    // 顺序：先改名旧项、再删除旧项、最后把新项改回原名。
++    const order = mock.calls
++      .filter((c) => c.path === "/file/update" || c.path === "/file/delete")
++      .map((c) => c.path)
++    assert.deepEqual(order, ["/file/update", "/file/delete", "/file/update"])
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 move: success===false 且无 message 也必须抛错", async () => {
++  const mock = await startMock({
++    "POST /file/list": () =>
++      listResp([
++        { fileId: "cnt1", name: "a.txt", type: "file" },
++        { fileId: "catDst", name: "dst", type: "folder" },
++      ]),
++    "POST /file/batchMove": () => ({ json: { success: false } }),
++  })
++  const driver = makeDriver(mock.port)
++  try {
++    await assert.rejects(
++      () => driver.move("/", "/dst", ["a.txt"], "/a.txt", "/dst/a.txt"),
++      /139 Cloud API error/,
++    )
++  } finally {
++    await mock.close()
++  }
++})
++
++test("139 move/copy/put: family 类型显式失败，不再静默成功", async () => {
++  const driver = makeDriver(1, { type: "family" })
++  for (const [name, call] of [
++    ["move", () => driver.move("/", "/dst", ["a"], "/a", "/dst/a")],
++    ["copy", () => driver.copy("/", "/dst", ["a"], "/a", "/dst/a")],
++    ["put", () => driver.put("/a", "/a", Buffer.from("x"))],
++  ] as const) {
++    await assert.rejects(call, /not implemented/, `${name} 未按预期抛错`)
++  }
++})
