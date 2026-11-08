@@ -155,8 +155,8 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 55
-file_count 43
+patch_count 60
+file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
 patch 03 2fa70968ecc282a78bb73a6b67c36a03782ee6a7d06eec3a6e6fdb9fc30aa731 work/g4-local-range-416.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file aabcf3f7e830f36165dd065411101d961dcedaf957e3d010cdeb0395708ad511 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file c499417cc5a44567e68d5372a2e66dafaa38d9c360825c57109751789af216ce src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -242,7 +242,8 @@ file bf178726e27ed9ec313d9822f75d1ed134b3fcb60dc410ee300660a29c070e9e src/backen
 file 7efe4b23569f8458439d00bce562f5c3aaec6afebdb51c00bae7b7648e741907 src/backend/internal/webdav/webdav.ts src=patch strip_header=no eol=crlf
 file 3b0bc05837d6676e6adac59ebe03d708899f519e73163c712b42eb420ae6ff26 src/backend/pkg/password.ts src=patch strip_header=no eol=crlf
 file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backend/pkg/xml.ts src=patch strip_header=no eol=crlf
-file 7046e61818e9d85a0f6f8d740405552bcfbdd1e0430a29aa81d1e62cfac9e75a src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
+file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
+file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
 file 25ef8c10d05897cec00c42ef23820a962bb9b16e19287ac85a677d7e1f5d383c src/backend/server/fs.ts src=patch strip_header=no eol=crlf
@@ -414,3 +415,29 @@ patch 53 71ea7c2eb736a5d5575c18605aaa893ab2f833c3c98835f0ff86cdf5d68a56dc work/p
 #   patch_count 53->55，file_count 43 不变。
 patch 54 23ff85f05c6fbe7f8f30ebbe61dd1569080d3e6935bc0050695fe5ffabefcf5d work/p2-54-f10-139-movecopy-put.patch
 patch 55 7e7c03ae4c882578d30ad2fb3e45ab97e071b3247431d1b427ced048c00eae5b work/p2-55-f11-ali-share-refresh.patch
+#
+# 第 56-59 条（2026-11-08，r57 驱动正确性修复，对应 ARCH-3WAY-V7 的 D5/D2/D3/D7）：
+#   56 115 分页：util.ts getFiles 由单请求 limit=1000/offset=0 改为按 count 翻页
+#      （offset 取已取条数，无 count 时按短页收尾），新增 util.test.ts（mock 1500 项）。
+#   57 123_share 签名时区：signPath 的 nowStr 固定用 CST(+8) 构造，不再用本机时区
+#      （alist util.go:32-45 的 FixedZone），新增 util.test.ts（TZ=UTC/Asia-Shanghai 子进程比对）。
+#   58 123_open 401：getAccessToken 拆出 refreshAccessToken，加 5 分钟窗口 + blockRefresh
+#      熔断，401 后最多刷新重试一次，新增 util.test.ts（mock fetch 计次、连续 401 不递归）。
+#   59 189pc 接线：internal/op/storage.ts 去掉 189 分支的 startsWith("189")，
+#      driver=189pc 显式报错说明未接线原因；新增 189pc/routing.test.ts（两个负向用例）。
+#   storage.ts 的 file 条目 sha 随 59 更新（见下面 file 行）。
+#   patch_count 55->59，file_count 43 不变。
+patch 56 2ed981ea2d88b9623bc7687bccdfbf91a49306efbb64e695f0a0942c9ef439d3 work/p2-56-115-paging.patch
+patch 57 9015538df952aac324e335bc883e6fe53b95000e69be920fa0a4ac467028413a work/p2-57-123share-cst-sign.patch
+patch 58 a062f4cc19fa5283ebc1eb31f2008e6d5bc1201a2ffc2b06945ba88feed6fbda work/p2-58-123open-401-bounded.patch
+patch 59 6a227068ef095b3a5da81e94081ae93adbfd112c0e89573079faa69ca927e7dc work/p2-59-189pc-explicit-reject.patch
+#
+# 第 60 条（2026-11-08，F-189PC-API）：管理 API 的 normalizeDriver 在
+#   startsWith("189") 之前单独认 189pc，返回原名，让 p2-59 在 getDriver 里的
+#   显式拒绝对 storage/create / storage/update（以及逐条调 create 的备份导入）
+#   生效；189 / 189cloud / cloud189 / ctyun / 189pan / 189cloudpc / 189cloudapp /
+#   189tv 的既有映射一字未动（189cloud 仍命中 driverConfigs 的精确名 189Cloud）。
+#   admin.ts 是 src=repo：仓库副本与补丁 hunk 两处同步改，file 条目 sha 随之更新
+#   （7046e61… -> 6a5f33e1…），新增 HTTP 级用例 storage_189pc_api.test.ts，
+#   file_count 43->44。
+patch 60 c5808668654de6f9641f314b331a34a214be0b07b2db02688551d4789d85eae1 work/p2-60-189pc-admin-api.patch

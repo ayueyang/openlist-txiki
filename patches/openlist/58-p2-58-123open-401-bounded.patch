@@ -1,0 +1,214 @@
+diff --git a/src/backend/drivers/123_open/util.test.ts b/src/backend/drivers/123_open/util.test.ts
+new file mode 100644
+index 0000000..365a53d
+--- /dev/null
++++ b/src/backend/drivers/123_open/util.test.ts
+@@ -0,0 +1,110 @@
++import assert from "node:assert/strict"
++import { afterEach, test } from "node:test"
++
++import { Client123Open } from "./util"
++
++const realFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++interface MockOpts {
++  listCode: number
++  refresh: "ok" | "fail"
++  expiresIn?: number
++}
++
++/** 假服务端：/api/v1/access_token 走刷新，其余当文件列表 */
++function installMock(opts: MockOpts) {
++  const calls = { list: 0, refresh: 0 }
++  globalThis.fetch = (async (input: any) => {
++    const url = String(input)
++    if (url.includes("/api/v1/access_token")) {
++      calls.refresh++
++      if (opts.refresh === "fail") {
++        return {
++          ok: true,
++          status: 200,
++          json: async () => ({ code: -1, message: "bad refresh" }),
++        }
++      }
++      return {
++        ok: true,
++        status: 200,
++        json: async () => ({
++          code: 0,
++          message: "ok",
++          data: { access_token: "t-new", expires_in: opts.expiresIn ?? 7200 },
++        }),
++      }
++    }
++    calls.list++
++    return {
++      ok: true,
++      status: 200,
++      json: async () =>
++        opts.listCode === 0
++          ? { code: 0, message: "ok", data: { file_list: [], last_file_id: -1 } }
++          : { code: opts.listCode, message: "unauthorized" },
++    }
++  }) as any
++  return calls
++}
++
++function newClient() {
++  return new Client123Open({
++    client_id: "id",
++    client_secret: "sec",
++    use_online_api: false,
++  } as any)
++}
++
++test("123_open 401 后只刷新一次，二次 401 直接报错", async () => {
++  const calls = installMock({ listCode: 401, refresh: "ok" })
++  const client = newClient()
++
++  await assert.rejects(() => client.getFiles("0"), /401 after token refresh/)
++  assert.equal(calls.refresh, 1)
++  assert.equal(calls.list, 2)
++})
++
++test("123_open 刷新失败即熔断，后续请求不再打刷新接口", async () => {
++  const calls = installMock({ listCode: 401, refresh: "fail" })
++  const client = newClient()
++
++  await assert.rejects(() => client.getFiles("0"), /bad refresh/)
++  assert.equal(calls.refresh, 1)
++  assert.equal(calls.list, 1)
++
++  await assert.rejects(() => client.getFiles("0"), /Authentication expired/)
++  assert.equal(calls.refresh, 1)
++  assert.equal(calls.list, 2)
++})
++
++test("123_open 到期前 5 分钟主动刷新，不等 401", async () => {
++  const calls = installMock({ listCode: 0, refresh: "ok", expiresIn: 120 })
++  const client = newClient()
++
++  await client.init()
++  assert.equal(calls.refresh, 1)
++  assert.equal(calls.list, 0)
++
++  await client.getFiles("0")
++  assert.equal(calls.refresh, 2)
++  assert.equal(calls.list, 1)
++})
++
++test("123_open 连续 401 不递归爆栈，每轮最多一次刷新", async () => {
++  const calls = installMock({ listCode: 401, refresh: "ok" })
++  const client = newClient()
++
++  for (let i = 0; i < 5; i++) {
++    await assert.rejects(
++      () => client.getFiles("0"),
++      (e: any) => e instanceof Error && !(e instanceof RangeError) && /401 after token refresh/.test(e.message),
++    )
++  }
++  assert.equal(calls.refresh, 5)
++  assert.equal(calls.list, 10)
++})
+diff --git a/src/backend/drivers/123_open/util.ts b/src/backend/drivers/123_open/util.ts
+index 51e75e8..6e3393b 100644
+--- a/src/backend/drivers/123_open/util.ts
++++ b/src/backend/drivers/123_open/util.ts
+@@ -13,6 +13,10 @@ const API = "https://open-api.123pan.com"
+ export class Client123Open {
+   private addition: Driver123OpenAddition
+   private accessToken = ""
++  /** access_token 到期时间（epoch ms；0 表示服务端没给 expires_in） */
++  private tokenExpiredAt = 0
++  /** 刷新失败后的熔断位，避免 401 风暴（openlist token.go:32-48 blockRefresh） */
++  private blockRefresh = false
+ 
+   constructor(addition: Driver123OpenAddition) {
+     this.addition = addition
+@@ -25,7 +29,28 @@ export class Client123Open {
+     }
+   }
+ 
+-  private async getAccessToken(): Promise<void> {
++  private async getAccessToken(forceRefresh = false): Promise<void> {
++    // 熔断后不再刷新（openlist token.go:32-36）。
++    if (this.blockRefresh) throw new Error("[123Open] Authentication expired")
++    // 5 分钟窗口内视为将要过期，提前刷新（openlist token.go:37-39）。
++    if (
++      !forceRefresh &&
++      this.accessToken &&
++      this.tokenExpiredAt &&
++      Date.now() < this.tokenExpiredAt - 5 * 60 * 1000
++    ) {
++      return
++    }
++    try {
++      await this.refreshAccessToken()
++    } catch (e) {
++      // 刷新失败即熔断，后续请求不再打刷新接口（openlist token.go:46-48）。
++      this.blockRefresh = true
++      throw e
++    }
++  }
++
++  private async refreshAccessToken(): Promise<void> {
+     // 1. 在线 API 刷新 refresh_token
+     if (
+       this.addition.use_online_api !== false &&
+@@ -43,6 +68,7 @@ export class Client123Open {
+         this.accessToken = data.access_token
+         this.addition.access_token = data.access_token
+         this.addition.refresh_token = data.refresh_token
++        this.setTokenExpiry(data.expires_in)
+         return
+       }
+       const err = data.error_description || data.text || data.message || data.error
+@@ -63,16 +89,29 @@ export class Client123Open {
+       if (!data.data?.access_token) throw new Error("[123Open] empty access token")
+       this.accessToken = data.data.access_token
+       this.addition.access_token = this.accessToken
++      this.setTokenExpiry((data.data as any).expires_in)
+       return
+     }
+     throw new Error("[123Open] no valid authentication method (access_token / refresh_token / client_id+client_secret)")
+   }
+ 
++  /** expires_in（秒）换算成本地到期时刻；缺省或非法时置 0（未知）。 */
++  private setTokenExpiry(expiresIn?: unknown): void {
++    const secs = Number(expiresIn)
++    this.tokenExpiredAt =
++      Number.isFinite(secs) && secs > 0 ? Date.now() + secs * 1000 : 0
++  }
++
+   private async request<T = any>(
+     url: string,
+     method: string,
+     body?: any,
++    retried = false,
+   ): Promise<Resp123 & { data?: T }> {
++    // 到期前 5 分钟主动刷新，别等 401 再补（openlist token.go:37-39）。
++    if (this.tokenExpiredAt && Date.now() >= this.tokenExpiredAt - 5 * 60 * 1000) {
++      await this.getAccessToken(true)
++    }
+     const headers: Record<string, string> = {
+       Authorization: `Bearer ${this.accessToken}`,
+       platform: "open_platform",
+@@ -83,8 +122,12 @@ export class Client123Open {
+     const resp = await fetch(url, options)
+     const data: Resp123 = await resp.json().catch(() => ({ code: -1 } as any))
+     if (data.code === 401) {
+-      await this.getAccessToken()
+-      return this.request<T>(url, method, body)
++      // 401 后最多刷新一次；二次 401 直接报错，不再递归（旧实现无界递归）。
++      if (retried) {
++        throw new Error(`[123Open] 401 after token refresh: ${data.message || ""}`.trim())
++      }
++      await this.getAccessToken(true)
++      return this.request<T>(url, method, body, true)
+     }
+     return data as Resp123 & { data?: T }
+   }

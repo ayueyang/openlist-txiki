@@ -1,4 +1,4 @@
-# txiki.js 运行时补丁清单（r54）
+# txiki.js 运行时补丁清单（r57）
 
 基树：txiki.js `zig/v26.9.0` = commit `a07d6aa19553a61d088bbfbd7ac2ae204d2761a6`，
 CRLF 工作区（`core.autocrlf=true`）。`deps/libwebsockets` 为子模块 `ac23cae7`。
@@ -42,6 +42,10 @@ CRLF 工作区（`core.autocrlf=true`）。`deps/libwebsockets` 为子模块 `ac
 - 无。r45 起构建树用到的 tjs 侧改动全部有补丁实体或生成物实体落在本目录；
   `0003-openlist-wirepath-decoded` 与 `0004-canonical-path-tests` 属产品侧，落在
   `patches/openlist/48`、`49`（在 53 条累进栈内）；r54 的 `raw.ts` HEAD 短路同为产品侧
-  补丁，落在 `patches/openlist/53`，不属于本目录的 tjs 补丁栈。
+  补丁，落在 `patches/openlist/53`，不属于本目录的 tjs 补丁栈。r56 的 F10/F11 属产品侧补丁，
+  落在 `patches/openlist/54`、`55`；r57 的四处驱动修复属产品侧补丁，落在
+  `patches/openlist/56`..`59`。r55 的 Range 收尾修复
+  是 `src/backend/txiki/shims/fs.ts`（src=repo，适配层自有文件，源码指纹清单登记），
+  不是补丁，也不属于本目录的 tjs 补丁栈。
 - 仍未归档的是 txiki.js 上游源码树本体（415 MB 级 CRLF 检出），由上游 tag 提供，
   按 `docs/BUILD.md` 第 2 节 clone 即可；这不属于本项目改动的缺口。

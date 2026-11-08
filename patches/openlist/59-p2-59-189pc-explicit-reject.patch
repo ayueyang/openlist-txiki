@@ -1,0 +1,89 @@
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -813,6 +813,17 @@
+       }
+     })
+     await driver.init?.()
++  } else if (normDriver === "189pc") {
++    // 189pc/driver.ts 的方法签名是 list(dir)/link(file)/move(src,dst)，按目录 id 操作；
++    // StorageDriver 要 list(virtualPath, physicalPath) 按路径解析，缺一层路径→id 解析，
++    // 且该目录 README 自己标注为「未适配的半成品」。旧实现靠下面 189 分支的
++    // startsWith("189") 把它吞进 Cloud189Driver，用 189 的协议跑 189pc 的配置。
++    // 接线前显式失败，不再静默错路由。
++    throw new Error(
++      "failed get driver: '189pc' 未接线（189pc/driver.ts 的 list/link/move 签名与 StorageDriver 不一致，" +
++        "缺路径→目录 id 解析层；见 src/backend/drivers/189pc/README.md）。" +
++        "为避免用 189 协议误读 189pc 配置，这里显式拒绝。",
++    )
+   } else if (
+     normDriver === "189" ||
+     normDriver === "189cloud" ||
+@@ -821,7 +832,6 @@
+     normDriver === "189pan" ||
+     normDriver === "189cloudpc" ||
+     normDriver === "189cloudapp" ||
+-    normDriver.startsWith("189") ||
+     normDriver.includes("cloud189")
+   ) {
+     const addition = parseAddition(storageConfig)
+diff --git a/src/backend/drivers/189pc/routing.test.ts b/src/backend/drivers/189pc/routing.test.ts
+new file mode 100644
+index 0000000..e69de4a
+--- /dev/null
++++ b/src/backend/drivers/189pc/routing.test.ts
+@@ -0,0 +1,54 @@
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++
++import { getDriver } from "../../internal/op/storage"
++
++const realFetch = globalThis.fetch
++
++// 这两条用例不该发任何网络请求：旧实现会把 189pc 路由进 Cloud189Driver 并尝试登录。
++// 真发请求就立刻失败，避免外网依赖，也让「错路由」表现成可读的断言失败。
++beforeEach(() => {
++  globalThis.fetch = (async () => {
++    throw new Error("routing test must not call fetch")
++  }) as any
++})
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++function cfg(id: string) {
++  return {
++    id,
++    driver: "189pc",
++    mount_path: "/189pc",
++    addition: JSON.stringify({ username: "u", password: "p" }),
++    modified: 1,
++    disabled: false,
++  }
++}
++
++/**
++ * 负向 1：driver=189pc 必须显式失败。
++ * 旧实现用 normDriver.startsWith("189") 把它吞进 Cloud189Driver，等于用 189 的
++ * 协议去跑 189pc 的配置（189pc/driver.ts 的 list/link/move 签名与 StorageDriver 不一致）。
++ */
++test("driver=189pc 显式拒绝，不被 startsWith(189) 路由进 189 驱动", async () => {
++  await assert.rejects(
++    () => getDriver("189pc", cfg("r57-neg-189pc")),
++    (e: any) => {
++      assert.match(String(e?.message), /189pc/)
++      assert.match(String(e?.message), /未接线/)
++      assert.doesNotMatch(String(e?.message), /189Cloud|Cloud189Driver/)
++      return true
++    },
++  )
++})
++
++/** 负向 2：任意 189 开头的未知名不再被模糊匹配成 189 驱动。 */
++test("未知的 189 开头驱动名落到 unsupported driver，而不是 189", async () => {
++  await assert.rejects(
++    () => getDriver("189abc", cfg("r57-neg-189abc")),
++    /unsupported driver/,
++  )
++})

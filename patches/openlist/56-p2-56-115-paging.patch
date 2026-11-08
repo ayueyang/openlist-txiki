@@ -1,0 +1,168 @@
+diff --git a/src/backend/drivers/115/util.test.ts b/src/backend/drivers/115/util.test.ts
+new file mode 100644
+index 0000000..52bfbbd
+--- /dev/null
++++ b/src/backend/drivers/115/util.test.ts
+@@ -0,0 +1,101 @@
++import assert from "node:assert/strict"
++import { afterEach, test } from "node:test"
++
++import { Client115 } from "./util"
++
++const realFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++/** 造 n 个文件条目（大写字段，与 115 Open API 一致） */
++function makeItems(n: number) {
++  return Array.from({ length: n }, (_, i) => ({
++    Fid: String(i),
++    Fn: `f${String(i).padStart(5, "0")}`,
++    Fc: "1",
++    FS: 1,
++    Pc: `pc${i}`,
++    Upt: 1700000000 + i,
++  }))
++}
++
++/**
++ * 假服务端：按 offset/limit 切片，单页最多 serverCap 条（模拟服务端自己的上限）。
++ * 记录每次请求的 offset/limit，供断言翻页次数与顺序。
++ */
++function installMock(items: any[], serverCap = 1000) {
++  const calls: Array<{ offset: number; limit: number }> = []
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    if (url.includes("/user/info")) {
++      return {
++        ok: true,
++        status: 200,
++        json: async () => ({ state: true, data: { user_id: 1, user_name: "t" } }),
++      }
++    }
++    const body = JSON.parse(String(init?.body || "{}"))
++    const offset = Number(body.offset)
++    const limit = Number(body.limit)
++    calls.push({ offset, limit })
++    const take = Math.min(limit, serverCap)
++    const page = items.slice(offset, offset + take)
++    return {
++      ok: true,
++      status: 200,
++      json: async () => ({
++        state: true,
++        count: items.length,
++        offset,
++        page_size: take,
++        data: page,
++      }),
++    }
++  }) as any
++  return calls
++}
++
++test("115 getFiles 翻页取满 1500 项，顺序稳定", async () => {
++  const items = makeItems(1500)
++  const calls = installMock(items)
++  const client = new Client115({ access_token: "t", refresh_token: "r" } as any)
++
++  const files = await client.getFiles("0")
++
++  assert.equal(files.length, 1500)
++  assert.deepEqual(
++    files.map((f) => f.Fid),
++    items.map((f) => f.Fid),
++  )
++  assert.deepEqual(calls, [
++    { offset: 0, limit: 1000 },
++    { offset: 1000, limit: 1000 },
++  ])
++})
++
++test("115 服务端单页上限低于请求值时按 count 继续翻页", async () => {
++  const items = makeItems(1500)
++  const calls = installMock(items, 500)
++  const client = new Client115({ access_token: "t", refresh_token: "r" } as any)
++
++  const files = await client.getFiles("0")
++
++  assert.equal(files.length, 1500)
++  assert.deepEqual(
++    calls.map((c) => c.offset),
++    [0, 500, 1000],
++  )
++})
++
++test("115 恰好 1000 项时只请求一页，不多打一次空页", async () => {
++  const items = makeItems(1000)
++  const calls = installMock(items)
++  const client = new Client115({ access_token: "t", refresh_token: "r" } as any)
++
++  const files = await client.getFiles("0")
++
++  assert.equal(files.length, 1000)
++  assert.deepEqual(calls, [{ offset: 0, limit: 1000 }])
++})
+diff --git a/src/backend/drivers/115/util.ts b/src/backend/drivers/115/util.ts
+index 33f88b1..2190616 100644
+--- a/src/backend/drivers/115/util.ts
++++ b/src/backend/drivers/115/util.ts
+@@ -97,19 +97,13 @@ export class Client115 {
+   }
+ 
+   async getFiles(cid: string): Promise<Cloud115File[]> {
+-    const resp = await this.request<Cloud115ListResp>("/open/ufile/files", {
+-      cid,
+-      limit: 1000,
+-      offset: 0,
+-      order: this.addition.order_by || "user_utime",
+-      asc: this.addition.order_direction === "asc" ? 1 : 0,
+-      show_dir: 1,
+-      fc_mix: 1,
+-    })
+-    if (resp?.data && Array.isArray(resp.data)) return resp.data
++    // 115 Open API 单页最多 1000 条，必须按 offset 翻页；旧实现只取 offset=0
++    // 一页，超 1000 项的目录会静默少列（alist 115 util.go:85 按 page_size 循环）。
++    const limit = 1000
++    const all: Cloud115File[] = []
+     // 旧格式（小写字段）兼容
+-    if (resp?.files && Array.isArray(resp.files)) {
+-      return resp.files.map((f: any) => ({
++    const normalize = (files: any[]): Cloud115File[] =>
++      files.map((f: any) => ({
+         Fid: f.fid ?? f.id,
+         Fn: f.n ?? f.file_name ?? f.name,
+         Fc: String(
+@@ -122,8 +116,29 @@ export class Client115 {
+         Upt: f.tu ?? f.upt ?? f.updated_at,
+         Pid: f.pid ?? f.cid,
+       }))
++
++    for (;;) {
++      const resp = await this.request<Cloud115ListResp>("/open/ufile/files", {
++        cid,
++        limit,
++        offset: all.length,
++        order: this.addition.order_by || "user_utime",
++        asc: this.addition.order_direction === "asc" ? 1 : 0,
++        show_dir: 1,
++        fc_mix: 1,
++      })
++      let page: Cloud115File[] | null = null
++      if (resp?.data && Array.isArray(resp.data)) page = resp.data
++      else if (resp?.files && Array.isArray(resp.files)) page = normalize(resp.files)
++      if (!page) break
++      all.push(...page)
++      // 终止条件：空页一律停；服务端给了 count 就以 count 为准，否则以短页为准。
++      if (page.length === 0) break
++      if (typeof resp?.count === "number") {
++        if (all.length >= resp.count) break
++      } else if (page.length < limit) break
+     }
+-    return []
++    return all
+   }
+ 
+   /** 通过路径逐级解析文件夹 ID（带缓存由 driver 层管理） */

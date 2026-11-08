@@ -1,10 +1,10 @@
-# 从源码构建（openlist-txiki 0.1.0-r56）
+# 从源码构建（openlist-txiki 0.1.0-r57）
 
-本归档是 openlist-txiki 0.1.0-r56 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r57 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
-    patches/openlist/01..55   应用侧补丁，按编号顺序累进应用
+    patches/openlist/01..60   应用侧补丁，按编号顺序累进应用
     patches/txiki/            txiki.js 运行时补丁（本归档不包含 txiki.js 源码树，见第 2 节）
     build/                    build-txiki.mjs、p2-source-manifest.txt
     scripts/                  apk 打包脚本与生命周期钩子
@@ -30,7 +30,7 @@ cd tree
 # CRLF 检出校验：必须是 2015
 grep -c $'\r' src/backend/server/fs.ts
 
-# 按清单顺序应用 55 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
+# 按清单顺序应用 60 条补丁；--exclude 必须带（src/backend/txiki 由移植层提供，不走补丁）
 while read -r tag seq sha rel; do
   [ "$tag" = patch ] || continue
   echo "$sha  $PROJ/$rel" | sha256sum -c - || exit 1
@@ -43,9 +43,9 @@ TXIKI_SOURCE_MANIFEST="$PROJ/work/p2-source-manifest.txt" node scripts/build-txi
 sha256sum dist-txiki/openlist-txiki.js
 ```
 
-期望：预检打印「补丁 55/55（01..55 顺序与 sha 一致），指纹 99 条（file 43 + patch 55 + commit 1），
-checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,083,901 B、
-sha256 `25b78068bd5f1be81ad2c1105b947f9979941824842b59fd86532cf73a1e26c9`、inputs 447。
+期望：预检打印「补丁 60/60（01..60 顺序与 sha 一致），指纹 105 条（file 44 + patch 60 + commit 1），
+checkout_eol=crlf」；产物 `dist-txiki/openlist-txiki.js` 为 2,085,205 B、
+sha256 `0c669e8289d900a80cb938d4ac3c855dd6d800fb518d12bbf56b883d646b50f7`、inputs 447。
 
 第 21 条补丁只改适配层 `src/backend/txiki/config.ts`（Windows 绝对路径判定与
 `%LOCALAPPDATA%` 默认数据目录）。适配层文件由上面 `--exclude` 口径跳过 apply，
@@ -108,7 +108,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r56
+VERSION=0.1.0-r57
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```
@@ -120,14 +120,14 @@ stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按�
 ## 3.1 从源码归档复算桌面两件（linux tar.gz / win x64 zip）
 
 归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（四份模板）、
-`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.0.1.0-r56.json`（输入锚点）。
+`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.0.1.0-r57.json`（输入锚点）。
 inputs.json 里的七个路径一律写 `${NAME}` 占位符，不含任何本机路径；复算前自己填一份变量文件：
 
 ```sh
 cp scripts/build-archives.vars.example.json /tmp/vars.json
 # 按下面的字段来源改 /tmp/vars.json 的七个值（相对仓根或绝对路径都行）
 python scripts/build-archives.py \
-  --inputs scripts/build-archives.inputs.0.1.0-r56.json \
+  --inputs scripts/build-archives.inputs.0.1.0-r57.json \
   --out /tmp/desktop --renderer build/make-archives.py \
   --vars /tmp/vars.json
 ```

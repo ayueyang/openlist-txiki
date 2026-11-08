@@ -1,0 +1,15 @@
+diff --git a/src/backend/server/admin.ts b/src/backend/server/admin.ts
+--- a/src/backend/server/admin.ts
++++ b/src/backend/server/admin.ts
+@@ -145,6 +145,11 @@
+   if (norm.startsWith("123")) return "123Pan"
+   if (norm.includes("aliyun")) return "AliyundriveOpen"
+   if (norm.startsWith("baidu")) return "BaiduNetdisk"
++  // 189pc 是独立驱动（189pc/driver.ts，未接线）。必须在下面的 startsWith("189")
++  // 之前返回原名：否则管理 API 在落库前把它改写成 Cloud189，请求到不了
++  // getDriver 里 189pc 的显式拒绝分支，等于继续用 189 的协议跑 189pc 的配置。
++  // create / update / 从备份导入三条路都走这里。
++  if (norm === "189pc") return "189pc"
+   if (
+     norm.startsWith("189") ||
+     norm.includes("cloud189") ||

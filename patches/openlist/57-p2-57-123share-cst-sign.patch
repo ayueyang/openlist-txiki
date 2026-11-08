@@ -1,0 +1,117 @@
+diff --git a/src/backend/drivers/123_share/util.test.ts b/src/backend/drivers/123_share/util.test.ts
+new file mode 100644
+index 0000000..e999b37
+--- /dev/null
++++ b/src/backend/drivers/123_share/util.test.ts
+@@ -0,0 +1,95 @@
++import assert from "node:assert/strict"
++import { execFileSync } from "node:child_process"
++import path from "node:path"
++import { test } from "node:test"
++
++import { crc32, signPath } from "./util"
++
++/**
++ * alist 的映射表（util.go:32-45）：nowStr 的每个数字按 charCode-48 取字母。
++ * 测试里独立抄一份当 oracle，不引用被测实现。
++ */
++const TABLE = [
++  "a", "d", "e", "f", "g", "h", "l", "m", "y", "i", "j", "n", "o",
++  "p", "k", "q", "r", "s", "t", "u", "b", "c", "v", "w", "s", "z",
++]
++
++const FIXED_MS = 1767240000000 // 2026-01-01T04:00:00Z = CST 12:00
++
++/** 固定 CST(+8) 的 yyyyMMddHHmm，与时区环境无关 */
++function cstMinute(ms: number): string {
++  const d = new Date(ms + 8 * 3600 * 1000)
++  const p = (n: number) => String(n).padStart(2, "0")
++  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}`
++}
++
++function expectedTimeSign(ms: number): string {
++  const mapped = cstMinute(ms)
++    .split("")
++    .map((ch) => TABLE[ch.charCodeAt(0) - 48])
++    .join("")
++  return String(crc32(mapped))
++}
++
++/** 固定时钟与随机数，让签名可复算 */
++function withFixedClock<T>(ms: number, fn: () => T): T {
++  const RealDate = Date
++  const realRandom = Math.random
++  class FixedDate extends RealDate {
++    constructor(...args: any[]) {
++      if (args.length === 0) super(ms)
++      else super(...(args as [any]))
++    }
++    static now() {
++      return ms
++    }
++  }
++  ;(globalThis as any).Date = FixedDate as any
++  Math.random = () => 0.5
++  try {
++    return fn()
++  } finally {
++    ;(globalThis as any).Date = RealDate
++    Math.random = realRandom
++  }
++}
++
++test("123_share signPath 用固定 CST(+8) 构造 nowStr，签名可复算", () => {
++  const [timeSign, value] = withFixedClock(FIXED_MS, () => signPath("/b/api/share/list"))
++  const [timestamp, random, dataSign] = value.split("-")
++  const expected = expectedTimeSign(FIXED_MS)
++
++  assert.equal(timeSign, expected)
++  assert.equal(timestamp, String(Math.floor(FIXED_MS / 1000)))
++  // dataSign 也按 alist 的拼接顺序独立复算
++  const data = [timestamp, random, "/b/api/share/list", "web", "3", timeSign].join("|")
++  assert.equal(dataSign, String(crc32(data)))
++})
++
++test("123_share 签名在 TZ=UTC 与 TZ=Asia/Shanghai 下字节相同", () => {
++  const tsx = path.resolve("node_modules/.bin/tsx")
++  const probe = `
++const RealDate = Date
++const FIXED = ${FIXED_MS}
++class FixedDate extends RealDate {
++  constructor(...a) { a.length ? super(...a) : super(FIXED) }
++  static now() { return FIXED }
++}
++globalThis.Date = FixedDate
++Math.random = () => 0.5
++import("./src/backend/drivers/123_share/util.ts").then((m) => {
++  process.stdout.write(JSON.stringify(m.signPath("/b/api/share/list")))
++})
++`
++  const run = (tz: string) =>
++    execFileSync(tsx, ["-e", probe], {
++      cwd: process.cwd(),
++      env: { ...process.env, TZ: tz },
++      encoding: "utf8",
++    }).trim()
++
++  const utc = run("UTC")
++  const shanghai = run("Asia/Shanghai")
++  assert.equal(utc, shanghai)
++  assert.equal(utc, JSON.stringify(withFixedClock(FIXED_MS, () => signPath("/b/api/share/list"))))
++})
+diff --git a/src/backend/drivers/123_share/util.ts b/src/backend/drivers/123_share/util.ts
+index 22425c9..5d51fad 100644
+--- a/src/backend/drivers/123_share/util.ts
++++ b/src/backend/drivers/123_share/util.ts
+@@ -64,7 +64,10 @@ export function signPath(
+   const timestamp = String(Math.floor(now.getTime() / 1000))
+ 
+   const pad = (n: number) => String(n).padStart(2, "0")
+-  const nowStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`
++  // 123 的签名用固定 CST(+8) 构造 nowStr（alist util.go:32-45 用 FixedZone）。
++  // 用本机时区的话，设备 TZ=UTC 时签名串差 8 小时，服务端直接拒绝。
++  const cst = new Date(now.getTime() + 8 * 60 * 60 * 1000)
++  const nowStr = `${cst.getUTCFullYear()}${pad(cst.getUTCMonth() + 1)}${pad(cst.getUTCDate())}${pad(cst.getUTCHours())}${pad(cst.getUTCMinutes())}`
+ 
+   const mappedChars: string[] = []
+   for (let i = 0; i < nowStr.length; i++) {
