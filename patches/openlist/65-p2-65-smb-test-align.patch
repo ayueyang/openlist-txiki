@@ -1,0 +1,59 @@
+diff -ruN a/src/backend/drivers/smb/driver.test.ts b/src/backend/drivers/smb/driver.test.ts
+--- a/src/backend/drivers/smb/driver.test.ts	2026-11-09 04:40:46.384472800 +0800
++++ b/src/backend/drivers/smb/driver.test.ts	2026-11-09 04:40:46.389854100 +0800
+@@ -3,18 +3,45 @@
+ import { SMBDriver } from "./driver"
+ import { SMBAddition } from "./types"
+ 
+-test("SMBDriver instantiation and methods", async () => {
+-  const addition: SMBAddition = {
+-    address: "192.168.1.100",
+-    username: "admin",
+-    password: "password",
+-    share_name: "public",
+-  }
++// SMB 在 txiki 运行时没有实现（无 node:net / SMB 客户端），所有方法 fail-closed。
++// 本文件保留上游原有的单测入口，断言口径与 driver.failclosed.test.ts 一致：
++// 每个方法都必须 reject，且错误消息同时含驱动名 SMB 与操作名。
++// 不连网、不登录、不读任何真实配置。
++
++const addition: SMBAddition = {
++  address: "192.168.1.100",
++  username: "admin",
++  password: "password",
++  share_name: "public",
++}
+ 
++async function expectUnsupported(op: string, run: () => Promise<unknown>) {
++  await assert.rejects(run, (err: any) => {
++    const msg = String(err && err.message)
++    assert.match(msg, /SMB/, `message must name SMB: ${msg}`)
++    assert.match(msg, new RegExp(`\\(${op}\\)`), `message must name op ${op}: ${msg}`)
++    return true
++  })
++}
++
++test("SMBDriver instantiation and methods", async () => {
+   const driver = new SMBDriver(addition)
+   assert.ok(driver)
+ 
+-  const root = await driver.get("/", "/")
+-  assert.ok(root)
+-  assert.equal(root.name, "root")
++  await expectUnsupported("list", () => driver.list("/", "/"))
++  await expectUnsupported("get", () => driver.get("/", "/"))
++  await expectUnsupported("mkdir", () => driver.mkdir("/", "/newdir"))
++  await expectUnsupported("rename", () => driver.rename("/", "/a.txt", "b.txt"))
++  await expectUnsupported("remove", () =>
++    driver.remove("/", "/a.txt", ["a.txt"]),
++  )
++  await expectUnsupported("move", () =>
++    driver.move("/src", "/dst", ["a.txt"], "/src/a.txt", "/dst/a.txt"),
++  )
++  await expectUnsupported("copy", () =>
++    driver.copy("/src", "/dst", ["a.txt"], "/src/a.txt", "/dst/a.txt"),
++  )
++  await expectUnsupported("put", () =>
++    driver.put("/", "/a.txt", new Uint8Array([1, 2, 3])),
++  )
+ })

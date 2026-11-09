@@ -1,0 +1,305 @@
+diff -ruN a/src/backend/drivers/115open/driver.ts b/src/backend/drivers/115open/driver.ts
+--- a/src/backend/drivers/115open/driver.ts	2026-11-09 05:45:32.199946400 +0800
++++ b/src/backend/drivers/115open/driver.ts	2026-11-09 05:45:32.209613900 +0800
+@@ -15,8 +15,13 @@
+ const OPENLIST_UA =
+   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30"
+ 
+-/** CF Workers 免费版单次 invocation 子请求预算（留余量） */
+-const SUBREQUEST_LIMIT = 45
++/**
++ * 单次 invocation 子请求预算：CF Workers 免费版是 45（留余量）；
++ * txiki 运行时没有这个限制，phase 2 的 1GiB 分片上传不能按 45 截断。
++ */
++function subrequestLimit(): number {
++  return typeof (globalThis as any).tjs !== "undefined" ? 100000 : 45
++}
+ 
+ function pan115FileToFileItem(f: Pan115File): FileItem {
+   const isDir = f.fc === "0"
+@@ -56,7 +61,7 @@
+   /** cache: 物理路径 → fid（复用） */
+   private fidCache = new Map<string, string>()
+   /** CF subrequest 预算 */
+-  private budget = { used: 0, limit: SUBREQUEST_LIMIT }
++  private budget = { used: 0, limit: subrequestLimit() }
+   /**
+    * 下载链接缓存（Go LinkCacheMode=UA 等价）：按 文件ID+UA 缓存，TTL 30 分钟。
+    * 115 免费用户 downurl 接口有每日配额（code 406），缓存显著减少调用次数。
+@@ -405,66 +410,10 @@
+     physicalPath: string,
+     content: Buffer,
+   ): Promise<void> {
+-    if (content.length < 1) {
+-      throw new Error("115 网盘不允许上传空文件")
+-    }
+-    this.budget.used = 0
+-    const segs = String(physicalPath || "")
+-      .split("/")
+-      .filter(Boolean)
+-    const fileName = segs.pop() || "file"
+-    const parentPath = "/" + segs.join("/")
+-    const parentId = await this.resolveFolderId(parentPath)
+-    const target = parentId
+-
+-    const fileSize = content.length
+-    const sha1Full = (await sha1(content)).toUpperCase()
+-    const preSize = Math.min(128 * 1024, fileSize)
+-    const sha1128k = (await sha1(content.subarray(0, preSize))).toUpperCase()
+-
+-    // 1. UploadInit（秒传）
+-    if (!this.reserve()) throw new Error("subrequest budget exceeded")
+-    let initResp = await this.client.uploadInit({
+-      fileName,
+-      fileSize,
+-      target,
+-      fileId: sha1Full,
+-      preId: sha1128k,
+-    })
+-    if (initResp.status === 2) return // 秒传成功
+-
+-    // 2. 二次校验（status 6/7/8）
+-    if ([6, 7, 8].includes(initResp.status) && initResp.sign_check) {
+-      const parts = initResp.sign_check.split("-")
+-      const start = parseInt(parts[0], 10)
+-      const end = parseInt(parts[1], 10)
+-      if (Number.isFinite(start) && Number.isFinite(end)) {
+-        const signVal = (
+-          await sha1(content.subarray(start, end + 1))
+-        ).toUpperCase()
+-        if (!this.reserve()) throw new Error("subrequest budget exceeded")
+-        initResp = await this.client.uploadInit({
+-          fileName,
+-          fileSize,
+-          target,
+-          fileId: sha1Full,
+-          preId: sha1128k,
+-          signKey: initResp.sign_key,
+-          signVal,
+-        })
+-        if (initResp.status === 2) return // 校验后秒传成功
+-      }
+-    }
+-
+-    // 3. 获取 OSS 上传凭证
+-    if (!this.reserve()) throw new Error("subrequest budget exceeded")
+-    const token = await this.client.uploadGetToken()
+-    if (!initResp.bucket || !initResp.object || !token.endpoint) {
+-      throw new Error("115 上传初始化失败：缺少 OSS 上传信息")
+-    }
+-
+-    // 4. OSS PUT Object（单请求上传，含 V1 签名）
+-    await this.ossPutObject(token, initResp, content)
++    // phase 2 才做 beginStream 分片上传；现在整包 ossPutObject 会把文件全放内存。
++    throw new Error(
++      "115open 上传未接线：整包单请求会把文件全部放进内存，已禁用；等待 beginStream 分片实现",
++    )
+   }
+ 
+   private async ossPutObject(
+diff -ruN a/src/backend/drivers/115open/routing.test.ts b/src/backend/drivers/115open/routing.test.ts
+--- a/src/backend/drivers/115open/routing.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/115open/routing.test.ts	2026-11-09 05:45:32.211612100 +0800
+@@ -0,0 +1,122 @@
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++
++import { getDriver } from "../../internal/op/storage"
++import { Pan115Driver } from "./driver"
++
++// 全部用例只 mock globalThis.fetch：不连网、不登录、不需要真实 115 账号。
++
++const realFetch = globalThis.fetch
++let fetchCalls = 0
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++beforeEach(() => {
++  fetchCalls = 0
++  globalThis.fetch = (async (input: any) => {
++    fetchCalls++
++    const url = String(input)
++    // Pan115Driver.init 的 token 校验（proapi 开放平台）
++    if (url.includes("/open/user/info")) {
++      return jsonResponse({
++        state: true,
++        code: 0,
++        data: { user_id: 1, user_name: "u" },
++      })
++    }
++    // Driver115.init 的 token 校验（passport）
++    if (url.includes("passportapi.115.com")) {
++      return jsonResponse({ state: true, data: { user_id: 1 } })
++    }
++    // Driver115Cookie.init 的登录态校验
++    if (url.includes("my.115.com")) {
++      return jsonResponse({ state: true })
++    }
++    return jsonResponse({ state: true, code: 0, data: {} })
++  }) as any
++})
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++function cfg(id: string, addition: any) {
++  return {
++    id,
++    mount_path: "/115",
++    addition: JSON.stringify(addition),
++    modified: 1,
++    disabled: false,
++  }
++}
++
++test("driver 名 115 Open 精确路由到 Pan115Driver", async () => {
++  const driver = await getDriver(
++    "115 Open",
++    cfg("r67-pos-115open", { refresh_token: "r", access_token: "a" }),
++  )
++  assert.equal(driver.constructor.name, "Pan115Driver")
++})
++
++test("driver 名 115 + 仅 cookie 仍路由到 Driver115Cookie（patch 41 双轨回归）", async () => {
++  const driver = await getDriver(
++    "115",
++    cfg("r67-neg-cookie", { cookie: "UID=1;CID=2;SEID=3", access_token: "" }),
++  )
++  assert.equal(driver.constructor.name, "Driver115Cookie")
++})
++
++test("driver 名 115 + token 仍路由到 Driver115", async () => {
++  const driver = await getDriver(
++    "115",
++    cfg("r67-neg-token", { access_token: "a", refresh_token: "r" }),
++  )
++  assert.equal(driver.constructor.name, "Driver115")
++})
++
++test("Pan115Driver.put fail-closed：抛未接线且不发任何 fetch", async () => {
++  const driver = new Pan115Driver({
++    access_token: "a",
++    refresh_token: "r",
++  } as any)
++  const before = fetchCalls
++  await assert.rejects(
++    () => driver.put("/115", "/115/a.bin", Buffer.from("abc")),
++    /未接线/,
++  )
++  assert.equal(fetchCalls, before)
++})
++
++// subrequestLimit 按 A-4 保持模块内私有，没有导出符号；这里断言它真正被读取的位置：
++// budget 是实例字段，构造时求值，所以同一个进程里两次构造就能覆盖两种运行时，
++// 不需要动态 import 规避 ESM 缓存。
++test("subrequestLimit：无 tjs 时预算 45，tjs 运行时 100000", () => {
++  const g = globalThis as any
++  const saved = g.tjs
++  try {
++    delete g.tjs
++    const nodeSide = new Pan115Driver({
++      access_token: "a",
++      refresh_token: "r",
++    } as any)
++    assert.equal((nodeSide as any).budget.limit, 45)
++    g.tjs = {}
++    const tjsSide = new Pan115Driver({
++      access_token: "a",
++      refresh_token: "r",
++    } as any)
++    assert.equal((tjsSide as any).budget.limit, 100000)
++  } finally {
++    if (saved === undefined) delete g.tjs
++    else g.tjs = saved
++  }
++})
+diff -ruN a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+--- a/src/backend/internal/op/storage.ts	2026-11-09 05:45:32.198963700 +0800
++++ b/src/backend/internal/op/storage.ts	2026-11-09 05:45:32.206612200 +0800
+@@ -208,6 +208,32 @@
+     : additionStr
+ }
+ 
++function pan115TokenPersister(storageConfig: any) {
++  return async (tokens: {
++    access_token: string
++    refresh_token: string
++  }) => {
++    // 持久化刷新后的 access_token / refresh_token，避免冷启动重复刷新
++    try {
++      const db = await getDb()
++      const st = (db.storages || []).find(
++        (s: any) => s.id === storageConfig?.id,
++      )
++      if (!st) return
++      const stAddition =
++        typeof st.addition === "string"
++          ? JSON.parse(st.addition || "{}")
++          : st.addition || {}
++      stAddition.access_token = tokens.access_token
++      stAddition.refresh_token = tokens.refresh_token
++      st.addition = JSON.stringify(stAddition)
++      await saveDb(db)
++    } catch (e) {
++      console.warn("[115open] failed to persist token:", e)
++    }
++  }
++}
++
+ async function createDriver(
+   driverName: string,
+   storageConfig?: any,
+@@ -346,11 +372,14 @@
+       })
+     })
+     await driver.init?.()
++  } else if (normDriver === "115open") {
++    const addition = parseAddition(storageConfig)
++    driver = new Pan115Driver(addition, pan115TokenPersister(storageConfig))
++    await driver.init?.()
+   } else if (
+     normDriver === "115" ||
+     normDriver === "115cloud" ||
+     normDriver === "115cookie" ||
+-    normDriver === "115open" ||
+     normDriver === "115netdisk"
+   ) {
+     const addition = parseAddition(storageConfig)
+@@ -646,26 +675,7 @@
+     normDriver.startsWith("115")
+   ) {
+     const addition = parseAddition(storageConfig)
+-    driver = new Pan115Driver(addition, async (tokens) => {
+-      // 持久化刷新后的 access_token / refresh_token，避免冷启动重复刷新
+-      try {
+-        const db = await getDb()
+-        const st = (db.storages || []).find(
+-          (s: any) => s.id === storageConfig?.id,
+-        )
+-        if (!st) return
+-        const stAddition =
+-          typeof st.addition === "string"
+-            ? JSON.parse(st.addition || "{}")
+-            : st.addition || {}
+-        stAddition.access_token = tokens.access_token
+-        stAddition.refresh_token = tokens.refresh_token
+-        st.addition = JSON.stringify(stAddition)
+-        await saveDb(db)
+-      } catch (e) {
+-        console.warn("[115open] failed to persist token:", e)
+-      }
+-    })
++    driver = new Pan115Driver(addition, pan115TokenPersister(storageConfig))
+     await driver.init?.()
+   } else if (
+     normDriver === "github" ||

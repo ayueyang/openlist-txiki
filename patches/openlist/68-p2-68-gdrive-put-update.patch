@@ -1,0 +1,311 @@
+diff --git a/src/backend/drivers/google_drive/driver.ts b/src/backend/drivers/google_drive/driver.ts
+index ba6bbcb..b0d50a8 100644
+--- a/src/backend/drivers/google_drive/driver.ts
++++ b/src/backend/drivers/google_drive/driver.ts
+@@ -146,6 +146,13 @@ export class GoogleDrive implements StorageDriver {
+   ): Promise<void> {
+     const { parentId, name } =
+       await this.client.resolveParentAndName(physicalPath)
++    // 对齐 alist v3.2.0：目标路径已有同名文件时 PATCH 覆盖同一个 file id，
++    // 否则（或只有同名文件夹时）POST 新建。
++    const existing = await this.client.findFileByName(parentId, name)
++    if (existing) {
++      await this.client.updateFile(existing.id, content)
++      return
++    }
+     await this.client.putFile(parentId, name, content)
+   }
+ }
+diff --git a/src/backend/drivers/google_drive/put-overwrite.test.ts b/src/backend/drivers/google_drive/put-overwrite.test.ts
+new file mode 100644
+index 0000000..fb8a51b
+--- /dev/null
++++ b/src/backend/drivers/google_drive/put-overwrite.test.ts
+@@ -0,0 +1,154 @@
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++
++import { GoogleDrive } from "./driver"
++import { GOOGLE_DRIVE_FOLDER_MIME } from "./types"
++
++// 全部用例只 mock globalThis.fetch：不连网、不登录、不需要真实 Google 账号。
++// 目标语义对齐 alist v3.2.0：上传前按目标路径查同名文件，命中则
++// PATCH files/{id}?uploadType=resumable（body 空 JSON），未命中才 POST 新建。
++
++const realFetch = globalThis.fetch
++
++type Call = {
++  method: string
++  url: string
++  body: string
++  headers: Record<string, string>
++}
++
++let calls: Call[] = []
++let listedFiles: any[] = []
++let initSeq = 0
++
++function jsonResponse(
++  body: any,
++  headers: Record<string, string> = {},
++  status = 200,
++): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    headers: {
++      get: (name: string) => {
++        const key = String(name).toLowerCase()
++        for (const [k, v] of Object.entries(headers)) {
++          if (k.toLowerCase() === key) return v
++        }
++        return key === "content-type" ? "application/json" : null
++      },
++    },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++beforeEach(() => {
++  calls = []
++  listedFiles = []
++  initSeq = 0
++  globalThis.fetch = (async (input: any, init: any = {}) => {
++    const url = String(input)
++    const method = String(init.method || "GET").toUpperCase()
++    const isUploadInit =
++      url.startsWith("https://www.googleapis.com/upload/drive/v3/files") &&
++      (method === "POST" || method === "PATCH")
++    calls.push({
++      method,
++      url,
++      body: typeof init.body === "string" ? init.body : "<binary>",
++      headers: (init.headers || {}) as Record<string, string>,
++    })
++    if (method === "GET" && url.includes("/drive/v3/files?")) {
++      return jsonResponse({ files: listedFiles })
++    }
++    if (isUploadInit) {
++      initSeq += 1
++      return jsonResponse({}, { location: `https://upload.example/s${initSeq}` })
++    }
++    return jsonResponse({})
++  }) as any
++})
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++function initCalls(): Call[] {
++  return calls.filter(
++    (c) =>
++      (c.method === "POST" || c.method === "PATCH") &&
++      c.url.startsWith("https://www.googleapis.com/upload/drive/v3/files"),
++  )
++}
++
++function makeDriver(chunkSize?: number): GoogleDrive {
++  return new GoogleDrive({ refresh_token: "", chunk_size: chunkSize })
++}
++
++test("同名上传：首次 POST 新建，第二次 PATCH 覆盖同一个 file id", async () => {
++  // 1MB + 1 字节，大于 chunk_size=1MB，新建和覆盖都走 resumable 分支。
++  const content = Buffer.alloc(1024 * 1024 + 1, 7)
++  const driver = makeDriver(1)
++
++  listedFiles = []
++  await driver.put("/gd", "/a.txt", content)
++  listedFiles = [
++    { id: "f1", name: "a.txt", mimeType: "application/octet-stream" },
++  ]
++  await driver.put("/gd", "/a.txt", content)
++
++  const inits = initCalls()
++  assert.deepEqual(
++    inits.map((c) => c.method),
++    ["POST", "PATCH"],
++  )
++  const patch = inits[1]
++  assert.ok(
++    patch.url.includes("/files/f1?uploadType=resumable"),
++    `PATCH URL 未带目标文件 id: ${patch.url}`,
++  )
++  assert.equal(patch.body, "{}")
++  const posts = calls.filter(
++    (c) =>
++      c.method === "POST" &&
++      c.url.startsWith("https://www.googleapis.com/upload/drive/v3/files"),
++  )
++  assert.equal(posts.length, 1)
++})
++
++test("同名条目是文件夹时不 PATCH，仍 POST 新建", async () => {
++  const content = Buffer.alloc(1024 * 1024 + 1, 7)
++  const driver = makeDriver(1)
++
++  listedFiles = [
++    { id: "d1", name: "a.txt", mimeType: GOOGLE_DRIVE_FOLDER_MIME },
++  ]
++  await driver.put("/gd", "/a.txt", content)
++  await driver.put("/gd", "/a.txt", content)
++
++  assert.deepEqual(
++    initCalls().map((c) => c.method),
++    ["POST", "POST"],
++  )
++})
++
++test("小文件覆盖：PATCH 后单次 PUT 带 Content-Length，无 Content-Range", async () => {
++  const content = Buffer.from("hello overwrite")
++  const driver = makeDriver(1)
++
++  listedFiles = [
++    { id: "f1", name: "a.txt", mimeType: "application/octet-stream" },
++  ]
++  await driver.put("/gd", "/a.txt", content)
++
++  assert.deepEqual(
++    initCalls().map((c) => c.method),
++    ["PATCH"],
++  )
++  const puts = calls.filter((c) => c.method === "PUT")
++  assert.equal(puts.length, 1)
++  assert.equal(puts[0].headers["Content-Length"], String(content.length))
++  assert.equal(puts[0].headers["Content-Range"], undefined)
++})
+diff --git a/src/backend/drivers/google_drive/util.ts b/src/backend/drivers/google_drive/util.ts
+index 230c4d2..867715b 100644
+--- a/src/backend/drivers/google_drive/util.ts
++++ b/src/backend/drivers/google_drive/util.ts
+@@ -226,6 +226,18 @@ export class GoogleDriveClient {
+     return files
+   }
+ 
++  public async findFileByName(
++    parentId: string,
++    filename: string,
++  ): Promise<GoogleFile | null> {
++    const files = await this.listFiles(parentId)
++    return (
++      files.find(
++        (f) => f.name === filename && f.mimeType !== GOOGLE_DRIVE_FOLDER_MIME,
++      ) ?? null
++    )
++  }
++
+   public async getFile(fileId: string): Promise<GoogleFile> {
+     const params = new URLSearchParams({
+       fields: "id,name,mimeType,size,modifiedTime,md5Checksum",
+@@ -362,24 +374,92 @@ export class GoogleDriveClient {
+       const uploadUrl = initRes.headers.get("location")
+       if (!uploadUrl) throw new Error("[GoogleDrive] No upload URL returned")
+ 
+-      // Upload in chunks
+-      let offset = 0
+-      while (offset < content.length) {
+-        const chunk = content.slice(offset, offset + chunkSize)
+-        const end = offset + chunk.length - 1
+-        const putRes = await fetch(uploadUrl, {
+-          method: "PUT",
+-          headers: {
+-            "Content-Range": `bytes ${offset}-${end}/${content.length}`,
+-            "Content-Type": mimeType,
+-          },
+-          body: chunk,
+-        })
+-        if (!putRes.ok && putRes.status !== 308) {
+-          throw new Error(`[GoogleDrive] Chunk upload failed: ${putRes.status}`)
+-        }
+-        offset += chunk.length
++      await this.uploadContent(uploadUrl, content, mimeType, chunkSize, false)
++    }
++  }
++
++  // 同名覆盖：对齐 alist v3.2.0，PATCH upload/drive/v3/files/{fileId} 申请
++  // resumable 会话（body 空 JSON、不带 parents，避免把文件挪目录），再 PUT 内容。
++  public async updateFile(
++    fileId: string,
++    content: Buffer,
++    mimeType = "application/octet-stream",
++  ): Promise<void> {
++    await this.ensureToken()
++    const params = new URLSearchParams({
++      uploadType: "resumable",
++      supportsAllDrives: "true",
++    })
++    const initRes = await fetch(
++      `${GDRIVE_UPLOAD_API}/files/${fileId}?${params.toString()}`,
++      {
++        method: "PATCH",
++        headers: {
++          Authorization: `Bearer ${this.accessToken}`,
++          "Content-Type": "application/json",
++          "X-Upload-Content-Type": mimeType,
++          "X-Upload-Content-Length": String(content.length),
++        },
++        body: "{}",
++      },
++    )
++    if (!initRes.ok) {
++      throw new Error(
++        `[GoogleDrive] Resumable update init failed: ${initRes.status}`,
++      )
++    }
++    const uploadUrl = initRes.headers.get("location")
++    if (!uploadUrl) throw new Error("[GoogleDrive] No upload URL returned")
++
++    const chunkSize = (this.addition.chunk_size || 5) * 1024 * 1024
++    await this.uploadContent(
++      uploadUrl,
++      content,
++      mimeType,
++      chunkSize,
++      content.length < chunkSize,
++    )
++  }
++
++  // singlePut=true：按 A 的小文件分支发一次带 Content-Length 的 PUT；
++  // 否则按 chunkSize 循环、带 Content-Range（新建大文件与覆盖大文件共用）。
++  private async uploadContent(
++    uploadUrl: string,
++    content: Buffer,
++    mimeType: string,
++    chunkSize: number,
++    singlePut: boolean,
++  ): Promise<void> {
++    if (singlePut) {
++      const putRes = await fetch(uploadUrl, {
++        method: "PUT",
++        headers: {
++          "Content-Length": String(content.length),
++          "Content-Type": mimeType,
++        },
++        body: content.slice(),
++      })
++      if (!putRes.ok && putRes.status !== 308) {
++        throw new Error(`[GoogleDrive] Upload failed: ${putRes.status}`)
++      }
++      return
++    }
++    let offset = 0
++    while (offset < content.length) {
++      const chunk = content.slice(offset, offset + chunkSize)
++      const end = offset + chunk.length - 1
++      const putRes = await fetch(uploadUrl, {
++        method: "PUT",
++        headers: {
++          "Content-Range": `bytes ${offset}-${end}/${content.length}`,
++          "Content-Type": mimeType,
++        },
++        body: chunk,
++      })
++      if (!putRes.ok && putRes.status !== 308) {
++        throw new Error(`[GoogleDrive] Chunk upload failed: ${putRes.status}`)
+       }
++      offset += chunk.length
+     }
+   }
+ 

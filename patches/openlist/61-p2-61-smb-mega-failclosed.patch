@@ -1,0 +1,282 @@
+diff -ruN a/src/backend/drivers/mega/driver.failclosed.test.ts b/src/backend/drivers/mega/driver.failclosed.test.ts
+--- a/src/backend/drivers/mega/driver.failclosed.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/mega/driver.failclosed.test.ts	2026-11-09 03:49:15.580261600 +0800
+@@ -0,0 +1,43 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { MegaDriver } from "./driver"
++import { MegaAddition } from "./types"
++
++// Mega 的 put / rename / copy 在 txiki 运行时没有实现，必须显式抛错，
++// 不能 console.warn 后返回成功。unsupported 判断在节点解析之前，
++// 因此这些用例不需要登录、不需要 mock client、不连网。
++
++const addition: MegaAddition = {
++  email: "test@example.com",
++  password: "not-a-real-password",
++}
++
++async function expectUnsupported(op: string, run: () => Promise<unknown>) {
++  await assert.rejects(run, (err: any) => {
++    const msg = String(err && err.message)
++    assert.match(msg, /Mega/, `message must name Mega: ${msg}`)
++    assert.match(msg, new RegExp(`\\(${op}\\)`), `message must name op ${op}: ${msg}`)
++    return true
++  })
++}
++
++test("MegaDriver.put is fail-closed", async () => {
++  const driver = new MegaDriver(addition)
++  await expectUnsupported("put", () =>
++    driver.put("/", "/a.txt", new Uint8Array([1, 2, 3])),
++  )
++})
++
++test("MegaDriver.rename is fail-closed before node lookup", async () => {
++  const driver = new MegaDriver(addition)
++  await expectUnsupported("rename", () =>
++    driver.rename("/", "/a.txt", "b.txt"),
++  )
++})
++
++test("MegaDriver.copy is fail-closed", async () => {
++  const driver = new MegaDriver(addition)
++  await expectUnsupported("copy", () =>
++    driver.copy("/src", "/dst", ["a.txt"], "/src/a.txt", "/dst/a.txt"),
++  )
++})
+diff -ruN a/src/backend/drivers/mega/driver.ts b/src/backend/drivers/mega/driver.ts
+--- a/src/backend/drivers/mega/driver.ts	2026-11-09 03:49:15.347925100 +0800
++++ b/src/backend/drivers/mega/driver.ts	2026-11-09 03:49:15.461096300 +0800
+@@ -7,6 +7,12 @@
+ import { MegaAddition, MegaNodeItem } from "./types"
+ import { MegaApiClient } from "./util"
+ 
++// txiki 运行时没有实现 Mega 的写入/改名/复制调用。这些操作显式 fail-closed，
++// 不能 console.warn 后返回成功。unsupported 判断放在任何节点解析之前。
++function megaUnsupported(op: string): Error {
++  return new Error(`Mega driver is not implemented in txiki runtime (${op})`)
++}
++
+ export class MegaDriver implements StorageDriver {
+   private addition: MegaAddition
+   private client: MegaApiClient
+@@ -137,12 +143,7 @@
+     physicalPath: string,
+     newName: string,
+   ): Promise<void> {
+-    const node = this.resolveNodeByPath(this.cleanPath(physicalPath))
+-    if (!node) {
+-      throw new Error("Node not found")
+-    }
+-    // Rename via attr update
+-    console.warn(`[Mega] rename ${physicalPath} to ${newName}`)
++    throw megaUnsupported("rename")
+   }
+ 
+   async move(
+@@ -174,9 +175,7 @@
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    console.warn(
+-      `[Mega] copy not supported natively from ${srcPhys} to ${dstPhys}`,
+-    )
++    throw megaUnsupported("copy")
+   }
+ 
+   async remove(
+@@ -198,7 +197,7 @@
+     physicalPath: string,
+     content: Buffer | Uint8Array,
+   ): Promise<void> {
+-    console.warn(`[Mega] put for ${physicalPath}`)
++    throw megaUnsupported("put")
+   }
+ 
+   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {
+diff -ruN a/src/backend/drivers/smb/driver.failclosed.test.ts b/src/backend/drivers/smb/driver.failclosed.test.ts
+--- a/src/backend/drivers/smb/driver.failclosed.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/smb/driver.failclosed.test.ts	2026-11-09 03:49:15.517139800 +0800
+@@ -0,0 +1,72 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { SMBDriver } from "./driver"
++import { SMBAddition } from "./types"
++
++// SMB 在 txiki 运行时没有实现（无 node:net / SMB 客户端）。
++// 所有方法必须 fail-closed：抛错，而不是返回空数组 / 编造条目 / 空体成功。
++// 这些用例不连网、不登录、不读任何真实配置。
++
++const addition: SMBAddition = {
++  address: "127.0.0.1",
++  username: "guest",
++  password: "",
++  share_name: "share",
++}
++
++async function expectUnsupported(op: string, run: () => Promise<unknown>) {
++  await assert.rejects(run, (err: any) => {
++    const msg = String(err && err.message)
++    assert.match(msg, /SMB/, `message must name SMB: ${msg}`)
++    assert.match(msg, new RegExp(`\\(${op}\\)`), `message must name op ${op}: ${msg}`)
++    return true
++  })
++}
++
++test("SMBDriver.list is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("list", () => driver.list("/", "/"))
++})
++
++test("SMBDriver.get is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("get", () => driver.get("/", "/x.txt"))
++})
++
++test("SMBDriver.mkdir is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("mkdir", () => driver.mkdir("/", "/newdir"))
++})
++
++test("SMBDriver.rename is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("rename", () =>
++    driver.rename("/", "/a.txt", "b.txt"),
++  )
++})
++
++test("SMBDriver.remove is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("remove", () => driver.remove("/", "/a.txt", ["a.txt"]))
++})
++
++test("SMBDriver.move is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("move", () =>
++    driver.move("/src", "/dst", ["a.txt"], "/src/a.txt", "/dst/a.txt"),
++  )
++})
++
++test("SMBDriver.copy is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("copy", () =>
++    driver.copy("/src", "/dst", ["a.txt"], "/src/a.txt", "/dst/a.txt"),
++  )
++})
++
++test("SMBDriver.put is fail-closed", async () => {
++  const driver = new SMBDriver(addition)
++  await expectUnsupported("put", () =>
++    driver.put("/", "/a.txt", new Uint8Array([1, 2, 3])),
++  )
++})
+diff -ruN a/src/backend/drivers/smb/driver.ts b/src/backend/drivers/smb/driver.ts
+--- a/src/backend/drivers/smb/driver.ts	2026-11-09 03:49:15.289394600 +0800
++++ b/src/backend/drivers/smb/driver.ts	2026-11-09 03:49:15.402796400 +0800
+@@ -1,10 +1,11 @@
+-import {
+-  calcFileType,
+-  FileItem,
+-  StorageDriver,
+-} from "../../internal/driver/base"
+-import { sortFileItems } from "../../internal/driver/sort"
+-import { SMBAddition, SMBFileEntry } from "./types"
++import { FileItem, StorageDriver } from "../../internal/driver/base"
++import { SMBAddition } from "./types"
++
++// txiki 运行时没有 node:net，SMB 客户端不可用。所有方法 fail-closed：
++// 抛错，而不是返回空数组 / 编造条目 / 空体成功。
++function smbUnsupported(op: string): Error {
++  return new Error(`SMB driver is not implemented in txiki runtime (${op})`)
++}
+ 
+ export class SMBDriver implements StorageDriver {
+   private addition: SMBAddition
+@@ -19,39 +20,16 @@
+     }
+   }
+ 
+-  private cleanPath(p: string): string {
+-    const s = "/" + (p || "").split("/").filter(Boolean).join("/")
+-    return s === "/" ? "" : s
+-  }
+-
+   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+-    // In Node.js / container runtime, SMB client queries files from share
+-    // Return empty list or handled entries
+-    const items: FileItem[] = []
+-    return sortFileItems(
+-      items,
+-      this.addition.order_by,
+-      this.addition.order_direction,
+-    )
++    throw smbUnsupported("list")
+   }
+ 
+   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
+-    const clean = this.cleanPath(physicalPath)
+-    const name = clean.split("/").filter(Boolean).pop() || "root"
+-
+-    return {
+-      name,
+-      size: 0,
+-      is_dir: clean === "",
+-      modified: new Date().toISOString(),
+-      sign: clean || "/",
+-      type: calcFileType(name, clean === ""),
+-      raw_url: "",
+-    }
++    throw smbUnsupported("get")
+   }
+ 
+   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
+-    // SMB mkdir
++    throw smbUnsupported("mkdir")
+   }
+ 
+   async rename(
+@@ -59,7 +37,7 @@
+     physicalPath: string,
+     newName: string,
+   ): Promise<void> {
+-    // SMB rename
++    throw smbUnsupported("rename")
+   }
+ 
+   async remove(
+@@ -67,7 +45,7 @@
+     physicalPath: string,
+     names: string[],
+   ): Promise<void> {
+-    // SMB delete
++    throw smbUnsupported("remove")
+   }
+ 
+   async move(
+@@ -77,7 +55,7 @@
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    // SMB move
++    throw smbUnsupported("move")
+   }
+ 
+   async copy(
+@@ -87,7 +65,7 @@
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    // SMB copy
++    throw smbUnsupported("copy")
+   }
+ 
+   async put(
+@@ -95,6 +73,6 @@
+     physicalPath: string,
+     content: Buffer | Uint8Array,
+   ): Promise<void> {
+-    // SMB put
++    throw smbUnsupported("put")
+   }
+ }

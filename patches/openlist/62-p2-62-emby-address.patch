@@ -1,0 +1,102 @@
+diff -ruN a/src/backend/drivers/emby/driver.address.test.ts b/src/backend/drivers/emby/driver.address.test.ts
+--- a/src/backend/drivers/emby/driver.address.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/emby/driver.address.test.ts	2026-11-09 04:38:29.469401200 +0800
+@@ -0,0 +1,72 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { EmbyDriver } from "./driver"
++
++// AList 侧 emby 的 Addition 用 address 表示服务地址，W 侧历史字段是 url。
++// 本组用例验证 address 会映射到 url，且 api_key 与 username/password 两条
++// 认证路径都保留；fetch 全部由本文件替身，不连网、不用真实账号。
++
++test("address 映射到 url 并走 username/password 登录链", async () => {
++  const calls: string[] = []
++  const originalFetch = globalThis.fetch
++  globalThis.fetch = (async (input: any, init?: any) => {
++    calls.push(String(input))
++    assert.equal(init?.method, "POST")
++    const body = JSON.parse(String(init?.body))
++    assert.deepEqual(body, { Username: "bob", Pw: "pw" })
++    return new Response(
++      JSON.stringify({ AccessToken: "token-from-login", User: { Id: "user-1" } }),
++      { status: 200, headers: { "content-type": "application/json" } },
++    )
++  }) as any
++  try {
++    const driver = new EmbyDriver({
++      address: "http://emby.lan:8096/",
++      username: "bob",
++      password: "pw",
++    })
++    assert.equal((driver as any).addition.url, "http://emby.lan:8096")
++    await driver.init()
++    assert.equal((driver as any).client.token, "token-from-login")
++    assert.equal((driver as any).client.userID, "user-1")
++    assert.equal(calls.length, 1)
++    assert.match(calls[0], /\/Users\/AuthenticateByName$/)
++  } finally {
++    globalThis.fetch = originalFetch
++  }
++})
++
++test("url 非空时优先于 address", () => {
++  const driver = new EmbyDriver({
++    address: "http://old.lan:8096",
++    url: "http://new.lan:8096/",
++    api_key: "k",
++    user_id: "u",
++  })
++  assert.equal((driver as any).addition.url, "http://new.lan:8096")
++})
++
++test("api_key 路径不登录也能 init", async () => {
++  let fetched = 0
++  const originalFetch = globalThis.fetch
++  globalThis.fetch = (async () => {
++    fetched += 1
++    throw new Error("api_key path must not call network")
++  }) as any
++  try {
++    const driver = new EmbyDriver({
++      address: "http://emby.lan:8096",
++      api_key: "key",
++      user_id: "user",
++    })
++    await driver.init()
++    assert.equal(fetched, 0)
++  } finally {
++    globalThis.fetch = originalFetch
++  }
++})
++
++test("无 api_key 且无 username 时报错", async () => {
++  const driver = new EmbyDriver({ address: "http://emby.lan:8096" })
++  await assert.rejects(driver.init(), /api_key\+user_id or username/)
++})
+diff -ruN a/src/backend/drivers/emby/driver.ts b/src/backend/drivers/emby/driver.ts
+--- a/src/backend/drivers/emby/driver.ts	2026-11-09 04:38:29.454788000 +0800
++++ b/src/backend/drivers/emby/driver.ts	2026-11-09 04:38:29.467768900 +0800
+@@ -11,7 +11,9 @@
+ 
+ export function normalizeEmbyAddition(a: any): EmbyAddition {
+   const norm = { ...(a || {}) } as any
+-  norm.url = (norm.url || "").trim().replace(/\/+$/, "")
++  norm.address = (norm.address || "").trim().replace(/\/+$/, "")
++  norm.url =
++    (norm.url || "").trim().replace(/\/+$/, "") || norm.address
+   norm.api_key = (norm.api_key || "").trim()
+   norm.user_id = (norm.user_id || "").trim()
+   norm.username = (norm.username || "").trim()
+diff -ruN a/src/backend/drivers/emby/types.ts b/src/backend/drivers/emby/types.ts
+--- a/src/backend/drivers/emby/types.ts	2026-11-09 04:38:29.453169400 +0800
++++ b/src/backend/drivers/emby/types.ts	2026-11-09 04:38:29.465613800 +0800
+@@ -2,6 +2,8 @@
+ // Ported from: OpenList-Backends/drivers/emby
+ 
+ export interface EmbyAddition {
++  /** AList 配置字段：服务地址（导入配置时映射到 url） */
++  address?: string
+   /** Emby 服务器地址，例如 http://localhost:8096 */
+   url: string
+   api_key: string

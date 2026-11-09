@@ -1,4 +1,4 @@
-# txiki.js 运行时补丁清单（r57）
+# txiki.js 运行时补丁清单（r58）
 
 基树：txiki.js `zig/v26.9.0` = commit `a07d6aa19553a61d088bbfbd7ac2ae204d2761a6`，
 CRLF 工作区（`core.autocrlf=true`）。`deps/libwebsockets` 为子模块 `ac23cae7`。

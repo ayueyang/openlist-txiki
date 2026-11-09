@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 60
+patch_count 69
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file c499417cc5a44567e68d5372a2e66dafaa38d9c360825c57109751789af216ce src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file 075dddf4a1b33cca186686166995323018d1253efca49ca55f45b505c7eb4ded src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -246,7 +246,7 @@ file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backen
 file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file 25ef8c10d05897cec00c42ef23820a962bb9b16e19287ac85a677d7e1f5d383c src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file 50910ce6c99a2b6e80b10e0c361409e132fa379ba61a7f976b265097cae28100 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file d24a2dc841d324f1d12cb881bb9abbcb00282a7f31d352bc4bf3ea642bea6d7b src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
@@ -441,3 +441,22 @@ patch 59 6a227068ef095b3a5da81e94081ae93adbfd112c0e89573079faa69ca927e7dc work/p
 #   （7046e61… -> 6a5f33e1…），新增 HTTP 级用例 storage_189pc_api.test.ts，
 #   file_count 43->44。
 patch 60 c5808668654de6f9641f314b331a34a214be0b07b2db02688551d4789d85eae1 work/p2-60-189pc-admin-api.patch
+
+# 第 61 条（2026-11-09，r58 候选）：SMB / Mega 的 put/rename/copy 在 txiki 无实现，改显式抛错，不再 warn 后返回成功；新增 driver.failclosed.test.ts 两件。
+patch 61 ad125eabffa3b645fa630d219fb0b83cee0296f5fbf0cd88f2691a97df4a8d72 work/p2-61-smb-mega-failclosed.patch
+# 第 62 条（2026-11-09，r58 候选）：emby 的 address 映射到 url，api_key 与 username/password 两条认证路径保留；新增 driver.address.test.ts。
+patch 62 fb6b2dc67b66020a4e2378929ff4b8e48a320ff8d2d540926e8f679fe7a831c4 work/p2-62-emby-address.patch
+# 第 63 条（2026-11-09，r58 候选）：guangyapan 缺省 client_id 用 AList 默认值 aMe-8VSlkrbQXpUR，导入 A 配置不再起不来；新增 driver.clientid.test.ts。
+patch 63 f155a5816b3e173e6079e10f118acf46dcb060969e122646ea1c59b37b779a37 work/p2-63-guangyapan-clientid.patch
+# 第 64 条（2026-11-09，r58 候选）：seafile 同时认 repoId/repoPwd 与 repo_id/repo_pwd，repoId 优先；新增 driver.repoid.test.ts。
+patch 64 9dd73c5b9ea9bb13fdb1e688c4ae96d02f645f229ca25268af4456ee37524da2 work/p2-64-seafile-repoid.patch
+# 第 65 条（2026-11-09，r58 候选）：SMB 单测口径与 driver.failclosed.test.ts 对齐：每个方法 reject 且错误含驱动名与操作名。
+patch 65 94a51cb8c1056f012d98c3dcfb7606e549a74eb8d987c438733c4028fb9d2c98 work/p2-65-smb-test-align.patch
+# 第 66 条（2026-11-09，r58 候选）：/api/fs/copy 与 /api/fs/move 的写冲突 preflight：同名回 403 且不动任何条目，overwrite 覆盖、skip_existing 跳过、copy merge 回 400；新增 write-conflict.ts 与两件用例。
+patch 66 a6bbad0f47022877dec8b217487fdc46d58eafdbafbc43ec881c6a55714145d1 work/p2-66-fs-write-conflict.patch
+# 第 67 条（2026-11-09，r58 候选）：115open 路由到 Pan115Driver 前置判定与 SUBREQUEST_LIMIT 按运行时取值；put 在分片上传实现前 fail-closed 不上传；新增 routing.test.ts。
+patch 67 81c90a24e8d0fbf6813ca80512e445637d33d52ed18a2525ded8ae05623e2aa2 work/p2-67-115open-routing.patch
+# 第 68 条（2026-11-09，r58 候选）：google_drive 同名上传走 PATCH update 同一个 file id（对齐 alist v3.2.0），无同名才 POST 新建；新增 put-overwrite.test.ts。
+patch 68 d7d55ef94a4a27913d900028792aac3e7a500a6297865d1806b47c9ed8d1c79a work/p2-68-gdrive-put-update.patch
+# 第 69 条（2026-11-09，r58 候选）：115_share 登录链、短键映射与限速；新增 login.test.ts。
+patch 69 a6b0602273afea8f5fc57831c3230e42b23a456ec89d22209da3fec2df37f9c9 work/p2-69-115share-login.patch

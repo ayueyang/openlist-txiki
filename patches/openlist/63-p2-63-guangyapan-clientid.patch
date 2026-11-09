@@ -1,0 +1,41 @@
+diff -ruN a/src/backend/drivers/guangyapan/driver.clientid.test.ts b/src/backend/drivers/guangyapan/driver.clientid.test.ts
+--- a/src/backend/drivers/guangyapan/driver.clientid.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/guangyapan/driver.clientid.test.ts	2026-11-09 04:39:23.056165800 +0800
+@@ -0,0 +1,25 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { GuangYaPanDriver, normalizeGuangYaPanAddition } from "./driver"
++
++// AList 侧 guangyapan 的 ClientID 默认值是 aMe-8VSlkrbQXpUR。
++// W 侧原先缺 client_id 直接 throw，导入 A 配置（未写 client_id）会起不来。
++const DEFAULT_CLIENT_ID = "aMe-8VSlkrbQXpUR"
++
++test("缺省 client_id 时使用 AList 默认值", async () => {
++  const a = normalizeGuangYaPanAddition({})
++  assert.equal(a.client_id, DEFAULT_CLIENT_ID)
++
++  const driver = new GuangYaPanDriver({})
++  assert.equal((driver as any).client.clientId, DEFAULT_CLIENT_ID)
++  // 过了 client_id 门，停在「没有有效令牌」，而不是 client_id is required
++  await assert.rejects(driver.init(), /login failed/)
++})
++
++test("显式 client_id 不被默认值覆盖", () => {
++  const a = normalizeGuangYaPanAddition({ client_id: " custom-cid " })
++  assert.equal(a.client_id, "custom-cid")
++
++  const driver = new GuangYaPanDriver({ client_id: "custom-cid" })
++  assert.equal((driver as any).client.clientId, "custom-cid")
++})
+diff -ruN a/src/backend/drivers/guangyapan/driver.ts b/src/backend/drivers/guangyapan/driver.ts
+--- a/src/backend/drivers/guangyapan/driver.ts	2026-11-09 04:39:23.041650300 +0800
++++ b/src/backend/drivers/guangyapan/driver.ts	2026-11-09 04:39:23.054167300 +0800
+@@ -18,7 +18,7 @@
+ 
+ export function normalizeGuangYaPanAddition(a: any): GuangYaPanAddition {
+   const norm = { ...(a || {}) } as any
+-  norm.client_id = (norm.client_id || "").trim()
++  norm.client_id = (norm.client_id || "").trim() || "aMe-8VSlkrbQXpUR"
+   norm.device_id = normalizeDeviceID(norm.device_id || "")
+   if (!norm.device_id) norm.device_id = randomDeviceID()
+   norm.device_sign = (norm.device_sign || "").trim() || "wdi10." + norm.device_id

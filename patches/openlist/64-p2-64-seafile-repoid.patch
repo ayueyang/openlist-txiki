@@ -1,0 +1,109 @@
+diff -ruN a/src/backend/drivers/seafile/driver.repoid.test.ts b/src/backend/drivers/seafile/driver.repoid.test.ts
+--- a/src/backend/drivers/seafile/driver.repoid.test.ts	1970-01-01 08:00:00.000000000 +0800
++++ b/src/backend/drivers/seafile/driver.repoid.test.ts	2026-11-09 04:40:17.977994700 +0800
+@@ -0,0 +1,57 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { SeafileDriver } from "./driver"
++
++// AList 侧 seafile 的 Addition 字段是 repoId/repoPwd（json 键同名）；
++// W 侧历史字段是 repo_id/repo_pwd。两套键都要能读到，repoId/repoPwd 优先。
++// fetch 全部由本文件替身，不连网、不用真实账号。
++
++const base = {
++  address: "https://seafile.example.com",
++  token: "testtoken123456",
++}
++
++async function repoPwdUsedByDecrypt(addition: any): Promise<string> {
++  const bodies: string[] = []
++  const originalFetch = globalThis.fetch
++  globalThis.fetch = (async (_input: any, init?: any) => {
++    bodies.push(String(init?.body))
++    return new Response("success", {
++      status: 200,
++      headers: { "content-type": "text/plain" },
++    })
++  }) as any
++  try {
++    const driver = new SeafileDriver(addition)
++    await (driver as any).client.decryptLibrary({ id: "repo-x", encrypted: true })
++  } finally {
++    globalThis.fetch = originalFetch
++  }
++  assert.equal(bodies.length, 1)
++  return bodies[0]
++}
++
++test("AList 键 repoId/repoPwd 可读", async () => {
++  const driver = new SeafileDriver({ ...base, repoId: "repo-a", repoPwd: "pwd-a" } as any)
++  assert.equal((driver as any).repoId, "repo-a")
++  assert.equal(await repoPwdUsedByDecrypt({ ...base, repoId: "repo-a", repoPwd: "pwd-a" }), "password=pwd-a")
++})
++
++test("历史键 repo_id/repo_pwd 继续可读", async () => {
++  const driver = new SeafileDriver({ ...base, repo_id: "repo-b", repo_pwd: "pwd-b" })
++  assert.equal((driver as any).repoId, "repo-b")
++  assert.equal(await repoPwdUsedByDecrypt({ ...base, repo_id: "repo-b", repo_pwd: "pwd-b" }), "password=pwd-b")
++})
++
++test("两套键同时给时 repoId/repoPwd 优先", async () => {
++  const both = {
++    ...base,
++    repoId: "repo-a",
++    repo_id: "repo-b",
++    repoPwd: "pwd-a",
++    repo_pwd: "pwd-b",
++  } as any
++  const driver = new SeafileDriver(both)
++  assert.equal((driver as any).repoId, "repo-a")
++  assert.equal(await repoPwdUsedByDecrypt(both), "password=pwd-a")
++})
+diff -ruN a/src/backend/drivers/seafile/driver.ts b/src/backend/drivers/seafile/driver.ts
+--- a/src/backend/drivers/seafile/driver.ts	2026-11-09 04:40:17.967420200 +0800
++++ b/src/backend/drivers/seafile/driver.ts	2026-11-09 04:40:17.976419300 +0800
+@@ -18,7 +18,7 @@
+     onTokenRefreshed?: (token: string) => Promise<void>,
+   ) {
+     this.addition = addition
+-    this.repoId = addition.repo_id || undefined
++    this.repoId = addition.repoId || addition.repo_id || undefined
+     this.client = new SeafileApiClient(addition, onTokenRefreshed)
+   }
+ 
+diff -ruN a/src/backend/drivers/seafile/types.ts b/src/backend/drivers/seafile/types.ts
+--- a/src/backend/drivers/seafile/types.ts	2026-11-09 04:40:17.965419600 +0800
++++ b/src/backend/drivers/seafile/types.ts	2026-11-09 04:40:17.975417800 +0800
+@@ -3,6 +3,10 @@
+   username?: string
+   password?: string
+   token?: string
++  /** AList 配置字段（json: repoId），非空时优先于 repo_id */
++  repoId?: string
++  /** AList 配置字段（json: repoPwd），非空时优先于 repo_pwd */
++  repoPwd?: string
+   repo_id?: string
+   repo_pwd?: string
+   root_folder_path?: string
+diff -ruN a/src/backend/drivers/seafile/util.ts b/src/backend/drivers/seafile/util.ts
+--- a/src/backend/drivers/seafile/util.ts	2026-11-09 04:40:17.968420300 +0800
++++ b/src/backend/drivers/seafile/util.ts	2026-11-09 04:40:17.976419300 +0800
+@@ -146,7 +146,8 @@
+ 
+   async decryptLibrary(repo: SeafileLibraryItem): Promise<void> {
+     if (!repo.encrypted) return
+-    if (!this.addition.repo_pwd) {
++    const repoPwd = this.addition.repoPwd || this.addition.repo_pwd
++    if (!repoPwd) {
+       throw new Error(
+         "Seafile encrypted library password (repo_pwd) is not configured",
+       )
+@@ -161,7 +162,7 @@
+       method: "POST",
+       isFormData: true,
+       body: {
+-        password: this.addition.repo_pwd,
++        password: repoPwd,
+       },
+     })
+ 

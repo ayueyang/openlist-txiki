@@ -1,0 +1,461 @@
+diff --git a/src/backend/drivers/115_share/login.test.ts b/src/backend/drivers/115_share/login.test.ts
+new file mode 100644
+index 0000000..91b4b67
+--- /dev/null
++++ b/src/backend/drivers/115_share/login.test.ts
+@@ -0,0 +1,187 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { Pan115ShareApiClient } from "./util"
++import { Pan115ShareDriver } from "./driver"
++
++interface RecordedRequest {
++  url: string
++  method: string
++  headers: Record<string, string>
++  body?: string
++}
++
++// 全 mock fetch：记录 URL/方法/头，不连网、不登录。
++function mockFetch(handler: (req: RecordedRequest) => unknown) {
++  const calls: RecordedRequest[] = []
++  const original = globalThis.fetch
++  ;(globalThis as any).fetch = async (input: any, init: any = {}) => {
++    const url = typeof input === "string" ? input : String(input?.url ?? input)
++    const headers: Record<string, string> = {}
++    for (const [k, v] of Object.entries(init.headers || {})) {
++      headers[String(k).toLowerCase()] = String(v)
++    }
++    const req: RecordedRequest = {
++      url,
++      method: String(init.method || "GET").toUpperCase(),
++      headers,
++      body: init.body,
++    }
++    calls.push(req)
++    const payload = handler(req)
++    return new Response(JSON.stringify(payload), {
++      status: 200,
++      headers: { "content-type": "application/json" },
++    })
++  }
++  return {
++    calls,
++    restore: () => {
++      globalThis.fetch = original
++    },
++  }
++}
++
++test("有 cookie：init 请求顺序是 snap -> my.115.com status，status 带 Cookie", async (t) => {
++  const mock = mockFetch((req) => {
++    if (req.url.includes("/share/snap")) {
++      return { state: true, data: { count: 0, list: [] } }
++    }
++    return { state: true }
++  })
++  t.after(mock.restore)
++
++  const client = new Pan115ShareApiClient({
++    share_code: "sc1",
++    receive_code: "rc1",
++    cookie: "UID=1;CID=2;SEID=3",
++  })
++  await client.init()
++
++  assert.equal(mock.calls.length, 2)
++  assert.ok(mock.calls[0].url.startsWith("https://webapi.115.com/share/snap"))
++  const snapUrl = new URL(mock.calls[0].url)
++  assert.equal(snapUrl.searchParams.get("share_code"), "sc1")
++  assert.equal(snapUrl.searchParams.get("receive_code"), "rc1")
++  assert.equal(snapUrl.searchParams.get("cid"), "0")
++
++  assert.ok(mock.calls[1].url.startsWith("https://my.115.com/"))
++  assert.match(mock.calls[1].url, /ct=guide/)
++  assert.match(mock.calls[1].url, /ac=status/)
++  assert.equal(mock.calls[1].headers["cookie"], "UID=1;CID=2;SEID=3")
++})
++
++test("无 cookie：init 只发 1 条 snap 并 resolve，公开分享不被登录打断", async (t) => {
++  const mock = mockFetch(() => ({ state: true, data: { count: 0, list: [] } }))
++  t.after(mock.restore)
++
++  const client = new Pan115ShareApiClient({
++    share_code: "sc1",
++    receive_code: "rc1",
++  })
++  await client.init()
++
++  assert.equal(mock.calls.length, 1)
++  assert.ok(mock.calls[0].url.includes("/share/snap"))
++})
++
++test("只有 qrcode_token：rejects /扫码登录未接线/ 且零请求", async (t) => {
++  const mock = mockFetch(() => {
++    throw new Error("qrcode 路径不应发请求")
++  })
++  t.after(mock.restore)
++
++  const client = new Pan115ShareApiClient({
++    share_code: "sc1",
++    receive_code: "rc1",
++    qrcode_token: "qr-token",
++  })
++  await assert.rejects(client.init(), /扫码登录未接线/)
++  assert.equal(mock.calls.length, 0)
++})
++
++test("短键 snap 归一化：目录/文件/大小正确", async (t) => {
++  const mock = mockFetch((req) => {
++    if (req.url.includes("/share/snap")) {
++      return {
++        state: true,
++        data: {
++          count: 2,
++          list: [
++            { cid: "c1", n: "Folder1", fc: 0, t: 1700000000 },
++            { fid: "f1", n: "video.mp4", fc: 1, s: 10240, t: 1700000000 },
++          ],
++        },
++      }
++    }
++    return { state: true }
++  })
++  t.after(mock.restore)
++
++  const driver = new Pan115ShareDriver({
++    share_code: "sc1",
++    receive_code: "rc1",
++  })
++  const items = await driver.list("/", "/")
++
++  assert.equal(items.length, 2)
++  const folder = items.find((item) => item.name === "Folder1")
++  const file = items.find((item) => item.name === "video.mp4")
++  assert.ok(folder, "Folder1 应出现在列表里")
++  assert.ok(file, "video.mp4 应出现在列表里")
++  assert.equal(folder!.is_dir, true)
++  assert.equal(file!.is_dir, false)
++  assert.equal(file!.size, 10240)
++})
++
++test("getDownloadUrl：GET + dl=1 + 115cdn share Referer", async (t) => {
++  const mock = mockFetch(() => ({
++    state: true,
++    data: { url: { url: "https://cdn.example/f1" } },
++  }))
++  t.after(mock.restore)
++
++  const client = new Pan115ShareApiClient({
++    share_code: "sc1",
++    receive_code: "rc1",
++  })
++  const url = await client.getDownloadUrl("f1")
++
++  assert.equal(url, "https://cdn.example/f1")
++  assert.equal(mock.calls.length, 1)
++  assert.equal(mock.calls[0].method, "GET")
++  const downloadUrl = new URL(mock.calls[0].url)
++  assert.equal(downloadUrl.searchParams.get("share_code"), "sc1")
++  assert.equal(downloadUrl.searchParams.get("receive_code"), "rc1")
++  assert.equal(downloadUrl.searchParams.get("file_id"), "f1")
++  assert.equal(downloadUrl.searchParams.get("dl"), "1")
++  assert.match(mock.calls[0].headers["referer"], /115cdn\.com\/s\/sc1/)
++})
++
++test("getDownloadUrl：兼容 data.url 字符串响应", async (t) => {
++  const mock = mockFetch(() => ({
++    state: true,
++    data: { url: "https://cdn.example/f2" },
++  }))
++  t.after(mock.restore)
++
++  const client = new Pan115ShareApiClient({
++    share_code: "sc1",
++    receive_code: "rc1",
++  })
++  assert.equal(await client.getDownloadUrl("f2"), "https://cdn.example/f2")
++})
++
++test("limit_rate 换算：2 -> 500ms；未设 -> 0", () => {
++  const limited = new Pan115ShareApiClient({
++    share_code: "s",
++    receive_code: "r",
++    limit_rate: 2,
++  })
++  assert.equal((limited as any).rateLimitMs, 500)
++
++  const unlimited = new Pan115ShareApiClient({
++    share_code: "s",
++    receive_code: "r",
++  })
++  assert.equal((unlimited as any).rateLimitMs, 0)
++})
+diff --git a/src/backend/drivers/115_share/types.ts b/src/backend/drivers/115_share/types.ts
+index 7fedb01..a672831 100644
+--- a/src/backend/drivers/115_share/types.ts
++++ b/src/backend/drivers/115_share/types.ts
+@@ -3,6 +3,8 @@ export interface Pan115ShareAddition {
+   qrcode_token?: string
+   qrcode_source?: string
+   page_size?: number
++  /** 限速：1r/[limit_rate]s（A meta.go:13，默认 2；未配置时不等待） */
++  limit_rate?: number
+   share_code: string
+   receive_code: string
+   root_folder_id?: string
+@@ -11,12 +13,23 @@ export interface Pan115ShareAddition {
+ }
+ 
+ export interface Pan115ShareItem {
++  // A status：115driver shareFile 的短键（utils.go:63-76）
++  fid?: string
++  cid?: string | number
++  n?: string
++  sha?: string
++  s?: number | string
++  t?: number | string
++  fc?: number | string
++  pid?: string
++  u?: string
++  // W 历史长键：保留不删，避免旧夹具断
+   file_id?: string
+   category_id?: string
+   file_name?: string
+   file_size?: number | string
+   sha1?: string
+-  is_file?: number // 0 = folder, 1 = file
++  is_file?: number | string
+   user_utime?: number | string
+   thumb_url?: string
+ }
+@@ -34,8 +47,7 @@ export interface Pan115ShareDownResp {
+   state: boolean
+   msg?: string
+   data?: {
+-    url?: {
+-      url: string
+-    }
++    /** A 返回 data.url.url；W 兼容 data.url 字符串 */
++    url?: string | { url: string }
+   }
+ }
+diff --git a/src/backend/drivers/115_share/util.ts b/src/backend/drivers/115_share/util.ts
+index 3d2edd7..574f8c0 100644
+--- a/src/backend/drivers/115_share/util.ts
++++ b/src/backend/drivers/115_share/util.ts
+@@ -4,17 +4,129 @@ import {
+   Pan115ShareSnapResp,
+ } from "./types"
+ 
++const SHARE_USER_AGENT =
++  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++
+ export class Pan115ShareApiClient {
+   private addition: Pan115ShareAddition
++  /** 限速间隔（毫秒）；limit_rate <= 0 或未配置时为 0，不等待 */
++  private rateLimitMs: number
++  private lastRequestAt = 0
+ 
+   constructor(addition: Pan115ShareAddition) {
+     this.addition = addition
++    const rate = Number(addition.limit_rate)
++    this.rateLimitMs = rate > 0 ? 1000 / rate : 0
++  }
++
++  /** A utils.go:115-117：share 请求统一用 115cdn 分享页 Referer */
++  private shareReferer(): string {
++    return `https://115cdn.com/s/${this.addition.share_code}?password=${this.addition.receive_code}&`
++  }
++
++  private shareHeaders(): Record<string, string> {
++    const headers: Record<string, string> = {
++      "User-Agent": SHARE_USER_AGENT,
++      Referer: this.shareReferer(),
++    }
++    if (this.addition.cookie) {
++      headers["Cookie"] = this.addition.cookie
++    }
++    return headers
++  }
++
++  /** 每次请求前按 limit_rate 等待（A driver.go:30-33 的 limiter） */
++  private async waitLimit(): Promise<void> {
++    if (this.rateLimitMs <= 0) return
++    const wait = this.lastRequestAt + this.rateLimitMs - Date.now()
++    if (wait > 0) {
++      await new Promise((resolve) => setTimeout(resolve, wait))
++    }
++    this.lastRequestAt = Date.now()
+   }
+ 
+   async init(): Promise<void> {
+     if (!this.addition.share_code || !this.addition.receive_code) {
+       throw new Error("115 Share: share_code and receive_code are required")
+     }
++
++    // 扫码登录未接线：显式拒绝，且不发任何请求（A 此处会走 QRCodeLoginWithApp）。
++    if (this.addition.qrcode_token && !this.addition.cookie) {
++      throw new Error("115 Share: 扫码登录未接线，请改用 cookie")
++    }
++
++    // A utils.go:181：login 先 getShareSnapWithUA 验证分享存在。
++    await this.getShareSnap("0", 1)
++
++    if (this.addition.cookie) {
++      // A utils.go:194-203：cookie 建凭据后 LoginCheck。
++      await this.loginCheck()
++    }
++    // 无凭据：保留公开分享只读。A 在 Init 会报 "missing cookie or qrcode account"；
++    // 这里沿用 W 历史兼容口径，允许免登录访问公开分享，比 A 宽松。
++  }
++
++  /** A utils.go:203 / 115cookie util.ts:213-240：GET my.115.com status */
++  async loginCheck(): Promise<void> {
++    const u = new URL("https://my.115.com/?ct=guide&ac=status")
++    await this.waitLimit()
++    const res = await fetch(u.toString(), {
++      method: "GET",
++      headers: this.shareHeaders(),
++    })
++    if (!res.ok) {
++      throw new Error(`115 Share login check error: HTTP ${res.status}`)
++    }
++    const json = (await res.json()) as any
++    if (json?.state === true) return
++    throw new Error(
++      `115 Share login check failed: ${json?.msg || json?.error || "state is not true"}`,
++    )
++  }
++
++  /** A utils.go:115-145：share/snap，短键响应由 normalizeItem 归一化 */
++  async getShareSnap(
++    cid = "0",
++    limit = 1000,
++    offset = 0,
++  ): Promise<Pan115ShareSnapResp> {
++    const u = new URL("https://webapi.115.com/share/snap")
++    u.searchParams.set("share_code", this.addition.share_code)
++    u.searchParams.set("receive_code", this.addition.receive_code)
++    u.searchParams.set("cid", cid || "0")
++    u.searchParams.set("limit", String(limit))
++    u.searchParams.set("offset", String(offset))
++    u.searchParams.set("format", "json")
++
++    await this.waitLimit()
++    const res = await fetch(u.toString(), {
++      method: "GET",
++      headers: this.shareHeaders(),
++    })
++    if (!res.ok) {
++      throw new Error(`115 Share API error: HTTP ${res.status}`)
++    }
++
++    const json = (await res.json()) as Pan115ShareSnapResp
++    if (!json.state) {
++      throw new Error(`115 Share API error: ${json.msg || "failed"}`)
++    }
++    return json
++  }
++
++  /** 短键优先、长键兜底；is_dir 统一为 Number(fc) === 0（A utils.go:98） */
++  private normalizeItem(raw: Pan115ShareItem): Pan115ShareItem {
++    const fc = raw.fc ?? raw.is_file
++    return {
++      file_id: String(raw.fid ?? raw.file_id ?? ""),
++      category_id: String(raw.cid ?? raw.category_id ?? ""),
++      file_name: String(raw.n ?? raw.file_name ?? ""),
++      file_size: raw.s ?? raw.file_size,
++      sha1: raw.sha ?? raw.sha1,
++      is_file: Number(fc) === 0 ? 0 : 1,
++      user_utime: raw.t ?? raw.user_utime,
++      thumb_url: raw.u ?? raw.thumb_url,
++    }
+   }
+ 
+   async getFiles(cid = "0"): Promise<Pan115ShareItem[]> {
+@@ -24,34 +136,11 @@ export class Pan115ShareApiClient {
+     let total = 0
+ 
+     do {
+-      const u = new URL("https://webapi.115.com/share/snap")
+-      u.searchParams.set("share_code", this.addition.share_code)
+-      u.searchParams.set("receive_code", this.addition.receive_code)
+-      u.searchParams.set("cid", cid || "0")
+-      u.searchParams.set("limit", String(pageSize))
+-      u.searchParams.set("offset", String(offset))
+-
+-      const headers: Record<string, string> = {
+-        "User-Agent":
+-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+-        Referer: "https://115.com/",
+-      }
+-      if (this.addition.cookie) {
+-        headers["Cookie"] = this.addition.cookie
+-      }
+-
+-      const res = await fetch(u.toString(), { headers })
+-      if (!res.ok) {
+-        throw new Error(`115 Share API error: HTTP ${res.status}`)
+-      }
+-
+-      const json = (await res.json()) as Pan115ShareSnapResp
+-      if (!json.state) {
+-        throw new Error(`115 Share API error: ${json.msg || "failed"}`)
+-      }
+-
++      const json = await this.getShareSnap(cid, pageSize, offset)
+       const list = json.data?.list || []
+-      items.push(...list)
++      for (const raw of list) {
++        items.push(this.normalizeItem(raw))
++      }
+       total = json.data?.count || 0
+       offset += list.length
+ 
+@@ -61,27 +150,18 @@ export class Pan115ShareApiClient {
+     return items
+   }
+ 
++  /** A utils.go:150-168：GET + query（share_code/receive_code/file_id/dl=1） */
+   async getDownloadUrl(fileId: string): Promise<string> {
+     const u = new URL("https://proapi.115.com/app/share/downurl")
+-    const body = new URLSearchParams({
+-      share_code: this.addition.share_code,
+-      receive_code: this.addition.receive_code,
+-      file_id: fileId,
+-    })
+-
+-    const headers: Record<string, string> = {
+-      "User-Agent":
+-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+-      "Content-Type": "application/x-www-form-urlencoded",
+-    }
+-    if (this.addition.cookie) {
+-      headers["Cookie"] = this.addition.cookie
+-    }
++    u.searchParams.set("share_code", this.addition.share_code)
++    u.searchParams.set("receive_code", this.addition.receive_code)
++    u.searchParams.set("file_id", fileId)
++    u.searchParams.set("dl", "1")
+ 
++    await this.waitLimit()
+     const res = await fetch(u.toString(), {
+-      method: "POST",
+-      headers,
+-      body: body.toString(),
++      method: "GET",
++      headers: this.shareHeaders(),
+     })
+ 
+     if (!res.ok) {
+@@ -89,7 +169,8 @@ export class Pan115ShareApiClient {
+     }
+ 
+     const json = (await res.json()) as any
+-    const rawUrl = json.data?.url?.url || json.data?.url
++    const rawUrl =
++      typeof json.data?.url === "string" ? json.data.url : json.data?.url?.url
+     if (!rawUrl) {
+       throw new Error(json.msg || "Empty download URL received from 115 Share")
+     }
