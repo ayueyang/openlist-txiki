@@ -1,0 +1,97 @@
+diff --git a/src/backend/drivers/proton_drive/driver.ts b/src/backend/drivers/proton_drive/driver.ts
+index 1470114..3272f46 100644
+--- a/src/backend/drivers/proton_drive/driver.ts
++++ b/src/backend/drivers/proton_drive/driver.ts
+@@ -57,6 +57,10 @@ function parseProtonDate(timestamp: number): string {
+ 
+ export function normalizeProtonDriveAddition(a: any): ProtonDriveAddition {
+   const norm = { ...(a || {}) } as any
++  // P2-76：A 配置只有 username、O/W 配置用 email；email 优先（O 迁移配置
++  // 不被旧 username 覆盖），空值/空白按缺失处理。
++  const emailTrimmed = (norm.email || "").trim()
++  if (!emailTrimmed && norm.username) norm.email = String(norm.username)
+   norm.email = (norm.email || "").trim()
+   norm.password = (norm.password || "").trim()
+   norm.two_fa_code = (norm.two_fa_code || "").trim()
+@@ -89,7 +93,8 @@ export class ProtonDriveDriver implements StorageDriver {
+   }
+ 
+   async init(): Promise<void> {
+-    if (!this.addition.email) throw new Error("email is required")
++    if (!this.addition.email)
++      throw new Error("username/email is required (A: username, O: email)")
+     if (!this.addition.password) throw new Error("password is required")
+ 
+     await this.client.login()
+diff --git a/src/backend/drivers/proton_drive/normalize.test.ts b/src/backend/drivers/proton_drive/normalize.test.ts
+new file mode 100755
+index 0000000..6eda5f6
+--- /dev/null
++++ b/src/backend/drivers/proton_drive/normalize.test.ts
+@@ -0,0 +1,53 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { ProtonDriveDriver, normalizeProtonDriveAddition } from "./driver"
++
++test("p2-76 只有 username：回填 email 且保留原键", () => {
++  const n = normalizeProtonDriveAddition({
++    username: "u@example.com",
++    password: "p",
++  } as any)
++  assert.equal(n.email, "u@example.com")
++  assert.equal(n.username, "u@example.com")
++})
++
++test("p2-76 email 与 username 同时存在：email 优先", () => {
++  const n = normalizeProtonDriveAddition({
++    email: "e@example.com",
++    username: "u@example.com",
++  } as any)
++  assert.equal(n.email, "e@example.com")
++})
++
++test("p2-76 email 为空白：trim 后回退 username", () => {
++  const n = normalizeProtonDriveAddition({
++    email: "  ",
++    username: " u@example.com ",
++  } as any)
++  assert.equal(n.email, "u@example.com")
++})
++
++test("p2-76 两个字段都缺：init 报 username/email required", async () => {
++  const d = new ProtonDriveDriver({ password: "p" } as any)
++  await assert.rejects(() => d.init(), /username\/email is required/)
++})
++
++test("p2-76 A 字段与 W 扩展字段归一后不丢", () => {
++  const n = normalizeProtonDriveAddition({
++    username: "u@example.com",
++    password: " p ",
++    two_fa_code: " 123456 ",
++    root_folder_id: " rid ",
++    use_reusable_login: true,
++    chunk_size: "8",
++    reusable_credential: " cred ",
++  } as any)
++  assert.equal(n.email, "u@example.com")
++  assert.equal(n.password, "p")
++  assert.equal(n.two_fa_code, "123456")
++  assert.equal(n.root_folder_id, "rid")
++  assert.equal(n.use_reusable_login, true)
++  assert.equal(n.chunk_size, "8")
++  assert.equal(n.reusable_credential, "cred")
++})
+diff --git a/src/backend/drivers/proton_drive/types.ts b/src/backend/drivers/proton_drive/types.ts
+index c2fc808..b913272 100644
+--- a/src/backend/drivers/proton_drive/types.ts
++++ b/src/backend/drivers/proton_drive/types.ts
+@@ -2,6 +2,8 @@
+ 
+ export interface ProtonDriveAddition {
+   email: string
++  /** P2-76：A meta.go:27 的字段名；归一化时回填 email（email 优先），原键保留 */
++  username?: string
+   password: string
+   two_fa_code?: string
+   root_folder_id?: string

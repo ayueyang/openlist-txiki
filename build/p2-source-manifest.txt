@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 72
+patch_count 76
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -246,7 +246,7 @@ file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backen
 file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file 7f2dc917fecde9fbe0165be701cd277c1b3fe62160a96a6424a34f9bbf9672f3 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file 5339a30b91092efbdb4887b00bf6b85ca297b56b3d6f982bb3fd42f7459d1b37 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file d24a2dc841d324f1d12cb881bb9abbcb00282a7f31d352bc4bf3ea642bea6d7b src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
@@ -466,3 +466,17 @@ patch 70 d50731e5a4b7d2b7996c04f2ced55cea9b0d093210d6fc77e760c3aadc2d9679 work/p
 patch 71 dbc1a3e52b2880211a112e85a7b9ee7b442a9a41585c98536d956a60ac476d44 work/p2-71-115open-spool-unlink.patch
 # 第 72 条（2026-11-09，r61 候选）：115open 动态导入字面量化——4 处 const spec = "node:..."; await import(spec) 改为 await import("node:...")，让 esbuild 接管成空壳，产物动态 node: 集合归零；beginstream.test.ts 增 2 条 tjs 侧 mock 测试。
 patch 72 d18a64257bc5ef87d059a0db78a4ed8cd4de4b61a889c4055e9aa0b640a342ab work/p2-72-115open-literal-import.patch
+# 第 73 条（2026-11-09，r62 候选）：alias 写入门禁——A 语义 writable 默认 false、
+#   protect_same_name 默认 true；mkdir/rename/remove/move/copy/put 六个写方法先进门禁，
+#   pickWriteTarget 按候选存在性选目标；新增 AliasPermissionError，fs.ts 映射 403。
+patch 73 842e0a716e1ee365b12928209605ac070657bbc90d3351fc8b1650bf37d1e79f work/p2-73-alias-writable.patch
+# 第 74 条（2026-11-09，r62 候选）：onedrive 分片 PUT 响应判定——非 2xx 不再当成功，
+#   500..504 每片 2s/4s/8s 退避重试 3 次，其他状态立即失败；新增 chunk-retry.test.ts。
+patch 74 319d783d1df90334b4fdd993f220c001a8b9813734a121f78aaf1866fc9a74b1 work/p2-74-onedrive-retry.patch
+# 第 75 条（2026-11-09，r62 候选）：123_open 认证字段与直链签名——auth_mode/private_key/
+#   uid/valid_duration/use_direct_link/upload_thread 及 O PascalCase 旧键；sign123Url 移植
+#   A sign.go；use_direct_link=true 显式 fail-closed；新增 auth-sign.test.ts。
+patch 75 8f79471da9a6fc60fd4c8aefceef4b35516cbaaa680155b7e5ac0657ab67cf68 work/p2-75-123open-auth-sign.patch
+# 第 76 条（2026-11-09，r62 候选）：proton_drive 字段兼容——读 A 的 username 回填 email
+#   （email 优先），缺字段错误改为 username/email is required；新增 normalize.test.ts。
+patch 76 b0ae18c44b832743549e1fbed28b9b1dce2b37811cca704d7a444afe9d9952b2 work/p2-76-proton-field-compat.patch

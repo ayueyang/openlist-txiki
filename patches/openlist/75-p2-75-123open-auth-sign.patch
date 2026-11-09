@@ -1,0 +1,255 @@
+diff --git a/src/backend/drivers/123_open/auth-sign.test.ts b/src/backend/drivers/123_open/auth-sign.test.ts
+new file mode 100755
+index 0000000..5296f4d
+--- /dev/null
++++ b/src/backend/drivers/123_open/auth-sign.test.ts
+@@ -0,0 +1,76 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { Driver123Open, normalize123OpenAddition } from "./driver"
++import { sign123Url } from "./util"
++
++const FIXED = { nowMs: 1699998200000, randInt: 12345 }
++
++test("p2-75 固定向量：auth_key 值正确且原 query 保留", () => {
++  const out = sign123Url(
++    "https://x.example/a/b.txt?x=1",
++    "secret",
++    42,
++    30,
++    FIXED,
++  )
++  const u = new URL(out)
++  assert.equal(u.searchParams.get("x"), "1")
++  assert.deepEqual(u.searchParams.getAll("auth_key"), [
++    "1700000000-12345-42-a03bc497c0ccd898bb80b2ebf8b5dc95",
++  ])
++})
++
++test("p2-75 private_key 为空：原样返回不改 query", () => {
++  const url = "https://x.example/a/b.txt?x=1"
++  assert.equal(sign123Url(url, "", 42, 30, FIXED), url)
++})
++
++test("p2-75 uid=0 且 private_key 非空：init 抛 uid is required", async () => {
++  const d = new Driver123Open({ access_token: "t", private_key: "k" })
++  await assert.rejects(() => d.init(), /uid is required when private_key is set/)
++})
++
++test("p2-75 auth_mode=bogus：构造即抛 unknown auth_mode", () => {
++  assert.throws(
++    () => new Driver123Open({ auth_mode: "bogus" } as any),
++    /\[123Open\] unknown auth_mode: bogus/,
++  )
++})
++
++test("p2-75 auth_mode=client_credentials 缺凭据：沿用现有错误", async () => {
++  const d = new Driver123Open({ auth_mode: "client_credentials" })
++  await assert.rejects(
++    () => d.init(),
++    /\[123Open\] no valid authentication method/,
++  )
++})
++
++test("p2-75 use_direct_link=true：init 显式 fail-closed", async () => {
++  const d = new Driver123Open({ access_token: "t", use_direct_link: true })
++  await assert.rejects(() => d.init(), /use_direct_link=false/)
++})
++
++test("p2-75 O PascalCase 键归一为 snake_case 四字段", () => {
++  const n = normalize123OpenAddition({
++    DirectLink: true,
++    DirectLinkPrivateKey: "k",
++    DirectLinkValidDuration: 10,
++    UploadThread: 2,
++  } as any)
++  assert.equal(n.use_direct_link, true)
++  assert.equal(n.private_key, "k")
++  assert.equal(n.valid_duration, 10)
++  assert.equal(n.upload_thread, 2)
++  assert.equal(n.auth_mode, "token")
++})
++
++test("p2-75 显式 auth_mode 优先于凭据推断", () => {
++  const n = normalize123OpenAddition({
++    auth_mode: "client_credentials",
++    access_token: "t",
++    client_id: "id",
++    client_secret: "sec",
++  } as any)
++  assert.equal(n.auth_mode, "client_credentials")
++})
+diff --git a/src/backend/drivers/123_open/driver.ts b/src/backend/drivers/123_open/driver.ts
+index 66425d0..dc40dd7 100644
+--- a/src/backend/drivers/123_open/driver.ts
++++ b/src/backend/drivers/123_open/driver.ts
+@@ -4,7 +4,7 @@ import {
+   calcFileType,
+ } from "../../internal/driver/base"
+ import { Driver123OpenAddition, File123 } from "./types"
+-import { Client123Open } from "./util"
++import { Client123Open, sign123Url } from "./util"
+ 
+ const DEFAULT_ROOT = "0"
+ 
+@@ -15,15 +15,69 @@ function parseTime(s?: string): string {
+   return isNaN(t.getTime()) ? new Date().toISOString() : t.toISOString()
+ }
+ 
++/**
++ * P2-75：A meta.go:21-40 字段与 O 的 PascalCase 旧键归一。
++ * 显式 auth_mode 永远优先；缺省按现有凭据推断（W 老配置无 auth_mode，
++ * 缺省值不能让它们起不来）。未知取值直接报错（A client.go:42 同义）。
++ */
++export function normalize123OpenAddition(
++  a: any,
++): Driver123OpenAddition {
++  const norm: any = { ...(a || {}) }
++  const mode = norm.auth_mode
++  if (
++    mode !== undefined &&
++    mode !== "" &&
++    mode !== "token" &&
++    mode !== "client_credentials"
++  ) {
++    throw new Error(`[123Open] unknown auth_mode: ${mode}`)
++  }
++  if (!mode) {
++    if (norm.access_token || norm.refresh_token) norm.auth_mode = "token"
++    else if (norm.client_id && norm.client_secret)
++      norm.auth_mode = "client_credentials"
++    else norm.auth_mode = "token"
++  }
++  norm.private_key = norm.private_key || norm.DirectLinkPrivateKey || ""
++  norm.uid = Number(norm.uid ?? 0)
++  const duration = Number(
++    norm.valid_duration ?? norm.DirectLinkValidDuration ?? 30,
++  )
++  norm.valid_duration = Number.isFinite(duration) && duration > 0 ? duration : 30
++  norm.use_direct_link = norm.use_direct_link ?? norm.DirectLink ?? false
++  norm.upload_thread = Number(norm.upload_thread ?? norm.UploadThread ?? 3)
++  return norm as Driver123OpenAddition
++}
++
+ export class Driver123Open implements StorageDriver {
+   private client: Client123Open
+   private pathCache = new Map<string, string>()
++  /** P2-75：签名参数在构造时归一，运行期只读 */
++  private privateKey = ""
++  private uid = 0
++  private validDuration = 30
++  private useDirectLink = false
+ 
+   constructor(addition: Driver123OpenAddition) {
+-    this.client = new Client123Open(addition)
++    const norm = normalize123OpenAddition(addition)
++    this.privateKey = norm.private_key || ""
++    this.uid = Number(norm.uid ?? 0)
++    this.validDuration = Number(norm.valid_duration ?? 30)
++    this.useDirectLink = norm.use_direct_link === true
++    this.client = new Client123Open(norm)
+   }
+ 
+   async init(): Promise<void> {
++    // P2-75：直链服务端点不在 A 源码树内，显式 fail-closed，不做静默降级。
++    if (this.useDirectLink) {
++      throw new Error(
++        "[123Open] use_direct_link is not implemented in txiki; set use_direct_link=false",
++      )
++    }
++    if (this.privateKey && this.uid <= 0) {
++      throw new Error("[123Open] uid is required when private_key is set")
++    }
+     await this.client.init()
+   }
+ 
+@@ -58,7 +112,12 @@ export class Driver123Open implements StorageDriver {
+         const item = this.fileToItem(file)
+         if (!item.is_dir) {
+           try {
+-            item.raw_url = await this.client.getDownloadUrl(file.fileId)
++            item.raw_url = sign123Url(
++              await this.client.getDownloadUrl(file.fileId),
++              this.privateKey,
++              this.uid,
++              this.validDuration,
++            )
+           } catch (e: any) {
+             item.raw_url_error = e.message
+           }
+diff --git a/src/backend/drivers/123_open/types.ts b/src/backend/drivers/123_open/types.ts
+index 2004733..88108d3 100644
+--- a/src/backend/drivers/123_open/types.ts
++++ b/src/backend/drivers/123_open/types.ts
+@@ -9,6 +9,23 @@ export interface Driver123OpenAddition {
+   use_online_api?: boolean
+   api_url_address?: string
+   root_folder_id?: string
++  /** P2-75：A meta.go:21 认证模式；显式值优先，缺省按凭据推断 */
++  auth_mode?: "token" | "client_credentials"
++  /** A meta.go:31 直链签名私钥；空 = 不签名 */
++  private_key?: string
++  /** A meta.go:32 直链签名 uid；private_key 非空时必填 */
++  uid?: number
++  /** A meta.go:33 签名有效期（分钟），默认 30 */
++  valid_duration?: number
++  /** A meta.go:35 直链服务开关；txiki 未实现，true 时 init 显式拒绝 */
++  use_direct_link?: boolean
++  /** A meta.go:37 上传并发；W 无上传，仅保留字段用于配置回写 */
++  upload_thread?: number
++  /** O 旧键兼容（只读，写回统一用 snake_case） */
++  DirectLink?: boolean
++  DirectLinkPrivateKey?: string
++  DirectLinkValidDuration?: number
++  UploadThread?: number
+ }
+ 
+ export interface File123 {
+diff --git a/src/backend/drivers/123_open/util.ts b/src/backend/drivers/123_open/util.ts
+index 6e3393b..cd1a5ad 100644
+--- a/src/backend/drivers/123_open/util.ts
++++ b/src/backend/drivers/123_open/util.ts
+@@ -7,6 +7,7 @@ import {
+   DownloadInfoData123,
+   AccessTokenData123,
+ } from "./types"
++import { createHash } from "crypto"
+ 
+ const API = "https://open-api.123pan.com"
+ 
+@@ -186,3 +187,34 @@ export class Client123Open {
+     if (resp.code !== 0) throw new Error(`[123Open] ${resp.message}`)
+   }
+ }
++
++/**
++ * P2-75：A sign.go:13-30 的逐行移植（auth_key 直链签名）。
++ * 空私钥原样返回；ts = 当前秒 + 有效分钟数*60；rand 默认随机。
++ * path 用解码后的 pathname（对齐 Go url.Parse 的 Path），解码失败回退原值。
++ */
++export function sign123Url(
++  originUrl: string,
++  privateKey: string,
++  uid: number,
++  validDurationMinutes: number,
++  opts: { nowMs?: number; randInt?: number } = {},
++): string {
++  if (!privateKey) return originUrl
++  const nowMs = opts.nowMs ?? Date.now()
++  const ts = Math.floor(nowMs / 1000) + validDurationMinutes * 60
++  const randInt =
++    opts.randInt ?? Math.floor(Math.random() * 2147483647)
++  const parsed = new URL(originUrl)
++  let path = parsed.pathname
++  try {
++    path = decodeURIComponent(parsed.pathname)
++  } catch {
++    path = parsed.pathname
++  }
++  const md5hex = createHash("md5")
++    .update(`${path}-${ts}-${randInt}-${uid}-${privateKey}`)
++    .digest("hex")
++  parsed.searchParams.append("auth_key", `${ts}-${randInt}-${uid}-${md5hex}`)
++  return parsed.toString()
++}

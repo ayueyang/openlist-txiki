@@ -1,0 +1,444 @@
+diff --git a/src/backend/drivers/alias/driver.ts b/src/backend/drivers/alias/driver.ts
+index 1aa3506..dc4352f 100644
+--- a/src/backend/drivers/alias/driver.ts
++++ b/src/backend/drivers/alias/driver.ts
+@@ -5,18 +5,95 @@ import {
+ } from "../../internal/driver/base"
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { AliasAddition, AliasPathPair } from "./types"
++import { AliasPermissionError } from "../../pkg/errs"
+ 
+ export class AliasDriver implements StorageDriver {
+   private addition: AliasAddition
+   private pathPairs: AliasPathPair[] = []
+   private rootOrder: string[] = []
+   private pathMap: Map<string, string[]> = new Map()
++  /** A meta.go:16 默认 false */
++  private writable: boolean
++  /** A meta.go:13 默认 true */
++  private protectSameName: boolean
+ 
+   constructor(addition: AliasAddition) {
+     this.addition = addition
++    // 默认值落在构造器，不依赖 JSON 层（A meta.go 的 default 语义）
++    this.writable = addition.writable === true
++    this.protectSameName = addition.protect_same_name !== false
+     this.parsePaths()
+   }
+ 
++  /** P2-73：写方法第一行调用；writable=false 时不触达底层存储。 */
++  private assertWritable(op: string): void {
++    if (!this.writable) {
++      throw new AliasPermissionError(
++        `[Alias] writable=false: ${op} denied`,
++      )
++    }
++  }
++
++  /**
++   * 动态导入集中点。门禁在任何写方法里先于本方法执行，拒绝时零底层调用；
++   * 单测覆写本方法注入计数桩，生产路径仍是 internal/op/storage。
++   */
++  protected async storageModule(): Promise<any> {
++    return await import("../../internal/op/storage")
++  }
++
++  /** 单个候选的存在性探测：目录用 list、文件项用 get；失败按不存在继续。 */
++  protected async probeCandidate(
++    fullPath: string,
++    isDir: boolean,
++  ): Promise<boolean> {
++    const storage = await this.storageModule()
++    try {
++      if (isDir) {
++        await storage.listItems(fullPath)
++      } else {
++        const res = await storage.getItem(fullPath)
++        if (!res?.item) return false
++      }
++      return true
++    } catch {
++      return false
++    }
++  }
++
++  /**
++   * 写目标选择（P2-73）：protect_same_name=true 时要求恰好一个候选存在，
++   * 0 个报 not found、>=2 个报同名保护；false 时取第一个存在的候选，
++   * 都不存在同样报 not found（对齐 A util.go:146-160 的 getReqPath）。
++   */
++  protected async pickWriteTarget(
++    physicalPath: string,
++    isParent: boolean,
++    op: string,
++  ): Promise<string> {
++    const targets = this.getTargetsForPath(physicalPath)
++    let chosen: string | undefined
++    let hits = 0
++    for (const target of targets) {
++      if (await this.probeCandidate(target.targetFullPath, isParent)) {
++        hits++
++        if (chosen === undefined) chosen = target.targetFullPath
++        if (!this.protectSameName) break
++      }
++    }
++    if (this.protectSameName && hits >= 2) {
++      throw new AliasPermissionError(
++        `[Alias] protect_same_name: multiple targets for ${physicalPath}`,
++      )
++    }
++    if (chosen === undefined) {
++      throw new AliasPermissionError(
++        `[Alias] ${op}: no target found for ${physicalPath}`,
++      )
++    }
++    return chosen
++  }
++
+   private cleanPath(p: string): string {
+     const s = "/" + (p || "").split("/").filter(Boolean).join("/")
+     return s === "/" ? "/" : s
+@@ -211,12 +288,15 @@ export class AliasDriver implements StorageDriver {
+   }
+ 
+   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
+-    const targets = this.getTargetsForPath(physicalPath)
+-    if (targets.length === 0) {
+-      throw new Error(`[Alias] no target found for path ${physicalPath}`)
+-    }
+-    const { makeDirectory } = await import("../../internal/op/storage")
+-    await makeDirectory(targets[0].targetFullPath)
++    this.assertWritable("mkdir")
++    const name = this.cleanPath(physicalPath).split("/").filter(Boolean).pop() || ""
++    const targetParent = await this.pickWriteTarget(
++      this.parentPath(physicalPath),
++      true,
++      "mkdir",
++    )
++    const storage = await this.storageModule()
++    await storage.makeDirectory(this.cleanPath(`${targetParent}/${name}`))
+   }
+ 
+   async rename(
+@@ -224,12 +304,10 @@ export class AliasDriver implements StorageDriver {
+     physicalPath: string,
+     newName: string,
+   ): Promise<void> {
+-    const targets = this.getTargetsForPath(physicalPath)
+-    if (targets.length === 0) {
+-      throw new Error(`[Alias] no target found for path ${physicalPath}`)
+-    }
+-    const { renameItem } = await import("../../internal/op/storage")
+-    await renameItem(targets[0].targetFullPath, newName)
++    this.assertWritable("rename")
++    const target = await this.pickWriteTarget(physicalPath, false, "rename")
++    const storage = await this.storageModule()
++    await storage.renameItem(target, newName)
+   }
+ 
+   async remove(
+@@ -237,14 +315,11 @@ export class AliasDriver implements StorageDriver {
+     physicalPath: string,
+     names: string[],
+   ): Promise<void> {
+-    // physicalPath 是目标项自身的路径（op/storage.ts removeItems 逐项调用），
+-    // 而 removeItems 需要「父目录 + names」（内部会再拼 name）；直接把项路径
+-    // 当目录传入会得到 <item>/<name>，目标不存在导致删除静默失败。
+-    const dirPath = this.parentPath(physicalPath)
+-    const targets = this.getTargetsForPath(dirPath)
+-    if (targets.length === 0) return
+-    const { removeItems } = await import("../../internal/op/storage")
+-    await removeItems(targets[0].targetFullPath, names)
++    this.assertWritable("remove")
++    // physicalPath 是目标项自身的路径；先按项探测同名，再交给父目录批量删。
++    const target = await this.pickWriteTarget(physicalPath, false, "remove")
++    const storage = await this.storageModule()
++    await storage.removeItems(this.parentPath(target), names)
+   }
+ 
+   async move(
+@@ -254,20 +329,14 @@ export class AliasDriver implements StorageDriver {
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    // srcPhys/dstPhys 是源/目标项自身的路径（已含 name），moveItems 需要的
+-    // 是各自所在父目录（内部会再拼 name）；传项路径会得到 <item>/<name>，
+-    // 操作静默失败。
+-    const srcDirPath = this.parentPath(srcPhys)
+-    const dstDirPath = this.parentPath(dstPhys)
+-    const srcTargets = this.getTargetsForPath(srcDirPath)
+-    const dstTargets = this.getTargetsForPath(dstDirPath)
+-    if (srcTargets.length === 0 || dstTargets.length === 0) {
+-      throw new Error("[Alias] cannot resolve source or destination path")
+-    }
+-    const { moveItems } = await import("../../internal/op/storage")
+-    await moveItems(
+-      srcTargets[0].targetFullPath,
+-      dstTargets[0].targetFullPath,
++    this.assertWritable("move")
++    // srcPhys 是源项自身路径，dstDir 是目标父目录；分别按文件项/目录探测。
++    const srcTarget = await this.pickWriteTarget(srcPhys, false, "move")
++    const dstTarget = await this.pickWriteTarget(dstDir, true, "move")
++    const storage = await this.storageModule()
++    await storage.moveItems(
++      this.parentPath(srcTarget),
++      dstTarget,
+       names,
+     )
+   }
+@@ -279,18 +348,13 @@ export class AliasDriver implements StorageDriver {
+     srcPhys: string,
+     dstPhys: string,
+   ): Promise<void> {
+-    // 同 move：srcPhys/dstPhys 是项自身路径，copyItems 需要各自所在父目录。
+-    const srcDirPath = this.parentPath(srcPhys)
+-    const dstDirPath = this.parentPath(dstPhys)
+-    const srcTargets = this.getTargetsForPath(srcDirPath)
+-    const dstTargets = this.getTargetsForPath(dstDirPath)
+-    if (srcTargets.length === 0 || dstTargets.length === 0) {
+-      throw new Error("[Alias] cannot resolve source or destination path")
+-    }
+-    const { copyItems } = await import("../../internal/op/storage")
+-    await copyItems(
+-      srcTargets[0].targetFullPath,
+-      dstTargets[0].targetFullPath,
++    this.assertWritable("copy")
++    const srcTarget = await this.pickWriteTarget(srcPhys, false, "copy")
++    const dstTarget = await this.pickWriteTarget(dstDir, true, "copy")
++    const storage = await this.storageModule()
++    await storage.copyItems(
++      this.parentPath(srcTarget),
++      dstTarget,
+       names,
+     )
+   }
+@@ -300,11 +364,14 @@ export class AliasDriver implements StorageDriver {
+     physicalPath: string,
+     content: Buffer,
+   ): Promise<void> {
+-    const targets = this.getTargetsForPath(physicalPath)
+-    if (targets.length === 0) {
+-      throw new Error(`[Alias] no target found for upload path ${physicalPath}`)
+-    }
+-    const { putItem } = await import("../../internal/op/storage")
+-    await putItem(targets[0].targetFullPath, content)
++    this.assertWritable("put")
++    const name = this.cleanPath(physicalPath).split("/").filter(Boolean).pop() || ""
++    const targetParent = await this.pickWriteTarget(
++      this.parentPath(physicalPath),
++      true,
++      "put",
++    )
++    const storage = await this.storageModule()
++    await storage.putItem(this.cleanPath(`${targetParent}/${name}`), content)
+   }
+ }
+diff --git a/src/backend/drivers/alias/types.ts b/src/backend/drivers/alias/types.ts
+index 6e547db..4fef9a5 100644
+--- a/src/backend/drivers/alias/types.ts
++++ b/src/backend/drivers/alias/types.ts
+@@ -1,5 +1,9 @@
+ export interface AliasAddition {
+   paths: string
++  /** A 默认 false：未配置时只读，写方法一律拒绝（A driver.go 每个写方法开头判 !Writable） */
++  writable?: boolean
++  /** A 默认 true：同名文件/目录在多个 target 同时存在时，写操作拒绝（A util.go getReqPath 的 NotImplement 分支） */
++  protect_same_name?: boolean
+   read_conflict_policy?: "first" | "random" | "all" | string
+   write_conflict_policy?:
+     | "disabled"
+diff --git a/src/backend/drivers/alias/write-gate.test.ts b/src/backend/drivers/alias/write-gate.test.ts
+new file mode 100755
+index 0000000..e8048b2
+--- /dev/null
++++ b/src/backend/drivers/alias/write-gate.test.ts
+@@ -0,0 +1,147 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { AliasDriver } from "./driver"
++import { AliasPermissionError } from "../../pkg/errs"
++
++/**
++ * P2-73 单测桩：不触达 internal/op/storage。
++ * - probeCandidate 用 existing 集合模拟候选存在性；
++ * - storageModule 返回计数桩，断言被门禁拦下时零底层写调用。
++ */
++class StubAliasDriver extends AliasDriver {
++  calls: string[] = []
++  existing = new Set<string>()
++  probeAll = false
++
++  protected async probeCandidate(
++    fullPath: string,
++    _isDir: boolean,
++  ): Promise<boolean> {
++    this.calls.push(`probe:${fullPath}`)
++    return this.probeAll || this.existing.has(fullPath)
++  }
++
++  protected async storageModule(): Promise<any> {
++    const calls = this.calls
++    return {
++      listItems: async (p: string) => {
++        calls.push(`storage.listItems:${p}`)
++        return { content: [] }
++      },
++      getItem: async (p: string) => {
++        calls.push(`storage.getItem:${p}`)
++        return { item: { name: "x" } }
++      },
++      makeDirectory: async (p: string) => {
++        calls.push(`storage.makeDirectory:${p}`)
++      },
++      renameItem: async (p: string) => {
++        calls.push(`storage.renameItem:${p}`)
++      },
++      removeItems: async (p: string) => {
++        calls.push(`storage.removeItems:${p}`)
++      },
++      moveItems: async (s: string, d: string) => {
++        calls.push(`storage.moveItems:${s}->${d}`)
++      },
++      copyItems: async (s: string, d: string) => {
++        calls.push(`storage.copyItems:${s}->${d}`)
++      },
++      putItem: async (p: string) => {
++        calls.push(`storage.putItem:${p}`)
++      },
++    }
++  }
++
++  storageCalls(): string[] {
++    return this.calls.filter((c) => c.startsWith("storage."))
++  }
++}
++
++/** 六个写方法各一次 */
++function sixWrites(d: AliasDriver): Array<() => Promise<void>> {
++  return [
++    () => d.mkdir("/v/mk", "/mk"),
++    () => d.rename("/v/r", "/r", "r2"),
++    () => d.remove("/v/x", "/x", ["x"]),
++    () => d.move("/v/s", "/v/t", ["f"], "/s/f", "/t/f"),
++    () => d.copy("/v/s", "/v/t", ["f"], "/s/f", "/t/f"),
++    () => d.put("/v/p", "/p", Buffer.from("x")),
++  ]
++}
++
++function newDriver(extra: Record<string, unknown> = {}): StubAliasDriver {
++  return new StubAliasDriver({
++    paths: "/local1\n/local2",
++    ...extra,
++  } as any)
++}
++
++test("p2-73 默认 writable=false：六个写方法全部拒绝且零底层调用", async () => {
++  const d = newDriver()
++  const wants = [
++    /\[Alias\] writable=false: mkdir denied/,
++    /\[Alias\] writable=false: rename denied/,
++    /\[Alias\] writable=false: remove denied/,
++    /\[Alias\] writable=false: move denied/,
++    /\[Alias\] writable=false: copy denied/,
++    /\[Alias\] writable=false: put denied/,
++  ]
++  const writes = sixWrites(d)
++  for (let i = 0; i < writes.length; i++) {
++    await assert.rejects(writes[i], (e: any) => {
++      assert.ok(e instanceof AliasPermissionError, `第 ${i} 个方法错误类型`)
++      assert.match(e.message, wants[i])
++      return true
++    })
++  }
++  assert.deepEqual(d.storageCalls(), [])
++})
++
++test("p2-73 writable=true：六个写方法过门禁", async () => {
++  const d = new StubAliasDriver({ paths: "/local1", writable: true } as any)
++  d.probeAll = true
++  for (const w of sixWrites(d)) {
++    await w()
++  }
++  assert.ok(d.storageCalls().length >= 6)
++})
++
++test("p2-73 protect_same_name 默认 true：两候选同名时 rename/remove 拒绝，单个存在时返回该候选", async () => {
++  const both = newDriver({ writable: true })
++  both.probeAll = true
++  await assert.rejects(
++    () => both.rename("/v/r", "/r", "r2"),
++    /\[Alias\] protect_same_name: multiple targets for \/r/,
++  )
++  await assert.rejects(
++    () => both.remove("/v/x", "/x", ["x"]),
++    /\[Alias\] protect_same_name: multiple targets for \/x/,
++  )
++
++  const one = newDriver({ writable: true })
++  one.existing.add("/local1/r")
++  await one.rename("/v/r", "/r", "r2")
++  assert.deepEqual(one.storageCalls(), ["storage.renameItem:/local1/r"])
++})
++
++test("p2-73 protect_same_name=false：两候选同名时取第一个存在的候选", async () => {
++  const d = newDriver({ writable: true, protect_same_name: false })
++  d.probeAll = true
++  await d.rename("/v/r", "/r", "r2")
++  assert.deepEqual(d.storageCalls(), ["storage.renameItem:/local1/r"])
++})
++
++test("p2-73 零候选存在：报 not found 且不落任何写调用", async () => {
++  const d = newDriver({ writable: true })
++  await assert.rejects(
++    () => d.mkdir("/v/mk", "/mk"),
++    /\[Alias\] mkdir: no target found for \//,
++  )
++  await assert.rejects(
++    () => d.put("/v/p", "/p", Buffer.from("x")),
++    /\[Alias\] put: no target found for \//,
++  )
++  assert.deepEqual(d.storageCalls(), [])
++})
+diff --git a/src/backend/pkg/errs.ts b/src/backend/pkg/errs.ts
+index 9b48e71..a77b0dd 100644
+--- a/src/backend/pkg/errs.ts
++++ b/src/backend/pkg/errs.ts
+@@ -67,3 +67,14 @@ export function safeErrorMessage(
+   }
+   return s
+ }
++
++/**
++ * P2-73：alias 写入门禁拒绝。放在 pkg/errs 而不是驱动里，避免驱动反向依赖
++ * server 层；名字与 A 的 errs.PermissionDenied 同义，映射由调用方决定。
++ */
++export class AliasPermissionError extends Error {
++  constructor(message: string) {
++    super(message)
++    this.name = "AliasPermissionError"
++  }
++}
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 9c58bc4..93a3163 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -50,7 +50,7 @@ import {
+   isEncryptPath,
+   getSignExpiresIn,
+ } from "../pkg/sign"
+-import { safeErrorMessage } from "../pkg/errs"
++import { AliasPermissionError, safeErrorMessage } from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
+ import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+ import { search } from "../internal/op/search"
+@@ -959,6 +959,9 @@ function writeFailure(c: any, e: any): Response {
+       { code: 403, message: `file [${e.itemName}] exists`, data: null },
+       403,
+     )
++  // P2-73：alias 的 writable=false / 同名保护拒绝，回 403 而不是 500。
++  if (e instanceof AliasPermissionError)
++    return c.json({ code: 403, message: e.message, data: null }, 403)
+   // P1-18：路径被拒绝（越界 / 二次编码残留）必须回 403，不能兜成 500。
+   if (isPathRejected(e)) return pathRejectedResponse(c, e)
+   const message = safeErrorMessage(e)

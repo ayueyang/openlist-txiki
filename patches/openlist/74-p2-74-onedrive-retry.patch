@@ -1,0 +1,207 @@
+diff --git a/src/backend/drivers/onedrive/chunk-retry.test.ts b/src/backend/drivers/onedrive/chunk-retry.test.ts
+new file mode 100755
+index 0000000..b9599ad
+--- /dev/null
++++ b/src/backend/drivers/onedrive/chunk-retry.test.ts
+@@ -0,0 +1,109 @@
++import assert from "node:assert/strict"
++import { afterEach, test } from "node:test"
++
++import { Onedrive } from "./driver"
++
++const realFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++interface Call {
++  url: string
++  method: string
++  headers: Record<string, string>
++  body: any
++}
++
++/** 假服务端：createUploadSession 返回 uploadUrl，分片 PUT 按 statuses 序列回放。 */
++function installMock(statuses: number[]): Call[] {
++  const calls: Call[] = []
++  let chunkSeen = 0
++  globalThis.fetch = (async (input: any, init: any = {}) => {
++    const url = String(input)
++    calls.push({
++      url,
++      method: String(init.method || "GET"),
++      headers: (init.headers || {}) as Record<string, string>,
++      body: init.body,
++    })
++    if (url.includes("createUploadSession")) {
++      return new Response(
++        JSON.stringify({ uploadUrl: "https://upload.example/upload" }),
++        { status: 200, headers: { "Content-Type": "application/json" } },
++      )
++    }
++    const status = statuses[chunkSeen] ?? 201
++    chunkSeen++
++    return new Response(status >= 400 ? "err" : null, { status })
++  }) as any
++  return calls
++}
++
++function newDriver(chunkSize = 5): { d: Onedrive; sleeps: number[] } {
++  const d = new Onedrive({ chunk_size: chunkSize } as any)
++  const sleeps: number[] = []
++  d.sleepFn = async (ms: number) => {
++    sleeps.push(ms)
++  }
++  return { d, sleeps }
++}
++
++function chunkCalls(calls: Call[]): Call[] {
++  return calls.filter((c) => c.url === "https://upload.example/upload")
++}
++
++const BIG = Buffer.alloc(4 * 1024 * 1024 + 1, 1)
++
++test("p2-74 分片首个 503 后 200：重试 1 次并成功，sleep=[2000]", async () => {
++  const calls = installMock([503, 201])
++  const { d, sleeps } = newDriver()
++  await d.put("/v/f", "/f", BIG)
++  assert.equal(chunkCalls(calls).length, 2)
++  assert.deepEqual(sleeps, [2000])
++})
++
++test("p2-74 连续 4 次 503：抛错、4 次调用、sleep=[2000,4000,8000]", async () => {
++  const calls = installMock([503, 503, 503, 503])
++  const { d, sleeps } = newDriver()
++  await assert.rejects(
++    () => d.put("/v/f", "/f", BIG),
++    /\[OneDrive\] chunk upload failed: HTTP 503 .*bytes 0-4194304\/4194305/,
++  )
++  assert.equal(chunkCalls(calls).length, 4)
++  assert.deepEqual(sleeps, [2000, 4000, 8000])
++})
++
++test("p2-74 400 立即失败：只调用 1 次、不 sleep", async () => {
++  const calls = installMock([400])
++  const { d, sleeps } = newDriver()
++  await assert.rejects(
++    () => d.put("/v/f", "/f", BIG),
++    /\[OneDrive\] chunk upload failed: HTTP 400/,
++  )
++  assert.equal(chunkCalls(calls).length, 1)
++  assert.deepEqual(sleeps, [])
++})
++
++test("p2-74 多分片：第 2 片 500 后成功，重试计数按片重置", async () => {
++  const calls = installMock([201, 500, 201, 201, 201])
++  const { d, sleeps } = newDriver(1)
++  await d.put("/v/f", "/f", BIG)
++  assert.equal(chunkCalls(calls).length, 6)
++  assert.deepEqual(sleeps, [2000])
++})
++
++test("p2-74 成功分片不重复写：Content-Range 顺序推进无重叠", async () => {
++  const calls = installMock([])
++  const { d } = newDriver(1)
++  await d.put("/v/f", "/f", BIG)
++  const ranges = chunkCalls(calls).map((c) => c.headers["Content-Range"])
++  assert.deepEqual(ranges, [
++    "bytes 0-1048575/4194305",
++    "bytes 1048576-2097151/4194305",
++    "bytes 2097152-3145727/4194305",
++    "bytes 3145728-4194303/4194305",
++    "bytes 4194304-4194304/4194305",
++  ])
++})
+diff --git a/src/backend/drivers/onedrive/driver.ts b/src/backend/drivers/onedrive/driver.ts
+index 62898ba..fbef552 100644
+--- a/src/backend/drivers/onedrive/driver.ts
++++ b/src/backend/drivers/onedrive/driver.ts
+@@ -5,6 +5,11 @@ import { fileToObj } from "./types"
+ 
+ import { refreshToken, requestApi, getFiles, getFile, getDrive } from "./util"
+ 
++/** P2-74：默认定时器；单测注入自己的 sleepFn 记录退避序列。 */
++export function defaultSleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms))
++}
++
+ export class Onedrive implements StorageDriver {
+   // Properties mapped from Addition
+   root_folder_path: string = "/"
+@@ -26,6 +31,8 @@ export class Onedrive implements StorageDriver {
+ 
+   accessToken: string = ""
+   onTokenUpdate?: (token: string) => void | Promise<void>
++  /** P2-74：分片退避定时器，单测可替换；生产为 defaultSleep。 */
++  sleepFn: (ms: number) => Promise<void> = defaultSleep
+ 
+   constructor(
+     addition?: Partial<Addition>,
+@@ -282,6 +289,50 @@ export class Onedrive implements StorageDriver {
+     await requestApi(this, url, "POST", data)
+   }
+ 
++  /**
++   * P2-74：单个分片 PUT 的响应判定与 5xx 退避（A util.go:204-258）。
++   * 只有 2xx 才返回；500..504 每片最多重试 3 次（2s/4s/8s）；
++   * 其他非 2xx 立即失败——失败分片绝不能被当成成功跳过。
++   */
++  private async putChunkWithRetry(
++    uploadUrl: string,
++    chunk: Buffer,
++    start: number,
++    total: number,
++    sleepFn: (ms: number) => Promise<void> = this.sleepFn,
++  ): Promise<void> {
++    const byteSize = chunk.length
++    const contentRange = `bytes ${start}-${start + byteSize - 1}/${total}`
++    let retryCount = 0
++    for (;;) {
++      const res = await fetch(uploadUrl, {
++        method: "PUT",
++        headers: {
++          "Content-Length": String(byteSize),
++          "Content-Range": contentRange,
++        },
++        body: chunk as any,
++      })
++      if (res.ok) {
++        // 成功分片体不需要内容；显式取消，避免占用连接池。
++        try {
++          await res.body?.cancel()
++        } catch {}
++        return
++      }
++      const status = res.status
++      const body = (await res.text().catch(() => "")).slice(0, 300)
++      if (status >= 500 && status <= 504 && retryCount < 3) {
++        retryCount++
++        await sleepFn(1000 * (1 << retryCount))
++        continue
++      }
++      throw new Error(
++        `[OneDrive] chunk upload failed: HTTP ${status} ${body} (bytes ${start}-${start + byteSize - 1}/${total})`,
++      )
++    }
++  }
++
+   async put(
+     virtualPath: string,
+     physicalPath: string,
+@@ -309,14 +360,7 @@ export class Onedrive implements StorageDriver {
+         const byteSize = Math.min(left, DEFAULT)
+         const chunk = content.slice(finish, finish + byteSize)
+ 
+-        await fetch(uploadUrl, {
+-          method: "PUT",
+-          headers: {
+-            "Content-Length": String(byteSize),
+-            "Content-Range": `bytes ${finish}-${finish + byteSize - 1}/${size}`,
+-          },
+-          body: chunk,
+-        })
++        await this.putChunkWithRetry(uploadUrl, chunk, finish, size)
+         finish += byteSize
+       }
+     }
