@@ -276,7 +276,7 @@ function verifySourceManifest() {
   if (!entries.files.length) problems.push("清单缺少 file 条目")
   if (entries.patchCount !== entries.patches.length) problems.push("patch_count " + entries.patchCount + " 与实际 patch 条目 " + entries.patches.length + " 不符")
   if (entries.fileCount !== entries.files.length) problems.push("file_count " + entries.fileCount + " 与实际 file 条目 " + entries.files.length + " 不符")
-  if (entries.patches.length !== 76) problems.push("补丁栈应为 76 个，实际 " + entries.patches.length + " 个")
+  if (entries.patches.length !== 77) problems.push("补丁栈应为 77 个，实际 " + entries.patches.length + " 个")
   entries.patches.forEach((p, idx) => {
     const want = String(idx + 1).padStart(2, "0")
     if (p.seq !== want) problems.push("补丁顺序断档：第 " + (idx + 1) + " 条序号 " + p.seq + "，期望 " + want)
@@ -406,7 +406,7 @@ function verifySourceManifest() {
       entries.commit.slice(0, 8) +
       "，补丁 " +
       entries.patches.length +
-      "/76（01..76 顺序与 sha 一致），指纹 " +
+      "/77（01..77 顺序与 sha 一致），指纹 " +
       info.fingerprint_entries +
       " 条（file " +
       info.fingerprint_files +

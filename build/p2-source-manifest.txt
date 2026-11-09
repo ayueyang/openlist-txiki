@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 76
+patch_count 77
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -480,3 +480,10 @@ patch 75 8f79471da9a6fc60fd4c8aefceef4b35516cbaaa680155b7e5ac0657ab67cf68 work/p
 # 第 76 条（2026-11-09，r62 候选）：proton_drive 字段兼容——读 A 的 username 回填 email
 #   （email 优先），缺字段错误改为 username/email is required；新增 normalize.test.ts。
 patch 76 b0ae18c44b832743549e1fbed28b9b1dce2b37811cca704d7a444afe9d9952b2 work/p2-76-proton-field-compat.patch
+# 第 77 条（2026-11-09，r63 候选，r62 G13 缺陷 A 退修）：alias 候选存在性探测改为
+#   getItem 的 stat 语义（A getReqPath 用 fs.Get）。p2-73 目录分支用 listItems 判存在，
+#   而 Local 把缺失目录的 readdir 失败吞成空列表（local.ts:39-45），缺失被误判为存在，
+#   多 target 可写 alias 的 PUT/MKDIR 恒 403 multiple targets。保持 0 候选 not found、
+#   1 候选返回该候选、>=2 候选 multiple targets 三条语义；write-gate.test.ts 增 Local
+#   同形桩与 0/1/2 候选、files 分支矩阵。不改 StorageDriver 接口、不实施缺陷 B。
+patch 77 0ed9b7a84182a8a137ce73505f03c4cbd029bc60796d431b15ec0255a438ab1f work/p2-77-g13-probe-exists.patch

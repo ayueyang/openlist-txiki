@@ -1,0 +1,175 @@
+diff --git a/src/backend/drivers/alias/driver.ts b/src/backend/drivers/alias/driver.ts
+index dc4352f..9faf27d 100755
+--- a/src/backend/drivers/alias/driver.ts
++++ b/src/backend/drivers/alias/driver.ts
+@@ -42,19 +42,21 @@ export class AliasDriver implements StorageDriver {
+     return await import("../../internal/op/storage")
+   }
+ 
+-  /** 单个候选的存在性探测：目录用 list、文件项用 get；失败按不存在继续。 */
++  /**
++   * 单个候选的存在性探测：一律用 getItem 的 stat 语义（A getReqPath 用 fs.Get）。
++   * 目录不能用 listItems 判存在：Local 等驱动把缺失目录的 readdir 失败吞成
++   * 空列表（r62 G13 缺陷 A），空列表无法区分「缺失」与「存在但为空」。
++   */
+   protected async probeCandidate(
+     fullPath: string,
+     isDir: boolean,
+   ): Promise<boolean> {
+     const storage = await this.storageModule()
+     try {
+-      if (isDir) {
+-        await storage.listItems(fullPath)
+-      } else {
+-        const res = await storage.getItem(fullPath)
+-        if (!res?.item) return false
+-      }
++      const res = await storage.getItem(fullPath)
++      if (!res?.item) return false
++      // 目录候选要求该项确实是目录；is_dir 缺省时不拦，兼容各驱动的省略。
++      if (isDir && res.item.is_dir === false) return false
+       return true
+     } catch {
+       return false
+diff --git a/src/backend/drivers/alias/write-gate.test.ts b/src/backend/drivers/alias/write-gate.test.ts
+index e8048b2..fa1c201 100755
+--- a/src/backend/drivers/alias/write-gate.test.ts
++++ b/src/backend/drivers/alias/write-gate.test.ts
+@@ -59,6 +59,71 @@ class StubAliasDriver extends AliasDriver {
+   }
+ }
+ 
++/**
++ * r63（r62 G13 缺陷 A）真机同形桩：与 LocalDriver 一致——目录不存在时
++ * readdir 失败被吞成空列表（reference local.ts:39-45），只有 getItem（stat）
++ * 会抛 ObjectNotFound。本桩不覆写 probeCandidate，直接验证探测实现。
++ */
++class LocalLikeAliasDriver extends AliasDriver {
++  calls: string[] = []
++  dirs = new Set<string>()
++  files = new Set<string>()
++
++  protected async storageModule(): Promise<any> {
++    const calls = this.calls
++    const dirs = this.dirs
++    const files = this.files
++    return {
++      listItems: async (p: string) => {
++        calls.push(`storage.listItems:${p}`)
++        return { content: [] }
++      },
++      getItem: async (p: string) => {
++        calls.push(`storage.getItem:${p}`)
++        if (files.has(p))
++          return { item: { name: p.split("/").pop(), is_dir: false, size: 1 } }
++        if (dirs.has(p))
++          return { item: { name: p.split("/").pop(), is_dir: true, size: 0 } }
++        throw new Error(`ObjectNotFound: ${p}`)
++      },
++      makeDirectory: async (p: string) => {
++        calls.push(`storage.makeDirectory:${p}`)
++      },
++      putItem: async (p: string) => {
++        calls.push(`storage.putItem:${p}`)
++      },
++      renameItem: async (p: string) => {
++        calls.push(`storage.renameItem:${p}`)
++      },
++      removeItems: async (p: string) => {
++        calls.push(`storage.removeItems:${p}`)
++      },
++      moveItems: async (s: string, d: string) => {
++        calls.push(`storage.moveItems:${s}->${d}`)
++      },
++      copyItems: async (s: string, d: string) => {
++        calls.push(`storage.copyItems:${s}->${d}`)
++      },
++    }
++  }
++
++  /** 写调用（去掉探测） */
++  writes(): string[] {
++    return this.calls.filter(
++      (c) =>
++        !c.startsWith("storage.getItem:") && !c.startsWith("storage.listItems:"),
++    )
++  }
++}
++
++function newLocalLike(extra: Record<string, unknown> = {}): LocalLikeAliasDriver {
++  return new LocalLikeAliasDriver({
++    paths: "/local1\n/local2",
++    writable: true,
++    ...extra,
++  } as any)
++}
++
+ /** 六个写方法各一次 */
+ function sixWrites(d: AliasDriver): Array<() => Promise<void>> {
+   return [
+@@ -145,3 +210,65 @@ test("p2-73 零候选存在：报 not found 且不落任何写调用", async ()
+   )
+   assert.deepEqual(d.storageCalls(), [])
+ })
++
++test("r63 缺陷 A 目录分支：单候选存在时 PUT 命中该候选（Local 缺失目录 list 回空）", async () => {
++  const d = newLocalLike()
++  d.dirs.add("/local1/sub")
++  await d.put("/v/sub/b2.txt", "/sub/b2.txt", Buffer.from("x"))
++  assert.deepEqual(d.writes(), ["storage.putItem:/local1/sub/b2.txt"])
++})
++
++test("r63 缺陷 A 目录分支：单候选存在时 MKDIR 命中该候选", async () => {
++  const d = newLocalLike()
++  d.dirs.add("/local1/sub")
++  await d.mkdir("/v/sub/d2", "/sub/d2")
++  assert.deepEqual(d.writes(), ["storage.makeDirectory:/local1/sub/d2"])
++})
++
++test("r63 缺陷 A 目录分支：0 候选 not found、2 候选仍 multiple targets", async () => {
++  const zero = newLocalLike()
++  await assert.rejects(
++    () => zero.put("/v/sub/b2.txt", "/sub/b2.txt", Buffer.from("x")),
++    /\[Alias\] put: no target found for \/sub/,
++  )
++  assert.deepEqual(zero.writes(), [])
++
++  const both = newLocalLike()
++  both.dirs.add("/local1/sub")
++  both.dirs.add("/local2/sub")
++  await assert.rejects(
++    () => both.put("/v/sub/b2.txt", "/sub/b2.txt", Buffer.from("x")),
++    /\[Alias\] protect_same_name: multiple targets for \/sub/,
++  )
++  assert.deepEqual(both.writes(), [])
++})
++
++test("r63 文件项矩阵：0 候选 not found、1 候选命中、2 候选 multiple targets", async () => {
++  const zero = newLocalLike()
++  await assert.rejects(
++    () => zero.rename("/v/r", "/r", "r2"),
++    /\[Alias\] rename: no target found for \/r/,
++  )
++  assert.deepEqual(zero.writes(), [])
++
++  const one = newLocalLike()
++  one.files.add("/local2/r")
++  await one.rename("/v/r", "/r", "r2")
++  assert.deepEqual(one.writes(), ["storage.renameItem:/local2/r"])
++
++  const both = newLocalLike()
++  both.files.add("/local1/r")
++  both.files.add("/local2/r")
++  await assert.rejects(
++    () => both.rename("/v/r", "/r", "r2"),
++    /\[Alias\] protect_same_name: multiple targets for \/r/,
++  )
++  assert.deepEqual(both.writes(), [])
++})
++
++test("r63 目录矩阵 protect_same_name=false：两候选只一个存在时取该候选", async () => {
++  const d = newLocalLike({ protect_same_name: false })
++  d.dirs.add("/local2/sub")
++  await d.put("/v/sub/b2.txt", "/sub/b2.txt", Buffer.from("x"))
++  assert.deepEqual(d.writes(), ["storage.putItem:/local2/sub/b2.txt"])
++})

@@ -2,10 +2,25 @@
 
 把 [OpenList-Worker](https://github.com/OpenListTeam/OpenList-Worker)（TypeScript + Hono，AGPL-3.0）移植到 [txiki.js](https://github.com/saghul/txiki.js) 运行时，产出：
 
-- **OpenWrt apk**（aarch64，自带私有 tjs，不依赖系统 txiki）
+- **OpenWrt apk**（aarch64，自带私有 tjs，不依赖系统 txiki；另有共享 tjs 版本）
 - **独立可执行运行时 + 应用包**：Linux（aarch64 / x86_64）与 Windows（x86_64），下载后直接 `tjs run openlist-txiki.js` 就能起服务
 
 不是 OpenList Go 版的重写。上游的存储驱动、WebDAV、分享、任务逻辑都保留，只把运行时从 Workers 换成 txiki.js。
+
+## 本版（0.1.0-r63）
+
+- 补丁栈 77 条。第 77 条修 r62 的 G13 设备侧缺陷 A：alias 候选探测从 `listItems` 改为 `getItem` 的 stat 语义。此前 Local 把缺失目录的 readdir 失败吞成空列表，空列表被当成存在，多 target 可写 alias 的 PUT/MKDIR 恒判 `multiple targets`；本版按候选实际存在性选择，DAV 写路径同步恢复。
+- 静态门 G1-G9 / G12 / G13-G16 全绿；tsc 23 条与 r62 基线相同；G12 四包扫描全空。
+- G13 设备复验 38/38：隔离实例、全新数据目录，PUT / MKDIR / DAV PUT 三条写路径全部恢复（r62 分别为 403 / 403 / 500）；双候选同名保护仍 403 且零落盘。
+- 设备实测（Nokia XG-040G-MF）：r62 到 r63 升级用时 186 s；reboot 后 5244 首 200 60,586 ms、5344 58,829 ms；空闲 5 分钟 VmRSS 21,248 kB；64 MiB 单流中位 27.73 MiB/s；装机 du 60,468 kB。
+
+### 本版已知限制
+
+- 缺陷 B（alias `get()` 返回占位 item，导致 rename/move/copy 403）、缺陷 C（alias 挂载下载 403，相对 `raw_url` 被 SSRF 断言拦）、缺陷 D（DAV 写拒绝回 500 而非 403）不在本版，下一版修复。
+- G15 KNOWN：tjs 运行期 crypto 为空壳，123_open 直链签名落 `raw_url_error`；不影响列表。
+- 设备侧 tjs 实为 26.9.0-r3（发布包带 r4；`min_version 26.9.0` 通过；r3 与 r4 的差异未验证）。
+- apk 未签名。
+- 默认只监听 `127.0.0.1:5345` 等限制沿用前版，见下文。
 
 ## 现在能做什么
 
@@ -17,7 +32,7 @@
 - 上传流式落盘：8MiB / 16MiB 单次请求的 VmHWM 增量分别 864kB / 892kB
 - 复制任务（SQLite 持久化、进度、取消，重启后无僵尸任务）
 - 整机重启后数据与登录都还在
-- 装机 68.3MB（含 452 个前端静态文件；Go 版约 51MB）
+- 装机 du 60,468 kB（含完整前端 452 个静态文件；Go 版约 51MB）
 
 ## 网盘适配状态
 
@@ -88,7 +103,7 @@ tjs run openlist-txiki.js
 
 ## 从源码构建
 
-见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、76 个应用补丁、tjs 运行时补丁全集（apply 顺序见 patches/txiki/TXIKI-PATCHES.md，其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
+见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、77 个应用补丁、tjs 运行时补丁全集（apply 顺序见 patches/txiki/TXIKI-PATCHES.md，其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
 
 ## 许可证
 
