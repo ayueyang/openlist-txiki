@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 69
+patch_count 71
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file 075dddf4a1b33cca186686166995323018d1253efca49ca55f45b505c7eb4ded src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file db5bb81b75f9bdefb17b01725730e25e5a7860505b420f965a6d2cfc39819466 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -246,12 +246,12 @@ file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backen
 file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file 50910ce6c99a2b6e80b10e0c361409e132fa379ba61a7f976b265097cae28100 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file 7f2dc917fecde9fbe0165be701cd277c1b3fe62160a96a6424a34f9bbf9672f3 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
 file d24a2dc841d324f1d12cb881bb9abbcb00282a7f31d352bc4bf3ea642bea6d7b src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
-file 7a6387508311cb9b5bb8fae2855a950e8d7bf28ff3f94ef4216afb61771e6f85 src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
+file 2ec103b2ac1bb36af306a77fc643f34c16dbd85e894221428e69a6808356a3cd src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
 file e2a19d883ba697a079609d98c6f32e1f3f5af7772621bb76053735054b642c90 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
@@ -267,7 +267,7 @@ file c15a27dac45238029a945fe2e692915dffb62887a291d49383fa16a76e32512d src/backen
 file bf3b415cb81fa4ad79d4174aaef7faf9d866879c5ee3761f73d817f7f9855f2c src/backend/txiki/static-site.ts src=repo strip_header=yes eol=lf
 file 8c597387887f53129e45c45f112ac187d4fa06787f89873e339e20b943b64909 src/backend/txiki/upload-sweep.ts src=repo strip_header=yes eol=lf
 file f04d15cc749fe3c16169995a034c9f7e1f050ed93f4f1b9c82619721d83dc68c src/backend/pkg/upload-stream.ts src=patch strip_header=no eol=lf
-file b9b253508a840465387e9a9e5461515aaa25864f39d072d806c1ff03fadd0a89 src/backend/server/s3.ts src=patch strip_header=no eol=crlf
+file aa6e50ae9166aef39fe5292a4445d0efc91e8a5d5bd5d84a8ec1f630222985ad src/backend/server/s3.ts src=patch strip_header=no eol=crlf
 file 6c40344aa5ef40e846d8df984311d78e87dfe6efda1f6eb81ac262ced98a3167 src/backend/pkg/canonical-path.ts src=patch strip_header=no eol=crlf
 file 96dc6de75a2f370310a13cdcfb83744be89dd519c0fcf7482311a21df87fadd7 src/backend/server/canonical-path.test.ts src=patch strip_header=no eol=crlf
 # 第 21 条（2026-10-28）：只改适配层 src/backend/txiki/config.ts（Windows 绝对路径
@@ -460,3 +460,7 @@ patch 67 81c90a24e8d0fbf6813ca80512e445637d33d52ed18a2525ded8ae05623e2aa2 work/p
 patch 68 d7d55ef94a4a27913d900028792aac3e7a500a6297865d1806b47c9ed8d1c79a work/p2-68-gdrive-put-update.patch
 # 第 69 条（2026-11-09，r58 候选）：115_share 登录链、短键映射与限速；新增 login.test.ts。
 patch 69 a6b0602273afea8f5fc57831c3230e42b23a456ec89d22209da3fec2df37f9c9 work/p2-69-115share-login.patch
+# 第 70 条（2026-11-09，r59 候选）：115open phase 2——beginStream 落盘暂存 + OSS multipart 上传，fs/s3/webdav 三条写路径接线；新增 beginstream.test.ts。
+patch 70 d50731e5a4b7d2b7996c04f2ced55cea9b0d093210d6fc77e760c3aadc2d9679 work/p2-70-115open-beginstream.patch
+# 第 71 条（2026-11-09，r60 候选）：115open spool 清理——unlinkSpool 按 t.unlink -> t.remove -> node:fs/promises 能力顺序回退；新增 spool-cleanup.test.ts（tjs mock 无 unlink）。
+patch 71 dbc1a3e52b2880211a112e85a7b9ee7b442a9a41585c98536d956a60ac476d44 work/p2-71-115open-spool-unlink.patch

@@ -1,0 +1,1041 @@
+diff --git a/src/backend/drivers/115open/beginstream.test.ts b/src/backend/drivers/115open/beginstream.test.ts
+new file mode 100644
+index 0000000..495acc9
+--- /dev/null
++++ b/src/backend/drivers/115open/beginstream.test.ts
+@@ -0,0 +1,362 @@
++// 115open phase 2：beginStream 落盘暂存 + OSS multipart 单元测试
++// 全部 mock globalThis.fetch：不连网、不登录、不需要真实 115 账号与设备。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { Pan115Driver, calPartSize } from "./driver"
++
++const MB = 1024 * 1024
++const GB = 1024 * MB
++const TB = 1024 * GB
++
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++interface FetchCall {
++  url: string
++  method: string
++  headers: Record<string, string>
++  body: any
++}
++
++let calls: FetchCall[] = []
++let initResponses: any[] = []
++let partFailAt = 0
++let spoolDir = ""
++let statFsQueue: Array<{ bsize: number; bavail: number }> = []
++let defaultStatFs = { bsize: 4096, bavail: 1024 * 1024 } // 4GiB 可用
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function ossResponse(
++  status: number,
++  text: string,
++  headers: Record<string, string> = {},
++): any {
++  const lower: Record<string, string> = {}
++  for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    headers: { get: (k: string) => lower[String(k).toLowerCase()] ?? null },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++beforeEach(async () => {
++  calls = []
++  initResponses = []
++  partFailAt = 0
++  statFsQueue = []
++  defaultStatFs = { bsize: 4096, bavail: 1024 * 1024 }
++  spoolDir = await mkdtemp(join(tmpdir(), "115open-p2-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => (statFsQueue.length ? statFsQueue.shift()! : defaultStatFs),
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    const method = String(init?.method || "GET").toUpperCase()
++    calls.push({ url, method, headers: init?.headers || {}, body: init?.body })
++    if (url.includes("/open/folder/get_info")) {
++      return jsonResponse({
++        state: true,
++        code: 0,
++        data: { file_id: "111", file_name: "dir" },
++      })
++    }
++    if (url.includes("/open/upload/init")) {
++      const next = initResponses.shift()
++      if (!next) throw new Error("unexpected uploadInit call")
++      return jsonResponse({ state: true, code: 0, data: next })
++    }
++    if (url.includes("/open/upload/get_token")) {
++      return jsonResponse({
++        state: true,
++        code: 0,
++        data: {
++          endpoint: "https://oss.example.com",
++          AccessKeyId: "AK",
++          AccessKeySecret: "SK",
++          SecurityToken: "ST",
++        },
++      })
++    }
++    if (url.includes("oss.example.com")) {
++      if (method === "POST" && url.endsWith("?uploads")) {
++        return ossResponse(
++          200,
++          "<InitiateMultipartUploadResult><UploadId>UP1</UploadId></InitiateMultipartUploadResult>",
++        )
++      }
++      if (method === "PUT") {
++        const pn = Number(new URL(url).searchParams.get("partNumber"))
++        if (partFailAt && pn === partFailAt) return ossResponse(500, "boom")
++        return ossResponse(200, "", { etag: `"etag-${pn}"` })
++      }
++      if (method === "POST" && url.includes("uploadId=")) {
++        return ossResponse(200, '{"state":true}')
++      }
++    }
++    throw new Error(`unexpected fetch ${method} ${url}`)
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  if (realTjs === undefined) delete (globalThis as any).tjs
++  else (globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++function newDriver(): Pan115Driver {
++  return new Pan115Driver({ access_token: "a", refresh_token: "r" } as any)
++}
++
++async function spoolFiles(): Promise<string[]> {
++  return (await readdir(spoolDir)).filter((n) => n.startsWith("115open-"))
++}
++
++function initOk(extra: Record<string, any> = {}) {
++  return {
++    status: 0,
++    bucket: "bkt",
++    object: "obj/a.bin",
++    callback: { callback: "CB", callback_var: "CV" },
++    ...extra,
++  }
++}
++
++function kindOf(c: FetchCall): string {
++  if (c.url.includes("/open/upload/init")) return "init"
++  if (c.url.includes("/open/upload/get_token")) return "token"
++  if (c.url.includes("oss.example.com")) {
++    if (c.method === "POST" && c.url.endsWith("?uploads")) return "initiate"
++    if (c.method === "PUT") {
++      return `part${new URL(c.url).searchParams.get("partNumber")}`
++    }
++    if (c.method === "POST" && c.url.includes("uploadId=")) return "complete"
++  }
++  return "other"
++}
++
++function uploadCalls(): FetchCall[] {
++  return calls.filter((c) => !c.url.includes("/open/folder/get_info"))
++}
++
++test("spool 顺序落盘；秒传 status 2 清理且不发 token/multipart", async () => {
++  initResponses = [{ status: 2 }]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/a.bin", 6)
++  await h.write(new Uint8Array([1, 2, 3]))
++  await h.write(new Uint8Array([4, 5, 6]))
++
++  const files = await spoolFiles()
++  assert.equal(files.length, 1)
++  assert.match(files[0], /^115open-[0-9a-f]+\.part$/)
++  const bytes = await readFile(join(spoolDir, files[0]))
++  assert.deepEqual([...bytes], [1, 2, 3, 4, 5, 6])
++
++  await h.commit()
++  assert.deepEqual(await readdir(spoolDir), [])
++
++  const kinds = uploadCalls().map(kindOf)
++  assert.deepEqual(kinds, ["init"])
++  assert.ok(!calls.some((c) => c.url.includes("/open/upload/get_token")))
++  assert.ok(!calls.some((c) => c.url.includes("oss.example.com")))
++})
++
++test("abort 关文件并删除 spool", async () => {
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/b.bin", 3)
++  await h.write(new Uint8Array([9, 9, 9]))
++  assert.equal((await spoolFiles()).length, 1)
++  await h.abort()
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("请求序列：init → token → Initiate → N 次 UploadPart → Complete(callback)", async () => {
++  initResponses = [initOk()]
++  const driver = newDriver()
++  const size = 20 * MB + 16
++  const h = await driver.beginStream("/dir/a.bin", size)
++  await h.write(new Uint8Array(20 * MB).fill(0x41))
++  await h.write(new Uint8Array(16).fill(0x42))
++  await h.commit()
++
++  assert.deepEqual(uploadCalls().map(kindOf), [
++    "init",
++    "token",
++    "initiate",
++    "part1",
++    "part2",
++    "complete",
++  ])
++
++  const oss = uploadCalls().filter((c) => c.url.includes("oss.example.com"))
++  for (const c of oss) {
++    assert.match(String(c.headers.Authorization), /^OSS AK:.+/)
++    assert.equal(c.headers["x-oss-security-token"], "ST")
++  }
++  const initiate = oss[0]
++  assert.equal(initiate.method, "POST")
++  assert.ok(initiate.url.endsWith("?uploads"))
++  const part1 = oss[1]
++  const part2 = oss[2]
++  assert.ok(part1.url.includes("partNumber=1&uploadId=UP1"))
++  assert.ok(part2.url.includes("partNumber=2&uploadId=UP1"))
++  assert.equal(part1.body.byteLength, 20 * MB)
++  assert.equal(part2.body.byteLength, 16)
++  const complete = oss[3]
++  assert.equal(complete.method, "POST")
++  assert.ok(complete.url.includes("?uploadId=UP1"))
++  assert.equal(
++    complete.headers["x-oss-callback"],
++    Buffer.from("CB", "utf8").toString("base64"),
++  )
++  assert.equal(
++    complete.headers["x-oss-callback-var"],
++    Buffer.from("CV", "utf8").toString("base64"),
++  )
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("sign_check：第二次 init 的 signVal 等于指定字节区间的 sha1", async () => {
++  initResponses = [
++    initOk({ status: 6, sign_check: "2-5", sign_key: "SK1" }),
++    { status: 2 },
++  ]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/a.bin", 10)
++  await h.write(new TextEncoder().encode("0123456789"))
++  await h.commit()
++
++  const inits = uploadCalls().filter((c) => kindOf(c) === "init")
++  assert.equal(inits.length, 2)
++  const second = new URLSearchParams(String(inits[1].body))
++  assert.equal(second.get("sign_key"), "SK1")
++  assert.equal(second.get("sign_val"), "D2F75E8204FEDF2EACD261E2461B2964E3BFD5BE")
++  assert.equal(second.get("fileid"), "87ACEC17CD9DCD20A716CC2CF67417B71C8A7016")
++  assert.equal(second.get("preid"), "87ACEC17CD9DCD20A716CC2CF67417B71C8A7016")
++  assert.ok(!uploadCalls().some((c) => c.url.includes("oss.example.com")))
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("sign_check 缺失：status 6 但无 sign_check 时 fail-closed，不进入 multipart", async () => {
++  initResponses = [initOk({ status: 6, sign_check: "" })]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/q.bin", 4)
++  await h.write(new Uint8Array([1, 2, 3, 4]))
++  await assert.rejects(() => h.commit(), /sign_check/)
++  assert.ok(!uploadCalls().some((c) => c.url.includes("oss.example.com")))
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("calPartSize：20MiB 起步、档位单调递增、1GiB 约 52 片", () => {
++  assert.equal(calPartSize(0), 20 * MB)
++  assert.equal(calPartSize(1), 20 * MB)
++  assert.equal(calPartSize(20 * MB), 20 * MB)
++  assert.equal(calPartSize(20 * MB + 1), 20 * MB)
++  assert.equal(calPartSize(1 * GB), 20 * MB)
++  assert.equal(Math.ceil((1 * GB) / calPartSize(1 * GB)), 52)
++
++  assert.equal(calPartSize(128 * GB + 1), 27487791)
++  assert.equal(calPartSize(256 * GB + 1), 41231687)
++  assert.equal(calPartSize(384 * GB + 1), 54975582)
++  assert.equal(calPartSize(512 * GB + 1), 82463373)
++  assert.equal(calPartSize(768 * GB + 1), 109951163)
++  assert.equal(calPartSize(1 * TB + 1), 5 * GB)
++
++  const samples = [
++    0,
++    1,
++    20 * MB,
++    20 * MB + 1,
++    128 * GB,
++    128 * GB + 1,
++    256 * GB + 1,
++    384 * GB + 1,
++    512 * GB + 1,
++    768 * GB + 1,
++    1 * TB + 1,
++  ]
++  let prev = 0
++  for (const n of samples) {
++    const p = calPartSize(n)
++    assert.ok(p >= 20 * MB, `calPartSize(${n}) 必须 >= 20MiB`)
++    assert.ok(p >= prev, `calPartSize 在 ${n} 处必须单调不减`)
++    prev = p
++  }
++})
++
++test("空间门：expectedSize 已知时 begin 即拒，且不建 spool", async () => {
++  statFsQueue = [{ bsize: 4096, bavail: 100 }] // 400KiB
++  const driver = newDriver()
++  await assert.rejects(
++    () => driver.beginStream("/dir/x.bin", 1 * MB),
++    /空间不足/,
++  )
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("空间门：expectedSize 未知时每 16MiB 复查，不足立即清理并抛错", async () => {
++  statFsQueue = [
++    { bsize: 4096, bavail: 1024 * 1024 }, // begin：4GiB
++    { bsize: 4096, bavail: 100 }, // 16MiB 节点：400KiB
++  ]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/y.bin")
++  await assert.rejects(
++    () => h.write(new Uint8Array(16 * MB)),
++    /空间不足/,
++  )
++  assert.deepEqual(await readdir(spoolDir), [])
++  await assert.rejects(() => h.write(new Uint8Array([1])), /已结束/)
++})
++
++test("失败清理：第 2 片 UploadPart 500 时 commit rejects，无 spool 残留", async () => {
++  initResponses = [initOk()]
++  partFailAt = 2
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/z.bin", 20 * MB + 1)
++  await h.write(new Uint8Array(20 * MB + 1))
++  await assert.rejects(() => h.commit(), /HTTP 500/)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("能力探测：beginStream 存在；流式路径不调用 put", async () => {
++  initResponses = [{ status: 2 }]
++  const driver = newDriver()
++  let putCalls = 0
++  ;(driver as any).put = async () => {
++    putCalls++
++    throw new Error("put must not be called")
++  }
++  assert.equal(typeof (driver as any).beginStream, "function")
++  const h = await driver.beginStream("/dir/s.bin", 3)
++  await h.write(new Uint8Array([1, 2, 3]))
++  await h.commit()
++  assert.equal(putCalls, 0)
++})
++
++test("spool 目录不可解析时抛错，不回退 /tmp", async () => {
++  ;(globalThis as any).tjs = { env: {}, statFs: async () => defaultStatFs }
++  const driver = newDriver()
++  await assert.rejects(
++    () => driver.beginStream("/dir/n.bin", 1),
++    /暂存目录不可用/,
++  )
++})
+diff --git a/src/backend/drivers/115open/driver.ts b/src/backend/drivers/115open/driver.ts
+index 9af3311..e1a45a8 100644
+--- a/src/backend/drivers/115open/driver.ts
++++ b/src/backend/drivers/115open/driver.ts
+@@ -23,6 +23,238 @@ function subrequestLimit(): number {
+   return typeof (globalThis as any).tjs !== "undefined" ? 100000 : 45
+ }
+ 
++// ---- Upload phase 2：落盘暂存 + OSS multipart（A-5） ----
++
++/** begin 时至少预留 fileSize + 64MiB。 */
++const SPOOL_MIN_FREE = 64 * 1024 * 1024
++/** expectedSize 未知时的剩余空间复查步长。 */
++const SPOOL_RECHECK_EVERY = 16 * 1024 * 1024
++/** 流式 sha1 的读块大小，只影响 hash 峰值，与分片大小无关。 */
++const HASH_CHUNK = 1024 * 1024
++
++const MB = 1024 * 1024
++const GB = 1024 * MB
++const TB = 1024 * GB
++
++/**
++ * 分片档位，逐字移植 A drivers/115_open/upload.go:17-35：
++ * 20MiB 起步；>128/256/384/512/768GB 与 >1TB 各升一档。
++ */
++export function calPartSize(fileSize: number): number {
++  let partSize = 20 * MB
++  if (fileSize > partSize) {
++    if (fileSize > 1 * TB) partSize = 5 * GB
++    else if (fileSize > 768 * GB) partSize = 109951163
++    else if (fileSize > 512 * GB) partSize = 82463373
++    else if (fileSize > 384 * GB) partSize = 54975582
++    else if (fileSize > 256 * GB) partSize = 41231687
++    else if (fileSize > 128 * GB) partSize = 27487791
++  }
++  return partSize
++}
++
++/** 只有真 tjs 运行时才有文件句柄 API；测试里的 tjs mock 只有 env/statFs。 */
++function tjsFs(): any {
++  const t = (globalThis as any).tjs
++  return t && typeof t.open === "function" ? t : null
++}
++
++function isErrno(e: any, name: string): boolean {
++  return e?.code === name || String(e?.message || e).includes(name)
++}
++
++/**
++ * spool 目录解析顺序：UPLOAD_SPOOL_DIR > dirname(TJS_DB)/upload-spool >
++ * TJS_DATA_DIR/upload-spool。都拿不到就抛错，禁止回退 /tmp（设备上是 tmpfs）。
++ */
++function resolveSpoolDir(): string {
++  const t = (globalThis as any).tjs
++  const env = (t && t.env) || {}
++  const explicit = env.UPLOAD_SPOOL_DIR
++  if (explicit) return String(explicit).replace(/[\\/]+$/, "")
++  const db = env.TJS_DB
++  if (db) {
++    const s = String(db)
++    const idx = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"))
++    if (idx > 0) return `${s.slice(0, idx)}/upload-spool`
++  }
++  const dataDir = env.TJS_DATA_DIR
++  if (dataDir) return `${String(dataDir).replace(/[\\/]+$/, "")}/upload-spool`
++  throw new Error(
++    "115open 上传暂存目录不可用：请设置 UPLOAD_SPOOL_DIR、TJS_DB 或 TJS_DATA_DIR" +
++      "（禁止回退 /tmp：设备上是 tmpfs）",
++  )
++}
++
++async function ensureDir(dir: string): Promise<void> {
++  const t = tjsFs()
++  if (!t || typeof t.makeDir !== "function") {
++    const spec: string = "node:fs/promises"
++    const fsp: any = await import(spec)
++    await fsp.mkdir(dir, { recursive: true })
++    return
++  }
++  const parts = dir.split("/").filter(Boolean)
++  let cur = dir.startsWith("/") ? "" : "."
++  for (const p of parts) {
++    cur = cur === "" ? `/${p}` : `${cur}/${p}`
++    try {
++      await t.makeDir(cur)
++    } catch (e: any) {
++      if (!isErrno(e, "EEXIST")) throw e
++    }
++  }
++}
++
++interface SpoolHandle {
++  write(chunk: Uint8Array): Promise<void>
++  readAt(buf: Uint8Array, position: number): Promise<number>
++  close(): Promise<void>
++}
++
++async function openSpoolFile(p: string, mode: "w" | "r"): Promise<SpoolHandle> {
++  const t = tjsFs()
++  if (t) {
++    const h = await t.open(p, mode)
++    return {
++      write: async (chunk) => {
++        let off = 0
++        while (off < chunk.byteLength) {
++          const n = Number(await h.write(chunk.subarray(off)))
++          if (!(n > 0)) throw new Error("115open spool 写入失败")
++          off += n
++        }
++      },
++      readAt: async (buf, position) => {
++        const n = await h.read(buf, position)
++        return n === null || n === undefined ? 0 : Number(n)
++      },
++      close: async () => {
++        await h.close()
++      },
++    }
++  }
++  const spec: string = "node:fs/promises"
++  const fsp: any = await import(spec)
++  const h = await fsp.open(p, mode)
++  return {
++    write: async (chunk) => {
++      let off = 0
++      while (off < chunk.byteLength) {
++        const r = await h.write(chunk.subarray(off))
++        const n = Number(r?.bytesWritten ?? r ?? 0)
++        if (!(n > 0)) throw new Error("115open spool 写入失败")
++        off += n
++      }
++    },
++    readAt: async (buf, position) => {
++      const r = await h.read(buf, 0, buf.length, position)
++      return Number(r?.bytesRead || 0)
++    },
++    close: async () => {
++      await h.close()
++    },
++  }
++}
++
++async function unlinkSpool(p: string): Promise<void> {
++  const t = tjsFs()
++  if (t && typeof t.unlink === "function") {
++    await t.unlink(p)
++    return
++  }
++  const spec: string = "node:fs/promises"
++  const fsp: any = await import(spec)
++  await fsp.unlink(p)
++}
++
++async function availableBytes(dir: string): Promise<number | null> {
++  const t = (globalThis as any).tjs
++  if (!t || typeof t.statFs !== "function") return null
++  const st = await t.statFs(dir)
++  const bsize = Number(st?.bsize)
++  const bavail = Number(st?.bavail)
++  // bavail 为 -1 表示文件系统不报可用块，按未知处理（不阻断上传）。
++  if (!Number.isFinite(bsize) || !Number.isFinite(bavail)) return null
++  if (bsize <= 0 || bavail < 0) return null
++  return bavail * bsize
++}
++
++async function assertSpoolSpace(dir: string, needed: number): Promise<void> {
++  const avail = await availableBytes(dir)
++  if (avail === null) return
++  if (avail < needed) {
++    throw new Error(
++      `115open 上传暂存空间不足：需要 ${needed} 字节，可用 ${avail} 字节（${dir}）`,
++    )
++  }
++}
++
++function randomHex(bytes: number): string {
++  const b = new Uint8Array(bytes)
++  crypto.getRandomValues(b)
++  return Array.from(b)
++    .map((x) => x.toString(16).padStart(2, "0"))
++    .join("")
++}
++
++interface Sha1Sink {
++  update(chunk: Uint8Array): void
++  hex(): string
++}
++
++/**
++ * 增量 sha1：tjs 用 tjs:hashing（native），Node/测试用 node:crypto。
++ * WebCrypto 只有一次性 digest，1GiB 全量哈希必须走增量接口。
++ */
++async function createSha1Sink(): Promise<Sha1Sink> {
++  if (tjsFs()) {
++    const spec: string = "tjs:hashing"
++    const mod: any = await import(spec)
++    const h = mod.createHash("sha1")
++    return {
++      update: (chunk) => {
++        h.update(chunk)
++      },
++      hex: () => String(h.digest()),
++    }
++  }
++  const spec: string = "node:crypto"
++  const mod: any = await import(spec)
++  const h = mod.createHash("sha1")
++  return {
++    update: (chunk) => {
++      h.update(chunk)
++    },
++    hex: () => String(h.digest("hex")),
++  }
++}
++
++/** 从 spool 读 [start, start+length) 算 sha1（小写 hex）；length 为 0 是空串 sha1。 */
++async function hashSpoolRange(
++  h: SpoolHandle,
++  start: number,
++  length: number,
++): Promise<string> {
++  const sink = await createSha1Sink()
++  let pos = start
++  let remaining = length
++  while (remaining > 0) {
++    const n = Math.min(HASH_CHUNK, remaining)
++    const buf = new Uint8Array(n)
++    let got = 0
++    while (got < n) {
++      const r = await h.readAt(buf.subarray(got), pos + got)
++      if (!(r > 0)) throw new Error("115open spool 读取提前结束")
++      got += r
++    }
++    sink.update(buf)
++    pos += n
++    remaining -= n
++  }
++  return sink.hex()
++}
++
+ function pan115FileToFileItem(f: Pan115File): FileItem {
+   const isDir = f.fc === "0"
+   return {
+@@ -403,19 +635,364 @@ export class Pan115Driver implements StorageDriver {
+     await this.client.copy(dstId, file.fid)
+   }
+ 
+-  // ---- Upload（OSS 直传：秒传 → 二次校验 → PUT Object） ----
++  // ---- Upload（beginStream：落盘暂存 + OSS multipart） ----
+ 
++  /**
++   * phase 1 的 fail-closed 保持不变：put 不是上传入口。
++   * 上传层（storage.ts beginUpload）按 `typeof driver.beginStream === "function"`
++   * 能力探测命中后只会调 beginStream，put 不会被调用。
++   */
+   async put(
+     _virtualPath: string,
+     physicalPath: string,
+     content: Buffer,
+   ): Promise<void> {
+-    // phase 2 才做 beginStream 分片上传；现在整包 ossPutObject 会把文件全放内存。
++    // phase 2 的上传入口是 beginStream；整包 ossPutObject 仍禁用。
+     throw new Error(
+       "115open 上传未接线：整包单请求会把文件全部放进内存，已禁用；等待 beginStream 分片实现",
+     )
+   }
+ 
++  /**
++   * A-5：真流式上传。数据顺序落盘到 <UPLOAD_SPOOL_DIR>/115open-<random>.part，
++   * commit 时从盘分片读并发 OSS multipart；内存上限 = 一个分片 + hash 缓冲。
++   */
++  async beginStream(
++    physicalPath: string,
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
++    this.budget.used = 0
++    const clean =
++      "/" +
++      String(physicalPath || "")
++        .split("/")
++        .filter(Boolean)
++        .join("/")
++    const segs = clean.split("/").filter(Boolean)
++    const fileName = segs.pop() || "file"
++    const parentPath = "/" + segs.join("/")
++    const parentId = await this.resolveFolderId(parentPath)
++
++    const dir = resolveSpoolDir()
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(dir, known ? expectedSize + SPOOL_MIN_FREE : SPOOL_MIN_FREE)
++
++    const spoolPath = `${dir}/115open-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let lastSpaceCheck = 0
++    let state: "open" | "done" | "aborted" = "open"
++
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
++    }
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!isErrno(e, "ENOENT"))
++          console.warn(
++            `[115open] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
++    }
++
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("115open beginStream 已结束，不能继续写入")
++        await fh.write(chunk)
++        size += chunk.byteLength
++        // expectedSize 未知时按 16MiB 步长复查；已知时 begin 已按
++        // expectedSize + 64MiB 预留，不再逐块查。
++        if (!known && size - lastSpaceCheck >= SPOOL_RECHECK_EVERY) {
++          lastSpaceCheck = size
++          try {
++            await assertSpoolSpace(dir, SPOOL_MIN_FREE)
++          } catch (e) {
++            state = "aborted"
++            await closeQuietly()
++            await removeSpool()
++            throw e
++          }
++        }
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("115open beginStream 已结束，不能重复 commit")
++        state = "done"
++        try {
++          await fh.close()
++          if (size === 0) throw new Error("115 网盘不允许上传空文件")
++          const reader = await openSpoolFile(spoolPath, "r")
++          try {
++            await this.uploadSpooled(reader, { fileName, parentId, size })
++          } finally {
++            try {
++              await reader.close()
++            } catch {}
++          }
++        } finally {
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
++    }
++  }
++
++  /** A drivers/115_open/driver.go:221-307 的 Put 流程：秒传 → 二次校验 → token → 分片。 */
++  private async uploadSpooled(
++    reader: SpoolHandle,
++    opts: { fileName: string; parentId: string; size: number },
++  ): Promise<void> {
++    const { fileName, parentId, size } = opts
++    const sha1Full = (await hashSpoolRange(reader, 0, size)).toUpperCase()
++    const preSize = Math.min(128 * 1024, size)
++    const sha1Pre = (await hashSpoolRange(reader, 0, preSize)).toUpperCase()
++
++    // 1. UploadInit（秒传）
++    if (!this.reserve()) throw new Error("subrequest budget exceeded")
++    let initResp = await this.client.uploadInit({
++      fileName,
++      fileSize: size,
++      target: parentId,
++      fileId: sha1Full,
++      preId: sha1Pre,
++    })
++    if (initResp.status === 2) return
++
++    // 2. 二次校验（status 6/7/8）：区间 sha1 用 sign_check 的字节范围
++    if ([6, 7, 8].includes(initResp.status)) {
++      const range = String(initResp.sign_check || "").split("-")
++      const start = parseInt(range[0], 10)
++      const end = parseInt(range[1], 10)
++      // Go 版在这两个 ParseInt 失败时直接返回错误；这里同样 fail-closed，
++      // 不把「该校验却没校验」的响应放进 multipart。
++      if (!Number.isFinite(start) || !Number.isFinite(end)) {
++        throw new Error("115 上传二次校验失败：sign_check 缺失或格式不正确")
++      }
++      const from = Math.min(Math.max(start, 0), size)
++      const to = Math.min(Math.max(end + 1, from), size)
++      const signVal = (
++        await hashSpoolRange(reader, from, to - from)
++      ).toUpperCase()
++      if (!this.reserve()) throw new Error("subrequest budget exceeded")
++      initResp = await this.client.uploadInit({
++        fileName,
++        fileSize: size,
++        target: parentId,
++        fileId: sha1Full,
++        preId: sha1Pre,
++        signKey: initResp.sign_key,
++        signVal,
++      })
++      if (initResp.status === 2) return
++    }
++
++    // 3. OSS 上传凭证
++    if (!this.reserve()) throw new Error("subrequest budget exceeded")
++    const token = await this.client.uploadGetToken()
++    if (!initResp.bucket || !initResp.object || !token.endpoint) {
++      throw new Error("115 上传初始化失败：缺少 OSS 上传信息")
++    }
++
++    // 4. multipart：Initiate → UploadPart × N → Complete(callback)
++    const partSize = calPartSize(size)
++    const partCount = Math.ceil(size / partSize)
++    if (!this.reserve()) throw new Error("subrequest budget exceeded")
++    const uploadId = await this.ossInitiateMultipart(token, initResp)
++    const parts: Array<{ number: number; etag: string }> = []
++    for (let i = 1; i <= partCount; i++) {
++      const offset = (i - 1) * partSize
++      const len = Math.min(partSize, size - offset)
++      const buf = new Uint8Array(len)
++      let got = 0
++      while (got < len) {
++        const n = await reader.readAt(buf.subarray(got), offset + got)
++        if (!(n > 0)) throw new Error("115open spool 读取提前结束")
++        got += n
++      }
++      if (!this.reserve()) throw new Error("subrequest budget exceeded")
++      const etag = await this.ossUploadPart(token, initResp, uploadId, i, buf)
++      parts.push({ number: i, etag })
++    }
++    if (!this.reserve()) throw new Error("subrequest budget exceeded")
++    await this.ossCompleteMultipart(token, initResp, uploadId, parts)
++  }
++
++  private ossBaseUrl(token: { endpoint: string }): string {
++    const base = token.endpoint.startsWith("http")
++      ? token.endpoint
++      : `https://${token.endpoint}`
++    return base.replace(/\/+$/, "")
++  }
++
++  /**
++   * OSS V1 签名（与 ossPutObject 同款：hmac-sha1 + CanonicalizedOSSHeaders）。
++   * 注意：reference 树里 ossPutObject 的 Authorization 前缀被脱敏成了 "***"，
++   * 这里按 OSS V1 规范写 "OSS "。
++   */
++  private async ossSignedFetch(opts: {
++    method: "POST" | "PUT"
++    url: string
++    resource: string
++    token: {
++      AccessKeyId: string
++      AccessKeySecret: string
++      SecurityToken: string
++    }
++    contentType: string
++    body?: Uint8Array | string
++    ossHeaders?: Record<string, string>
++  }): Promise<Response> {
++    const date = new Date().toUTCString()
++    const ossHeaders: Record<string, string> = {
++      "x-oss-security-token": opts.token.SecurityToken,
++      ...(opts.ossHeaders || {}),
++    }
++    const canonicalHeaders = Object.keys(ossHeaders)
++      .sort()
++      .map((k) => `${k}:${ossHeaders[k]}\n`)
++      .join("")
++    const stringToSign = `${opts.method}\n\n${opts.contentType}\n${date}\n${canonicalHeaders}${opts.resource}`
++    const signature = await hmacSha1Base64(stringToSign, opts.token.AccessKeySecret)
++    const headers: Record<string, string> = {
++      "Content-Type": opts.contentType,
++      Date: date,
++      Authorization: `OSS ${opts.token.AccessKeyId}:${signature}`,
++      ...ossHeaders,
++      "Content-Length": String(
++        opts.body === undefined
++          ? 0
++          : typeof opts.body === "string"
++            ? Buffer.byteLength(opts.body, "utf8")
++            : opts.body.byteLength,
++      ),
++    }
++    const res = await fetch(opts.url, {
++      method: opts.method,
++      headers,
++      body: opts.body as any,
++    })
++    // 203 是 OSS callback 失败的状态码：文件可能已写入 OSS，但 115 侧没登记，
++    // 按失败处理，避免上层以为上传成功。
++    if (!res.ok || res.status === 203) {
++      const text = (await res.text()).slice(0, 300)
++      throw new Error(`115 OSS ${opts.method} 失败（HTTP ${res.status}）：${text}`)
++    }
++    return res
++  }
++
++  private async ossInitiateMultipart(
++    token: {
++      endpoint: string
++      AccessKeyId: string
++      AccessKeySecret: string
++      SecurityToken: string
++    },
++    initResp: { bucket: string; object: string },
++  ): Promise<string> {
++    const res = await this.ossSignedFetch({
++      method: "POST",
++      url: `${this.ossBaseUrl(token)}/${initResp.object}?uploads`,
++      resource: `/${initResp.bucket}/${initResp.object}?uploads`,
++      token,
++      contentType: "application/octet-stream",
++    })
++    const text = await res.text()
++    const m = /<UploadId>([^<]+)<\/UploadId>/.exec(text)
++    if (!m) {
++      throw new Error(
++        `115 OSS InitiateMultipartUpload 响应缺少 UploadId：${text.slice(0, 300)}`,
++      )
++    }
++    return m[1]
++  }
++
++  private async ossUploadPart(
++    token: {
++      endpoint: string
++      AccessKeyId: string
++      AccessKeySecret: string
++      SecurityToken: string
++    },
++    initResp: { bucket: string; object: string },
++    uploadId: string,
++    partNumber: number,
++    body: Uint8Array,
++  ): Promise<string> {
++    const res = await this.ossSignedFetch({
++      method: "PUT",
++      url:
++        `${this.ossBaseUrl(token)}/${initResp.object}` +
++        `?partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId)}`,
++      resource: `/${initResp.bucket}/${initResp.object}?partNumber=${partNumber}&uploadId=${uploadId}`,
++      token,
++      contentType: "application/octet-stream",
++      body,
++    })
++    const etag = res.headers?.get?.("etag")
++    if (!etag) throw new Error(`115 OSS UploadPart ${partNumber} 响应缺少 ETag`)
++    return etag
++  }
++
++  private async ossCompleteMultipart(
++    token: {
++      endpoint: string
++      AccessKeyId: string
++      AccessKeySecret: string
++      SecurityToken: string
++    },
++    initResp: { bucket: string; object: string; callback: any },
++    uploadId: string,
++    parts: Array<{ number: number; etag: string }>,
++  ): Promise<void> {
++    const cb = Buffer.from(initResp.callback?.callback || "", "utf8").toString(
++      "base64",
++    )
++    const cbv = Buffer.from(
++      initResp.callback?.callback_var || "",
++      "utf8",
++    ).toString("base64")
++    const xml =
++      "<CompleteMultipartUpload>" +
++      parts
++        .map(
++          (p) =>
++            `<Part><PartNumber>${p.number}</PartNumber><ETag>${p.etag}</ETag></Part>`,
++        )
++        .join("") +
++      "</CompleteMultipartUpload>"
++    await this.ossSignedFetch({
++      method: "POST",
++      url: `${this.ossBaseUrl(token)}/${initResp.object}?uploadId=${encodeURIComponent(uploadId)}`,
++      resource: `/${initResp.bucket}/${initResp.object}?uploadId=${uploadId}`,
++      token,
++      contentType: "application/xml",
++      body: xml,
++      ossHeaders: {
++        "x-oss-callback": cb,
++        "x-oss-callback-var": cbv,
++      },
++    })
++  }
++
+   private async ossPutObject(
+     token: {
+       endpoint: string
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index 5cbcdd2..c876b74 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -1974,6 +1974,7 @@ export async function putItem(
+ export async function beginUpload(
+   virtualPath: string,
+   requestContext?: StorageRequestContext,
++  expectedSize?: number,
+ ): Promise<UploadTarget> {
+   const resolved = await resolvePath(virtualPath, requestContext?.env)
+   if (resolved.isVirtual) {
+@@ -1993,7 +1994,8 @@ export async function beginUpload(
+   // 不改 StorageDriver 接口，避免动 base.ts 和 100 多个驱动。
+   const beginStream = (driver as any).beginStream
+   if (typeof beginStream === "function") {
+-    const handle = await beginStream.call(driver, resolved.physical!)
++    // expectedSize 只用于驱动的落盘空间预留（115open A-5）；驱动可以不收这个参数。
++    const handle = await beginStream.call(driver, resolved.physical!, expectedSize)
+     let settled = false
+     return {
+       stream: true,
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 69029ae..9c58bc4 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -1225,7 +1225,7 @@ fsRouter.put("/put", async (c) => {
+       await drainBody(c)
+       return tooLargeResponse(c, limit)
+     }
+-    const target = await beginUpload(reqPath, requestContext)
++    const target = await beginUpload(reqPath, requestContext, declared ?? undefined)
+     const r = await pipeBody(c, limit, target)
+     if (!r.ok) return tooLargeResponse(c, r.limit)
+     return c.json({ code: 200, message: "success", data: null })
+diff --git a/src/backend/server/s3.ts b/src/backend/server/s3.ts
+index 426678c..696c7a7 100644
+--- a/src/backend/server/s3.ts
++++ b/src/backend/server/s3.ts
+@@ -315,7 +315,7 @@ s3Router.put("/*", async (c) => {
+         400,
+       )
+     }
+-    const target = await beginUpload(virtualPath, getCtx(c))
++    const target = await beginUpload(virtualPath, getCtx(c), declared ?? undefined)
+     const r = await pipeBody(c, limit, target)
+     if (!r.ok) {
+       return s3Error(
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index a51162d..00112cf 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -502,7 +502,9 @@ webdavRouter.all("/*", async (c) => {
+           await drainBody(c)
+           return c.text(`File too large (max ${limit} bytes)`, 413)
+         }
+-        const target = await sourceStep(() => beginUpload(actualPath, ctx))
++        const target = await sourceStep(() =>
++          beginUpload(actualPath, ctx, declared ?? undefined),
++        )
+         const r = await sourceStep(() => pipeBody(c, limit, target))
+         if (!r.ok) return c.text(`File too large (max ${r.limit} bytes)`, 413)
+         return c.body(null, 201)

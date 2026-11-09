@@ -1,0 +1,277 @@
+diff --git a/src/backend/drivers/115open/driver.ts b/src/backend/drivers/115open/driver.ts
+index e1a45a8..7acc7ac 100644
+--- a/src/backend/drivers/115open/driver.ts
++++ b/src/backend/drivers/115open/driver.ts
+@@ -163,6 +163,11 @@ async function unlinkSpool(p: string): Promise<void> {
+     await t.unlink(p)
+     return
+   }
++  // tjs 26.9.0 没有 unlink，全局只有 remove；先按能力探测再回退 Node。
++  if (t && typeof t.remove === "function") {
++    await t.remove(p)
++    return
++  }
+   const spec: string = "node:fs/promises"
+   const fsp: any = await import(spec)
+   await fsp.unlink(p)
+diff --git a/src/backend/drivers/115open/spool-cleanup.test.ts b/src/backend/drivers/115open/spool-cleanup.test.ts
+new file mode 100644
+index 0000000..9e90c01
+--- /dev/null
++++ b/src/backend/drivers/115open/spool-cleanup.test.ts
+@@ -0,0 +1,255 @@
++// 115open spool 清理回归（patch 71）
++//
++// 实测前提（txiki-js 26.9.0，Windows 版 tjs.exe 现跑）：
++//   typeof tjs.unlink === "undefined"，typeof tjs.remove === "function"
++// patch 70 的 unlinkSpool 先查 t.unlink，查不到就 import("node:fs/promises")；
++// 产物里 node: 被别名成访问即抛错的空壳，于是 removeSpool 只 warn 不删文件。
++//
++// 本测试按派工口径 mock globalThis.tjs：提供 open/makeDir/remove/statFs，
++// 故意不提供 unlink，用内存文件系统（真实盘上没有 spool 路径）跑两条收尾路径：
++//   1) beginStream → write → commit（OSS multipart 全 mock）→ spool 被删；
++//   2) beginStream → write → abort → spool 被删。
++// 断言删除只可能由 tjs.remove 完成，且收尾期间不解析 node:fs/promises。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as nodeModule from "node:module"
++
++import { Pan115Driver } from "./driver"
++
++const registerHooks = (nodeModule as any).registerHooks as
++  | ((hooks: any) => void)
++  | undefined
++assert.equal(
++  typeof registerHooks,
++  "function",
++  "本测试依赖 node:module registerHooks（Node >= 22.15）",
++)
++
++// driver 在 tjs 分支用 import("tjs:hashing") 做增量 sha1；Node 没有这个模块，
++// 解析到 data: 假模块（只需要 createHash().update()/digest()）。
++const HASHING_STUB =
++  'export function createHash(){return{update(){},digest(){return "da39a3ee5e6b4b0d3255bfef95601890afd80709"}}}'
++const HASHING_STUB_URL = "data:text/javascript," + encodeURIComponent(HASHING_STUB)
++
++let fsPromisesResolves = 0
++registerHooks!({
++  resolve(specifier: string, context: any, nextResolve: any) {
++    if (specifier === "tjs:hashing")
++      return { url: HASHING_STUB_URL, shortCircuit: true }
++    if (specifier === "node:fs/promises") fsPromisesResolves++
++    return nextResolve(specifier, context)
++  },
++})
++
++interface MemFile {
++  data: Uint8Array
++}
++
++const memFiles = new Map<string, MemFile>()
++const memDirs = new Set<string>()
++let removeCalls: string[] = []
++let openCalls: string[] = []
++let initResponses: any[] = []
++
++/** tjs 26.9.0 的 API 面：有 open/makeDir/remove/statFs，没有 unlink。 */
++function makeTjsMock() {
++  return {
++    env: { UPLOAD_SPOOL_DIR: "/mem/upload-spool" },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    makeDir: async (p: string) => {
++      if (memDirs.has(p)) {
++        const e: any = new Error("EEXIST: " + p)
++        e.code = "EEXIST"
++        throw e
++      }
++      memDirs.add(p)
++    },
++    open: async (p: string, mode: string) => {
++      openCalls.push(mode + ":" + p)
++      if (mode === "w") {
++        const f: MemFile = { data: new Uint8Array(0) }
++        memFiles.set(p, f)
++        return {
++          write: async (chunk: Uint8Array) => {
++            const next = new Uint8Array(f.data.length + chunk.length)
++            next.set(f.data)
++            next.set(chunk, f.data.length)
++            f.data = next
++            return chunk.length
++          },
++          read: async () => null,
++          close: async () => {},
++        }
++      }
++      const f = memFiles.get(p)
++      if (!f) {
++        const e: any = new Error("ENOENT: " + p)
++        e.code = "ENOENT"
++        throw e
++      }
++      return {
++        write: async () => 0,
++        read: async (buf: Uint8Array, position: number) => {
++          if (position >= f.data.length) return null
++          const n = Math.min(buf.length, f.data.length - position)
++          buf.set(f.data.subarray(position, position + n))
++          return n
++        },
++        close: async () => {},
++      }
++    },
++    remove: async (p: string) => {
++      removeCalls.push(p)
++      if (!memFiles.delete(p)) {
++        const e: any = new Error("ENOENT: " + p)
++        e.code = "ENOENT"
++        throw e
++      }
++    },
++  }
++}
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function ossResponse(
++  status: number,
++  text: string,
++  headers: Record<string, string> = {},
++): any {
++  const lower: Record<string, string> = {}
++  for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    headers: { get: (k: string) => lower[String(k).toLowerCase()] ?? null },
++    text: async () => text,
++  }
++}
++
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++beforeEach(() => {
++  memFiles.clear()
++  memDirs.clear()
++  removeCalls = []
++  openCalls = []
++  initResponses = []
++  fsPromisesResolves = 0
++  ;(globalThis as any).tjs = makeTjsMock()
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    const method = String(init?.method || "GET").toUpperCase()
++    if (url.includes("/open/folder/get_info")) {
++      return jsonResponse({
++        state: true,
++        code: 0,
++        data: { file_id: "111", file_name: "dir" },
++      })
++    }
++    if (url.includes("/open/upload/init")) {
++      const next = initResponses.shift()
++      if (!next) throw new Error("unexpected uploadInit call")
++      return jsonResponse({ state: true, code: 0, data: next })
++    }
++    if (url.includes("/open/upload/get_token")) {
++      return jsonResponse({
++        state: true,
++        code: 0,
++        data: {
++          endpoint: "https://oss.example.com",
++          AccessKeyId: "AK",
++          AccessKeySecret: "SK",
++          SecurityToken: "ST",
++        },
++      })
++    }
++    if (url.includes("oss.example.com")) {
++      if (method === "POST" && url.endsWith("?uploads")) {
++        return ossResponse(
++          200,
++          "<InitiateMultipartUploadResult><UploadId>UP1</UploadId></InitiateMultipartUploadResult>",
++        )
++      }
++      if (method === "PUT") {
++        return ossResponse(200, "", { etag: '"etag-1"' })
++      }
++      if (method === "POST" && url.includes("uploadId=")) {
++        return ossResponse(200, '{"state":true}')
++      }
++    }
++    throw new Error(`unexpected fetch ${method} ${url}`)
++  }) as any
++})
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++  if (realTjs === undefined) delete (globalThis as any).tjs
++  else (globalThis as any).tjs = realTjs
++})
++
++function newDriver(): Pan115Driver {
++  return new Pan115Driver({ access_token: "a", refresh_token: "r" } as any)
++}
++
++function spoolPathOf(): string {
++  assert.equal(memFiles.size, 1, "spool 应先落盘")
++  const p = [...memFiles.keys()][0]
++  assert.match(p, /^\/mem\/upload-spool\/115open-[0-9a-f]+\.part$/)
++  return p
++}
++
++test("成功上传后 spool 由 tjs.remove 删除，不发 node: 导入", async () => {
++  initResponses = [
++    {
++      status: 0,
++      bucket: "bkt",
++      object: "obj/a.bin",
++      callback: { callback: "CB", callback_var: "CV" },
++    },
++  ]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/a.bin", 5)
++  await h.write(new Uint8Array([1, 2, 3, 4, 5]))
++  const spoolPath = spoolPathOf()
++  assert.equal(
++    typeof (globalThis as any).tjs.unlink,
++    "undefined",
++    "mock 故意不提供 unlink",
++  )
++
++  fsPromisesResolves = 0
++  const removeBefore = removeCalls.length
++  await h.commit()
++
++  assert.equal(memFiles.size, 0, "commit 后 spool 必须被删除")
++  assert.equal(removeCalls.length, removeBefore + 1, "清理只能调用一次")
++  assert.equal(removeCalls[removeBefore], spoolPath, "清理参数必须是 spool 路径")
++  assert.equal(fsPromisesResolves, 0, "清理路径不得解析 node:fs/promises")
++  assert.ok(openCalls.includes("r:" + spoolPath), "上传时应从 spool 读回数据")
++})
++
++test("中止后 spool 由 tjs.remove 删除，不发 node: 导入", async () => {
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/b.bin", 3)
++  await h.write(new Uint8Array([7, 8, 9]))
++  const spoolPath = spoolPathOf()
++
++  fsPromisesResolves = 0
++  const removeBefore = removeCalls.length
++  await h.abort()
++
++  assert.equal(memFiles.size, 0, "abort 后 spool 必须被删除")
++  assert.equal(removeCalls.length, removeBefore + 1, "清理只能调用一次")
++  assert.equal(removeCalls[removeBefore], spoolPath, "清理参数必须是 spool 路径")
++  assert.equal(fsPromisesResolves, 0, "清理路径不得解析 node:fs/promises")
++})
