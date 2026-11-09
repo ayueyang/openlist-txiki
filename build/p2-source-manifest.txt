@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 71
+patch_count 72
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -464,3 +464,5 @@ patch 69 a6b0602273afea8f5fc57831c3230e42b23a456ec89d22209da3fec2df37f9c9 work/p
 patch 70 d50731e5a4b7d2b7996c04f2ced55cea9b0d093210d6fc77e760c3aadc2d9679 work/p2-70-115open-beginstream.patch
 # 第 71 条（2026-11-09，r60 候选）：115open spool 清理——unlinkSpool 按 t.unlink -> t.remove -> node:fs/promises 能力顺序回退；新增 spool-cleanup.test.ts（tjs mock 无 unlink）。
 patch 71 dbc1a3e52b2880211a112e85a7b9ee7b442a9a41585c98536d956a60ac476d44 work/p2-71-115open-spool-unlink.patch
+# 第 72 条（2026-11-09，r61 候选）：115open 动态导入字面量化——4 处 const spec = "node:..."; await import(spec) 改为 await import("node:...")，让 esbuild 接管成空壳，产物动态 node: 集合归零；beginstream.test.ts 增 2 条 tjs 侧 mock 测试。
+patch 72 d18a64257bc5ef87d059a0db78a4ed8cd4de4b61a889c4055e9aa0b640a342ab work/p2-72-115open-literal-import.patch

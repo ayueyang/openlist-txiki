@@ -1,0 +1,211 @@
+diff --git a/src/backend/drivers/115open/beginstream.test.ts b/src/backend/drivers/115open/beginstream.test.ts
+index 495acc9..b0f3eeb 100755
+--- a/src/backend/drivers/115open/beginstream.test.ts
++++ b/src/backend/drivers/115open/beginstream.test.ts
+@@ -2,6 +2,7 @@
+ // 全部 mock globalThis.fetch：不连网、不登录、不需要真实 115 账号与设备。
+ import assert from "node:assert/strict"
+ import { afterEach, beforeEach, test } from "node:test"
++import * as nodeModule from "node:module"
+ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+@@ -360,3 +361,154 @@ test("spool 目录不可解析时抛错，不回退 /tmp", async () => {
+     /暂存目录不可用/,
+   )
+ })
++
++// ---- patch 72：tjs 侧收尾路径 ----
++//
++// 真 tjs 形态的 mock：提供 open/makeDir/remove/statFs，刻意不提供 unlink。
++// 两条路径（成功上传、abort）都要求 spool 被删、删除只走 tjs.remove，且收尾期间
++// 不解析 node:fs/promises（patch 72 把 4 处动态导入改成字面量后，esbuild 会把它们
++// 折叠成空壳；这里用 resolve 钩子计数证明运行期没有触达）。
++
++const registerHooks = (nodeModule as any).registerHooks as
++  | ((hooks: any) => void)
++  | undefined
++assert.equal(
++  typeof registerHooks,
++  "function",
++  "本测试依赖 node:module registerHooks（Node >= 22.15）",
++)
++
++// driver 在 tjs 分支用 import("tjs:hashing") 做增量 sha1；Node 没有这个模块，
++// 解析到 data: 假模块（只需要 createHash().update()/digest()）。
++const HASHING_STUB =
++  'export function createHash(){return{update(){},digest(){return "da39a3ee5e6b4b0d3255bfef95601890afd80709"}}}'
++const HASHING_STUB_URL = "data:text/javascript," + encodeURIComponent(HASHING_STUB)
++
++let fsPromisesResolves = 0
++registerHooks!({
++  resolve(specifier: string, context: any, nextResolve: any) {
++    if (specifier === "tjs:hashing")
++      return { url: HASHING_STUB_URL, shortCircuit: true }
++    if (specifier === "node:fs/promises") fsPromisesResolves++
++    return nextResolve(specifier, context)
++  },
++})
++
++interface MemFile {
++  data: Uint8Array
++}
++
++const memFiles = new Map<string, MemFile>()
++const memDirs = new Set<string>()
++let memRemoveCalls: string[] = []
++
++/** tjs 26.9.0 的 API 面：有 open/makeDir/remove/statFs，没有 unlink。 */
++function makeTjsFsMock() {
++  return {
++    env: { UPLOAD_SPOOL_DIR: "/mem/upload-spool" },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    makeDir: async (p: string) => {
++      if (memDirs.has(p)) {
++        const e: any = new Error("EEXIST: " + p)
++        e.code = "EEXIST"
++        throw e
++      }
++      memDirs.add(p)
++    },
++    open: async (p: string, mode: string) => {
++      if (mode === "w") {
++        const f: MemFile = { data: new Uint8Array(0) }
++        memFiles.set(p, f)
++        return {
++          write: async (chunk: Uint8Array) => {
++            const next = new Uint8Array(f.data.length + chunk.length)
++            next.set(f.data)
++            next.set(chunk, f.data.length)
++            f.data = next
++            return chunk.length
++          },
++          read: async () => null,
++          close: async () => {},
++        }
++      }
++      const f = memFiles.get(p)
++      if (!f) {
++        const e: any = new Error("ENOENT: " + p)
++        e.code = "ENOENT"
++        throw e
++      }
++      return {
++        write: async () => 0,
++        read: async (buf: Uint8Array, position: number) => {
++          if (position >= f.data.length) return null
++          const n = Math.min(buf.length, f.data.length - position)
++          buf.set(f.data.subarray(position, position + n))
++          return n
++        },
++        close: async () => {},
++      }
++    },
++    remove: async (p: string) => {
++      memRemoveCalls.push(p)
++      if (!memFiles.delete(p)) {
++        const e: any = new Error("ENOENT: " + p)
++        e.code = "ENOENT"
++        throw e
++      }
++    },
++  }
++}
++
++function resetTjsFsMock() {
++  memFiles.clear()
++  memDirs.clear()
++  memRemoveCalls = []
++  fsPromisesResolves = 0
++  ;(globalThis as any).tjs = makeTjsFsMock()
++}
++
++test("tjs 侧：成功上传后 spool 由 tjs.remove 删除，不解析 node: 导入", async () => {
++  resetTjsFsMock()
++  initResponses = [{ status: 2 }]
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/t.bin", 5)
++  await h.write(new Uint8Array([1, 2, 3, 4, 5]))
++
++  assert.equal(memFiles.size, 1, "spool 应先落到 tjs 内存文件系统")
++  const spool = [...memFiles.keys()][0]
++  assert.match(spool, /^\/mem\/upload-spool\/115open-[0-9a-f]+\.part$/)
++  assert.equal(
++    typeof (globalThis as any).tjs.unlink,
++    "undefined",
++    "mock 故意不提供 unlink",
++  )
++
++  fsPromisesResolves = 0
++  await h.commit()
++
++  assert.equal(memFiles.size, 0, "commit 后 spool 必须被删除")
++  assert.deepEqual(memRemoveCalls, [spool], "清理必须走 tjs.remove，参数是 spool 路径")
++  assert.equal(fsPromisesResolves, 0, "收尾期间不得解析 node:fs/promises")
++})
++
++test("tjs 侧：abort 后 spool 由 tjs.remove 删除，不解析 node: 导入", async () => {
++  resetTjsFsMock()
++  const driver = newDriver()
++  const h = await driver.beginStream("/dir/b.bin", 3)
++  await h.write(new Uint8Array([7, 8, 9]))
++
++  assert.equal(memFiles.size, 1, "spool 应先落到 tjs 内存文件系统")
++  const spool = [...memFiles.keys()][0]
++  assert.equal(
++    typeof (globalThis as any).tjs.unlink,
++    "undefined",
++    "mock 故意不提供 unlink",
++  )
++
++  fsPromisesResolves = 0
++  await h.abort()
++
++  assert.equal(memFiles.size, 0, "abort 后 spool 必须被删除")
++  assert.deepEqual(memRemoveCalls, [spool], "清理必须走 tjs.remove，参数是 spool 路径")
++  assert.equal(fsPromisesResolves, 0, "收尾期间不得解析 node:fs/promises")
++})
+diff --git a/src/backend/drivers/115open/driver.ts b/src/backend/drivers/115open/driver.ts
+index 7acc7ac..c7d5913 100755
+--- a/src/backend/drivers/115open/driver.ts
++++ b/src/backend/drivers/115open/driver.ts
+@@ -89,8 +89,7 @@ function resolveSpoolDir(): string {
+ async function ensureDir(dir: string): Promise<void> {
+   const t = tjsFs()
+   if (!t || typeof t.makeDir !== "function") {
+-    const spec: string = "node:fs/promises"
+-    const fsp: any = await import(spec)
++    const fsp: any = await import("node:fs/promises")
+     await fsp.mkdir(dir, { recursive: true })
+     return
+   }
+@@ -134,8 +133,7 @@ async function openSpoolFile(p: string, mode: "w" | "r"): Promise<SpoolHandle> {
+       },
+     }
+   }
+-  const spec: string = "node:fs/promises"
+-  const fsp: any = await import(spec)
++  const fsp: any = await import("node:fs/promises")
+   const h = await fsp.open(p, mode)
+   return {
+     write: async (chunk) => {
+@@ -168,8 +166,7 @@ async function unlinkSpool(p: string): Promise<void> {
+     await t.remove(p)
+     return
+   }
+-  const spec: string = "node:fs/promises"
+-  const fsp: any = await import(spec)
++  const fsp: any = await import("node:fs/promises")
+   await fsp.unlink(p)
+ }
+ 
+@@ -224,8 +221,7 @@ async function createSha1Sink(): Promise<Sha1Sink> {
+       hex: () => String(h.digest()),
+     }
+   }
+-  const spec: string = "node:crypto"
+-  const mod: any = await import(spec)
++  const mod: any = await import("node:crypto")
+   const h = mod.createHash("sha1")
+   return {
+     update: (chunk) => {

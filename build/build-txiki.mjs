@@ -276,7 +276,7 @@ function verifySourceManifest() {
   if (!entries.files.length) problems.push("清单缺少 file 条目")
   if (entries.patchCount !== entries.patches.length) problems.push("patch_count " + entries.patchCount + " 与实际 patch 条目 " + entries.patches.length + " 不符")
   if (entries.fileCount !== entries.files.length) problems.push("file_count " + entries.fileCount + " 与实际 file 条目 " + entries.files.length + " 不符")
-  if (entries.patches.length !== 71) problems.push("补丁栈应为 71 个，实际 " + entries.patches.length + " 个")
+  if (entries.patches.length !== 72) problems.push("补丁栈应为 72 个，实际 " + entries.patches.length + " 个")
   entries.patches.forEach((p, idx) => {
     const want = String(idx + 1).padStart(2, "0")
     if (p.seq !== want) problems.push("补丁顺序断档：第 " + (idx + 1) + " 条序号 " + p.seq + "，期望 " + want)
@@ -406,7 +406,7 @@ function verifySourceManifest() {
       entries.commit.slice(0, 8) +
       "，补丁 " +
       entries.patches.length +
-      "/71（01..71 顺序与 sha 一致），指纹 " +
+      "/72（01..72 顺序与 sha 一致），指纹 " +
       info.fingerprint_entries +
       " 条（file " +
       info.fingerprint_files +
@@ -541,18 +541,30 @@ if (process.env.TXIKI_META) {
 const code = fs.readFileSync(outfile, "utf8")
 const size = Buffer.byteLength(code)
 
-// G1 自检 1：产物里不能有可静态解析的 node: 说明符。
-// 例外：源码写成 `const spec = "node:..."; await import(spec)` 的 Node 单测回落路径，
-// esbuild 链接阶段解析不到，压缩后才把常量折成 import("node:...")；这类只可能落在
-// 运行期门控分支（tjs 上不走），单独列出并允许，仍计入构建日志。
-const nodeSpecsAll = [...new Set((code.match(/["'`]node:[a-z_/]+/g) || []).map((s) => s.slice(1)))]
-const nodeSpecsDynamic = [
-  ...new Set(
-    (code.match(/import\(\s*["'`]node:[a-z_/]+["'`]\s*\)/g) || []).map((s) => s.match(/node:[a-z_/]+/)[0]),
-  ),
-]
-const nodeSpecs = nodeSpecsAll.filter((s) => !nodeSpecsDynamic.includes(s))
-// G1 自检 2：不能有 require("net") 这类裸内置残留
+// G1 自检 1：先抹掉动态 import("node:...") 调用整段并收集动态集合，再扫静态残量。
+// 不按说明符名字做集合扣除：同一说明符若另有静态 import/require 残留，必须仍被抓到。
+const DYN_RE = /import\(\s*(["'`])(node:[a-z_/]+)\1\s*\)/g
+const dynamicSpecs = new Set()
+const maskedCode = code.replace(DYN_RE, (_m, _q, spec) => {
+  dynamicSpecs.add(spec)
+  return 'import("__TJS_DYN__")'
+})
+const nodeSpecs = [...new Set((maskedCode.match(/["'`]node:[a-z_/]+/g) || []).map((s) => s.slice(1)))]
+const nodeSpecsDynamic = [...dynamicSpecs].sort()
+// G1 自检 2：动态集合必须与 build/g1-node-allowlist.json 完全一致（本版 entries 为空）。
+const allowlistPath =
+  process.env.TXIKI_G1_ALLOWLIST || path.join(root, "build", "g1-node-allowlist.json")
+if (!fs.existsSync(allowlistPath)) {
+  console.error("FAIL: 缺 G1 allowlist " + allowlistPath)
+  process.exit(1)
+}
+const allowlistDoc = JSON.parse(fs.readFileSync(allowlistPath, "utf8"))
+const allowlist = new Set(
+  (allowlistDoc.entries || []).map((e) => (typeof e === "string" ? e : e.spec)),
+)
+const nodeSpecsUnlisted = nodeSpecsDynamic.filter((s) => !allowlist.has(s))
+const nodeSpecsStale = [...allowlist].filter((s) => !nodeSpecsDynamic.includes(s)).sort()
+// G1 自检 3：不能有 require("net") 这类裸内置残留
 const bare = [...new Set((code.match(/require\(["'`](net|stream|fs|crypto|http|https|os|path)["'`]\)/g) || []))]
 
 const inputs = Object.keys(result.metafile.inputs).length
@@ -570,14 +582,20 @@ console.log(
       nodeSpecs,
       nodeSpecsDynamic,
       bareRequires: bare,
+      g1Allowlist: {
+        file: path.relative(root, allowlistPath).split(path.sep).join("/"),
+        entries: allowlist.size,
+        unlisted: nodeSpecsUnlisted,
+        stale: nodeSpecsStale,
+      },
     },
     null,
     2,
   ),
 )
 
-if (nodeSpecs.length || bare.length) {
-  console.error("FAIL: bundle still references node builtins")
+if (nodeSpecs.length || bare.length || nodeSpecsUnlisted.length || nodeSpecsStale.length) {
+  console.error("FAIL: bundle still references node builtins or G1 allowlist mismatch")
   process.exit(1)
 }
 if (size > 6 * 1024 * 1024) {
@@ -599,7 +617,17 @@ const buildManifest = {
   source_manifest: sourceFingerprint.source_manifest,
   source_manifest_sha256: sourceFingerprint.source_manifest_sha256,
   bundle: { file: path.basename(outfile), sha256: bundleSha256, size, inputs },
-  checks: { nodeSpecs, nodeSpecsDynamic, bareRequires: bare },
+  checks: {
+    nodeSpecs,
+    nodeSpecsDynamic,
+    bareRequires: bare,
+    g1Allowlist: {
+      file: path.relative(root, allowlistPath).split(path.sep).join("/"),
+      entries: allowlist.size,
+      unlisted: nodeSpecsUnlisted,
+      stale: nodeSpecsStale,
+    },
+  },
 }
 const buildManifestPath = path.join(outdir, faultEntry ? "build-manifest.fault.json" : "build-manifest.json")
 fs.writeFileSync(buildManifestPath, JSON.stringify(buildManifest, null, 2) + "\n")
