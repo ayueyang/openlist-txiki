@@ -1,0 +1,408 @@
+diff --git a/src/backend/drivers/alias/driver.ts b/src/backend/drivers/alias/driver.ts
+index 5fdef57..9610ec7 100644
+--- a/src/backend/drivers/alias/driver.ts
++++ b/src/backend/drivers/alias/driver.ts
+@@ -7,9 +7,13 @@ import { AliasAddition, AliasPathPair } from "./types"
+ import {
+   AliasNotFoundError,
+   AliasPermissionError,
++  AliasRedirectLoopError,
+   isNotFoundError,
+ } from "../../pkg/errs"
+ 
++/** r65 补丁 83：无 storageId 时的嵌套深度兜底（实例级，不用模块级计数器）。 */
++const MAX_ALIAS_DEPTH = 8
++
+ export class AliasDriver implements StorageDriver {
+   private addition: AliasAddition
+   private pathPairs: AliasPathPair[] = []
+@@ -19,9 +23,18 @@ export class AliasDriver implements StorageDriver {
+   private writable: boolean
+   /** A meta.go:13 默认 true */
+   private protectSameName: boolean
+-
+-  constructor(addition: AliasAddition) {
++  /** r65 补丁 83：本存储 id，用于自指环回判定；老调用点可不传。 */
++  private storageId?: string
++  /** r65 补丁 83：无 storageId 时的嵌套深度兜底。 */
++  private activeDepth = 0
++
++  constructor(
++    addition: AliasAddition,
++    storageConfig?: { id?: string | number },
++  ) {
+     this.addition = addition
++    this.storageId =
++      storageConfig?.id == null ? undefined : String(storageConfig.id)
+     // 默认值落在构造器，不依赖 JSON 层（A meta.go 的 default 语义）
+     this.writable = addition.writable === true
+     this.protectSameName = addition.protect_same_name !== false
+@@ -178,9 +191,41 @@ export class AliasDriver implements StorageDriver {
+     return results
+   }
+ 
++  /**
++   * r65 补丁 83（缺陷 C）：自指检测。目标路径解析回本存储即内部环回。
++   *
++   * 夹具 /loopA 的 paths=/loopA/sub 让每层目标继续落在同一个存储上，
++   * get()/list() 会无限递归到超时；这里只看解析结果的 storage.id，
++   * 不联网、不写缓存。
++   */
++  private async assertTargetsNotSelf(
++    targets: Array<{ targetFullPath: string }>,
++    storage: any,
++    physicalPath: string,
++  ): Promise<void> {
++    if (!this.storageId) return
++    for (const target of targets) {
++      let resolved: any
++      try {
++        resolved = await storage.resolvePath(target.targetFullPath)
++      } catch {
++        continue
++      }
++      if (
++        resolved?.storage?.id != null &&
++        String(resolved.storage.id) === this.storageId
++      ) {
++        throw new AliasRedirectLoopError(
++          `[Alias] internal redirect loop: ${physicalPath}`,
++        )
++      }
++    }
++  }
++
+   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+     const clean = this.cleanPath(physicalPath)
+-    const { listItems } = await import("../../internal/op/storage")
++    const storageModule = await this.storageModule()
++    const { listItems } = storageModule
+ 
+     if (clean === "/" && this.rootOrder.length > 1) {
+       const items: FileItem[] = []
+@@ -210,30 +255,45 @@ export class AliasDriver implements StorageDriver {
+       return []
+     }
+ 
+-    const mergedMap = new Map<string, FileItem>()
++    // r65 补丁 83（缺陷 C）：list 与 get 同源，自指必须一起拦。
++    await this.assertTargetsNotSelf(targets, storageModule, physicalPath)
+ 
+-    for (const target of targets) {
+-      try {
+-        const res = await listItems(target.targetFullPath)
+-        for (const item of res.content) {
+-          if (!mergedMap.has(item.name)) {
+-            mergedMap.set(item.name, item)
++    const guarded = this.storageId == null
++    if (guarded && this.activeDepth >= MAX_ALIAS_DEPTH) {
++      throw new AliasRedirectLoopError(
++        `[Alias] internal redirect loop: ${physicalPath}`,
++      )
++    }
++    if (guarded) this.activeDepth++
++    try {
++      const mergedMap = new Map<string, FileItem>()
++
++      for (const target of targets) {
++        try {
++          const res = await listItems(target.targetFullPath)
++          for (const item of res.content) {
++            if (!mergedMap.has(item.name)) {
++              mergedMap.set(item.name, item)
++            }
+           }
++        } catch (e) {
++          if (e instanceof AliasRedirectLoopError) throw e
++          console.warn(
++            `[Alias] listing target ${target.targetFullPath} warning:`,
++            e,
++          )
+         }
+-      } catch (e) {
+-        console.warn(
+-          `[Alias] listing target ${target.targetFullPath} warning:`,
+-          e,
+-        )
+       }
+-    }
+ 
+-    const items = Array.from(mergedMap.values())
+-    return sortFileItems(
+-      items,
+-      this.addition.order_by,
+-      this.addition.order_direction,
+-    )
++      const items = Array.from(mergedMap.values())
++      return sortFileItems(
++        items,
++        this.addition.order_by,
++        this.addition.order_direction,
++      )
++    } finally {
++      if (guarded) this.activeDepth--
++    }
+   }
+ 
+   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
+@@ -259,27 +319,43 @@ export class AliasDriver implements StorageDriver {
+     }
+ 
+     const storage = await this.storageModule()
+-    let realError: any = null
++    // r65 补丁 83（缺陷 C）：取到目标后先判自指，再进入候选循环。
++    await this.assertTargetsNotSelf(targets, storage, physicalPath)
+ 
+-    for (const target of targets) {
+-      try {
+-        const res = await storage.getItem(target.targetFullPath)
+-        if (res?.item) {
+-          return {
+-            ...res.item,
+-            raw_url: res.item.raw_url || res.rawUrl,
++    const guarded = this.storageId == null
++    if (guarded && this.activeDepth >= MAX_ALIAS_DEPTH) {
++      throw new AliasRedirectLoopError(
++        `[Alias] internal redirect loop: ${physicalPath}`,
++      )
++    }
++    if (guarded) this.activeDepth++
++    try {
++      let realError: any = null
++
++      for (const target of targets) {
++        try {
++          const res = await storage.getItem(target.targetFullPath)
++          if (res?.item) {
++            return {
++              ...res.item,
++              raw_url: res.item.raw_url || res.rawUrl,
++            }
+           }
++          // 驱动返回空 item 同样按不存在处理，继续下一个候选。
++        } catch (e: any) {
++          // r65 补丁 83：环回错误不能被暂存/继续别的候选，直接上抛。
++          if (e instanceof AliasRedirectLoopError) throw e
++          // 缺失继续尝试下一个候选；真实错误（鉴权/网络/5xx）先记下，
++          // 全部候选失败后原样上抛，不把「网络故障」伪装成 404。
++          if (!isNotFoundError(e) && realError === null) realError = e
+         }
+-        // 驱动返回空 item 同样按不存在处理，继续下一个候选。
+-      } catch (e: any) {
+-        // 缺失继续尝试下一个候选；真实错误（鉴权/网络/5xx）先记下，
+-        // 全部候选失败后原样上抛，不把「网络故障」伪装成 404。
+-        if (!isNotFoundError(e) && realError === null) realError = e
+       }
+-    }
+ 
+-    if (realError) throw realError
+-    throw new AliasNotFoundError(`[Alias] not found: ${physicalPath}`)
++      if (realError) throw realError
++      throw new AliasNotFoundError(`[Alias] not found: ${physicalPath}`)
++    } finally {
++      if (guarded) this.activeDepth--
++    }
+   }
+ 
+   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
+diff --git a/src/backend/drivers/alias/loop-guard.test.ts b/src/backend/drivers/alias/loop-guard.test.ts
+new file mode 100644
+index 0000000..0f1fb94
+--- /dev/null
++++ b/src/backend/drivers/alias/loop-guard.test.ts
+@@ -0,0 +1,93 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { AliasDriver } from "./driver"
++import { AliasRedirectLoopError } from "../../pkg/errs"
++
++/**
++ * r65 补丁 83 单测桩：resolvePath 按 resolveTo 返回目标存储 id；
++ * getItem / listItems 只记调用，用于断言「环回时零底层调用」。
++ */
++class LoopStubDriver extends AliasDriver {
++  calls: string[] = []
++  resolveTo = "s1"
++  itemName = "x"
++
++  // 覆写放宽为 public：兜底深度用例需要在实例上替换 storageModule。
++  async storageModule(): Promise<any> {
++    const calls = this.calls
++    const self = this
++    return {
++      resolvePath: async (p: string) => {
++        calls.push(`storage.resolvePath:${p}`)
++        return { storage: { id: self.resolveTo }, isVirtual: false }
++      },
++      getItem: async (p: string) => {
++        calls.push(`storage.getItem:${p}`)
++        return { item: { name: self.itemName, size: 1 } }
++      },
++      listItems: async (p: string) => {
++        calls.push(`storage.listItems:${p}`)
++        return { content: [] }
++      },
++    }
++  }
++}
++
++test("p2-86 自指 alias：get 与 list 均抛 AliasRedirectLoopError，且不进入底层", async () => {
++  const d = new LoopStubDriver({ paths: "/x" } as any, { id: "s1" })
++  await assert.rejects(() => d.get("/v/x", "/x"), AliasRedirectLoopError)
++  await assert.rejects(() => d.list("/v/x", "/x"), AliasRedirectLoopError)
++  assert.deepEqual(
++    d.calls.filter(
++      (c) => c.startsWith("storage.getItem:") || c.startsWith("storage.listItems:"),
++    ),
++    [],
++  )
++})
++
++test("p2-86 正常 alias 链不误杀：目标是别的存储时 get 正常返回", async () => {
++  const d = new LoopStubDriver({ paths: "/x" } as any, { id: "s1" })
++  d.resolveTo = "s2"
++  const item = await d.get("/v/x", "/x")
++  assert.equal(item.name, "x")
++})
++
++test("p2-86 三级别名链 s1->s2->s3 每层只解析到不同 id，全部放行", async () => {
++  const d1 = new LoopStubDriver({ paths: "/x" } as any, { id: "s1" })
++  d1.resolveTo = "s2"
++  const d2 = new LoopStubDriver({ paths: "/x" } as any, { id: "s2" })
++  d2.resolveTo = "s3"
++  const d3 = new LoopStubDriver({ paths: "/x" } as any, { id: "s3" })
++  d3.resolveTo = "l1"
++  for (const d of [d1, d2, d3]) {
++    const item = await d.get("/v/x", "/x")
++    assert.equal(item.name, "x")
++  }
++})
++
++test("p2-86 无 storageConfig 时嵌套超过 8 层触发兜底错误", async () => {
++  const d = new LoopStubDriver({ paths: "/x" } as any)
++  let hits = 0
++  const base = d.storageModule.bind(d)
++  ;(d as any).storageModule = async () => {
++    const mod = await base()
++    return {
++      ...mod,
++      getItem: async (_p: string) => {
++        hits++
++        await d.get("/v/x", "/x")
++        return { item: { name: "x", size: 1 } }
++      },
++    }
++  }
++  await assert.rejects(() => d.get("/v/x", "/x"), AliasRedirectLoopError)
++  assert.equal(hits, 8)
++})
++
++test("p2-86 两个独立实例的兜底计数互不污染", async () => {
++  const a = new LoopStubDriver({ paths: "/x" } as any)
++  const b = new LoopStubDriver({ paths: "/x" } as any)
++  const res = await Promise.all([a.get("/v/x", "/x"), b.get("/v/x", "/x")])
++  assert.equal(res.length, 2)
++})
+diff --git a/src/backend/internal/op/storage.ts b/src/backend/internal/op/storage.ts
+index c876b74..5cbc6e9 100644
+--- a/src/backend/internal/op/storage.ts
++++ b/src/backend/internal/op/storage.ts
+@@ -90,6 +90,10 @@ import { AListV3Driver } from "../../drivers/alist_v3/driver"
+ import { UrlTreeDriver } from "../../drivers/url_tree/driver"
+ import { StrmDriver } from "../../drivers/strm/driver"
+ import { ChunkDriver } from "../../drivers/chunk/driver"
++
++// r65 补丁 83：alias 驱动的自指判定通过 storageModule() 拿解析器，
++// 不新增 import 边。
++export { resolvePath }
+ import { AzureBlobDriver } from "../../drivers/azure_blob/driver"
+ import { UssDriver } from "../../drivers/uss/driver"
+ import { AliDocDriver } from "../../drivers/alidoc/driver"
+@@ -1026,7 +1030,7 @@ async function createDriver(
+     await driver.init?.()
+   } else if (normDriver === "alias" || normDriver.includes("alias")) {
+     const addition = parseAddition(storageConfig)
+-    driver = new AliasDriver(addition)
++    driver = new AliasDriver(addition, storageConfig)
+     await driver.init?.()
+   } else if (normDriver === "dropbox" || normDriver.includes("dropbox")) {
+     const addition = parseAddition(storageConfig)
+diff --git a/src/backend/pkg/errs.ts b/src/backend/pkg/errs.ts
+index 9c6ee56..0218344 100644
+--- a/src/backend/pkg/errs.ts
++++ b/src/backend/pkg/errs.ts
+@@ -111,6 +111,22 @@ export class SsrfTargetBlockedError extends Error {
+   }
+ }
+ 
++/**
++ * r65 补丁 83（缺陷 C）：alias 目标解析回自身存储（内部重定向环回）。
++ *
++ * 独立类型：不能继承 AliasNotFoundError（带 404，会被 isSourceMissing 吃掉），
++ * 也不复用 AliasPermissionError；调用方一律映射 403
++ * "internal redirect loop"。
++ */
++export class AliasRedirectLoopError extends Error {
++  code = 403
++
++  constructor(message: string) {
++    super(message)
++    this.name = "AliasRedirectLoopError"
++  }
++}
++
+ /**
+  * 「不存在」类错误判定：alias 驱动逐候选回退时用（code 优先，文案兜底）。
+  * 只用于决定是否继续尝试下一个候选；真实错误仍按原类型上抛，不在这里吞掉。
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index 3ee52e5..bae0fc1 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -17,7 +17,11 @@ import {
+   signDownloadPath,
+   getSignExpiresIn,
+ } from "../pkg/sign"
+-import { SsrfTargetBlockedError, safeErrorMessage } from "../pkg/errs"
++import {
++  AliasRedirectLoopError,
++  SsrfTargetBlockedError,
++  safeErrorMessage,
++} from "../pkg/errs"
+ import { assertStorageEndpointSafe } from "../pkg/ssrf-endpoint"
+ import { encodeDownloadPath } from "../pkg/path"
+ import {
+@@ -842,6 +846,12 @@ rawRouter.get("/*", async (c) => {
+             )
+           }
+         } catch (e: any) {
++          // r65 补丁 83（缺陷 C）：驱动层自指环回，按 403 截断；
++          // 响应体与补丁 78 的 hop 截断完全一致，便于 bench 同关键字判定。
++          if (e instanceof AliasRedirectLoopError) {
++            console.warn(`[rawRouter] internal redirect loop for '${reqPath}'`)
++            return c.text("internal redirect loop", 403)
++          }
+           console.error(
+             `[rawRouter] Driver get failed for '${reqPath}':`,
+             e.message,
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index 06595da..14e7e4f 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -50,6 +50,7 @@ import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav
+ import {
+   AliasNotFoundError,
+   AliasPermissionError,
++  AliasRedirectLoopError,
+   SsrfTargetBlockedError,
+   safeErrorMessage,
+ } from "../pkg/errs"
+@@ -382,6 +383,8 @@ export function webdavErrorResponse(c: any, e: any): Response {
+   if (e instanceof AliasNotFoundError) return c.text("Not Found", 404)
+   if (e instanceof AliasPermissionError)
+     return c.text(safeErrorMessage(e), 403)
++  if (e instanceof AliasRedirectLoopError)
++    return c.text("internal redirect loop", 403)
+   if (e instanceof SsrfTargetBlockedError)
+     return c.text(safeErrorMessage(e), 403)
+   return c.text(safeErrorMessage(e), 500)

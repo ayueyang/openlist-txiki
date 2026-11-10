@@ -7,21 +7,26 @@
 
 不是 OpenList Go 版的重写。上游的存储驱动、WebDAV、分享、任务逻辑都保留，只把运行时从 Workers 换成 txiki.js。
 
-## 本版（0.1.0-r63）
+## 本版（0.1.0-r65）
 
-- 补丁栈 77 条。第 77 条修 r62 的 G13 设备侧缺陷 A：alias 候选探测从 `listItems` 改为 `getItem` 的 stat 语义。此前 Local 把缺失目录的 readdir 失败吞成空列表，空列表被当成存在，多 target 可写 alias 的 PUT/MKDIR 恒判 `multiple targets`；本版按候选实际存在性选择，DAV 写路径同步恢复。
-- 静态门 G1-G9 / G12 / G13-G16 全绿；tsc 23 条与 r62 基线相同；G12 四包扫描全空。
-- G13 设备复验 38/38：隔离实例、全新数据目录，PUT / MKDIR / DAV PUT 三条写路径全部恢复（r62 分别为 403 / 403 / 500）；双候选同名保护仍 403 且零落盘。
-- 设备实测（Nokia XG-040G-MF）：r62 到 r63 升级用时 186 s；reboot 后 5244 首 200 60,586 ms、5344 58,829 ms；空闲 5 分钟 VmRSS 21,248 kB；64 MiB 单流中位 27.73 MiB/s；装机 du 60,468 kB。
+- 补丁栈 83 条。本版修 r64 设备门暴露的五条问题（S1-C5、S1-C6、S1-C8、S2-C2、S3-C3），全部转 PASS：
+  - 私网目标在驱动取链前拦截：指向内网地址的取链请求返回 403，不再挂起十几秒（补丁 82）。
+  - alias 自指环回在 `/dav` 与驱动层同样拦住：返回 403 internal redirect loop，不再挂起（补丁 83）。
+  - alias 的 move / copy 目标探测改用虚拟目标目录：目标不存在时与 rename 一致返回 200 且内容不变，此前返回 403 no target found（补丁 81）。
+- 随本版一并发布 r64 缺陷批补丁 78 / 79 / 80：alias 内部调度、alias `get()` 的 stat 语义、DAV 写错误映射。
+- 设备门 85 项：83 PASS、2 UNVERIFIED（构建期单测，已由静态门定向单测闭合）、0 FAIL；四个变体设备烟测 76/76。
+- 设备实测（Nokia XG-040G-MF）：r63 升级 r65 后重启一次，5244 首个 200 62,438 ms、5344 59,244 ms；空闲 VmRSS 5244 20,296 kB、5344 15,028 kB；挂载 6、账号 2、根目录与升级前一致。
 
 ### 本版已知限制
 
-- 缺陷 B（alias `get()` 返回占位 item，导致 rename/move/copy 403）、缺陷 C（alias 挂载下载 403，相对 `raw_url` 被 SSRF 断言拦）、缺陷 D（DAV 写拒绝回 500 而非 403）不在本版，下一版修复。
+- 源码归档内 `README.md` 的「本版」段仍是 r63 文本（版本串与补丁计数已更新，正文未重写）；以本页为准。
+- 本版未重出 Linux / Windows 桌面归档；需要桌面版的用 r57 的归档或从源码自建。
+- 139 与阿里云盘分享的写方法仍只有本地 mock 证据，未在真实账号上验证。
+- 天翼 189 依赖登录链路（curl 兜底），IP 变化会自动重登；遇滑块需人工过一次。
 - G15 KNOWN：tjs 运行期 crypto 为空壳，123_open 直链签名落 `raw_url_error`；不影响列表。
 - 设备侧 tjs 实为 26.9.0-r3（发布包带 r4；`min_version 26.9.0` 通过；r3 与 r4 的差异未验证）。
 - apk 未签名。
 - 默认只监听 `127.0.0.1:5345` 等限制沿用前版，见下文。
-
 ## 现在能做什么
 
 在 Nokia XG-040G-MF（Airoha AN7583DT，双核 A53，512MB RAM）上实测过：
@@ -103,7 +108,7 @@ tjs run openlist-txiki.js
 
 ## 从源码构建
 
-见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、77 个应用补丁、tjs 运行时补丁全集（apply 顺序见 patches/txiki/TXIKI-PATCHES.md，其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
+见 [`docs/BUILD.md`](docs/BUILD.md)：固定上游 commit、83 个应用补丁、tjs 运行时补丁全集（apply 顺序见 patches/txiki/TXIKI-PATCHES.md，其中 1 个仅 aarch64-windows 用，本版三目标不发）、构建脚本与校验方式都在仓库里。
 
 ## 许可证
 

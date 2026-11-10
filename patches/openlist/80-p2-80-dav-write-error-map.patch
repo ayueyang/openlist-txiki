@@ -1,0 +1,118 @@
+diff --git a/src/backend/server/webdav-error-map.test.ts b/src/backend/server/webdav-error-map.test.ts
+new file mode 100644
+index 0000000..6715940
+--- /dev/null
++++ b/src/backend/server/webdav-error-map.test.ts
+@@ -0,0 +1,58 @@
++/**
++ * r64 补丁 80（缺陷 D）单测：DAV 写方法共用的外层错误映射。
++ *
++ * 修前：webdav 外层 catch 只认路径拒绝 403 与源缺失 404，AliasPermissionError
++ * （writable=false、protect_same_name 多 target）落进 500 兜底，把「客户端被
++ * 拒绝」说成「服务端故障」。修后按类型补 403/404，其余仍 500。
++ *
++ * 直接调 webdavErrorResponse，用最小 Hono context 桩，不发网络请求。
++ */
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { webdavErrorResponse } from "./webdav"
++import { AliasNotFoundError, AliasPermissionError } from "../pkg/errs"
++import { PathRejectedError } from "../pkg/canonical-path"
++
++const ctx = () =>
++  ({
++    text: (body: string, status: number) => new Response(body, { status }),
++  }) as any
++
++test("r64 补丁 80：路径拒绝仍 403", () => {
++  const res = webdavErrorResponse(ctx(), new PathRejectedError("relative-path"))
++  assert.equal(res.status, 403)
++})
++
++test("r64 补丁 80：AliasNotFoundError 映射 404", () => {
++  const res = webdavErrorResponse(
++    ctx(),
++    new AliasNotFoundError("[Alias] not found: /x"),
++  )
++  assert.equal(res.status, 404)
++})
++
++test("r64 补丁 80：AliasPermissionError（writable=false）映射 403 且文案保留", async () => {
++  const res = webdavErrorResponse(
++    ctx(),
++    new AliasPermissionError("[Alias] writable=false: put denied"),
++  )
++  assert.equal(res.status, 403)
++  assert.equal(await res.text(), "[Alias] writable=false: put denied")
++})
++
++test("r64 补丁 80：AliasPermissionError（multiple targets）映射 403", async () => {
++  const res = webdavErrorResponse(
++    ctx(),
++    new AliasPermissionError(
++      "[Alias] protect_same_name: multiple targets for /dir1",
++    ),
++  )
++  assert.equal(res.status, 403)
++  assert.match(await res.text(), /multiple targets for/)
++})
++
++test("r64 补丁 80：普通 Error 仍 500", () => {
++  const res = webdavErrorResponse(ctx(), new Error("driver exploded"))
++  assert.equal(res.status, 500)
++})
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index 00112cf..7beac3e 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -47,7 +47,12 @@ import {
+   beginUpload,
+ } from "../internal/op/storage"
+ import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav/webdav"
+-import { safeErrorMessage } from "../pkg/errs"
++import {
++  AliasNotFoundError,
++  AliasPermissionError,
++  safeErrorMessage,
++} from "../pkg/errs"
++
+ import { encodeDownloadPath } from "../pkg/path"
+ import { isStorageNotFoundError } from "./fs"
+ 
+@@ -359,6 +364,24 @@ async function sourceStep<T>(call: () => Promise<T>): Promise<T> {
+   }
+ }
+ 
++/**
++ * r64 补丁 80（缺陷 D）：DAV 写方法共用的外层错误映射。
++ *
++ * PUT/MKCOL/DELETE/MOVE/COPY 全在同一个 try 里，sourceStep 只把「源缺失」
++ * 转成 SourceMissingError，其它错误原样冒泡，所以在这里按类型补分支即可
++ * 覆盖五个写方法。顺序先具体后兜底：
++ *   路径拒绝 403 → 源缺失 404 → alias 缺失 404 → alias 权限/同名 403 → 500。
++ * 不做字符串匹配，避免把驱动真实错误吞成 4xx。
++ */
++export function webdavErrorResponse(c: any, e: any): Response {
++  if (isPathRejected(e)) return c.text("Forbidden", 403)
++  if (e instanceof SourceMissingError) return c.text("Not Found", 404)
++  if (e instanceof AliasNotFoundError) return c.text("Not Found", 404)
++  if (e instanceof AliasPermissionError)
++    return c.text(safeErrorMessage(e), 403)
++  return c.text(safeErrorMessage(e), 500)
++}
++
+ webdavRouter.all("/*", async (c) => {
+   const method = c.req.method.toUpperCase()
+ 
+@@ -651,8 +674,7 @@ webdavRouter.all("/*", async (c) => {
+     // ENOENT/ENOTDIR 与 "... not found" 文案一律按原样回 500，报文仍经
+     // safeErrorMessage 输出。A10 四形态走 fs.ts 的 writeFailure，不经这里。
+     // P1-18：路径被拒绝（纵深调用里抛出的 PathRejectedError）一律 403。
+-    if (isPathRejected(e)) return c.text("Forbidden", 403)
+-    if (e instanceof SourceMissingError) return c.text("Not Found", 404)
+-    return c.text(safeErrorMessage(e), 500)
++    // r64 补丁 80（缺陷 D）：alias 写拒绝按类型映射 403/404，不再兜成 500。
++    return webdavErrorResponse(c, e)
+   }
+ })

@@ -1,0 +1,289 @@
+diff --git a/src/backend/pkg/errs.ts b/src/backend/pkg/errs.ts
+index 9831309..9c6ee56 100644
+--- a/src/backend/pkg/errs.ts
++++ b/src/backend/pkg/errs.ts
+@@ -95,6 +95,22 @@ export class AliasNotFoundError extends Error {
+   }
+ }
+ 
++/**
++ * r65 补丁 82（缺陷 B）：存储 endpoint 命中私网/环回/元数据地址。
++ *
++ * 读路径在调用驱动之前抛出，调用方按类型映射 403；消息原样保留
++ * assertSafeUrl 的文案（必须含 "SSRF protection"）。不继承
++ * AliasPermissionError，也不复用 AliasNotFoundError 的 404 码。
++ */
++export class SsrfTargetBlockedError extends Error {
++  code = 403
++
++  constructor(message: string) {
++    super(message)
++    this.name = "SsrfTargetBlockedError"
++  }
++}
++
+ /**
+  * 「不存在」类错误判定：alias 驱动逐候选回退时用（code 优先，文案兜底）。
+  * 只用于决定是否继续尝试下一个候选；真实错误仍按原类型上抛，不在这里吞掉。
+diff --git a/src/backend/pkg/http.ts b/src/backend/pkg/http.ts
+index 84303b3..453ae50 100644
+--- a/src/backend/pkg/http.ts
++++ b/src/backend/pkg/http.ts
+@@ -446,7 +446,7 @@ export function extractTrustedHosts(addition: any): Set<string> {
+  * 从一段字符串（完整 URL 或裸 host[:port]）提取 hostname。
+  * 失败返回 undefined。
+  */
+-function hostFromValue(raw: string): string | undefined {
++export function hostFromValue(raw: string): string | undefined {
+   const val = raw.trim()
+   if (!val) return undefined
+   // 有 scheme 直接用，没有则补 http://（覆盖 "192.168.1.10:9000" 这类 endpoint）
+diff --git a/src/backend/pkg/ssrf-endpoint.test.ts b/src/backend/pkg/ssrf-endpoint.test.ts
+new file mode 100644
+index 0000000..911248f
+--- /dev/null
++++ b/src/backend/pkg/ssrf-endpoint.test.ts
+@@ -0,0 +1,62 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { assertStorageEndpointSafe, collectEndpointUrls } from "./ssrf-endpoint"
++import { SsrfTargetBlockedError } from "./errs"
++
++test("p2-85 私网目标抛 SsrfTargetBlockedError，文案含 SSRF protection", () => {
++  assert.throws(
++    () => assertStorageEndpointSafe({ address: "http://10.255.255.1/x" }),
++    (e: any) => {
++      assert.ok(e instanceof SsrfTargetBlockedError, "错误类型")
++      assert.match(e.message, /SSRF protection/)
++      return true
++    },
++  )
++})
++
++test("p2-85 公网目标放行", () => {
++  assert.doesNotThrow(() =>
++    assertStorageEndpointSafe({ address: "https://dav.example.com/x" }),
++  )
++})
++
++test("p2-85 放行只认显式 allow：10.255.255.1 放行，只给 127.0.0.1 时仍拒绝", () => {
++  assert.doesNotThrow(() =>
++    assertStorageEndpointSafe(
++      { address: "http://10.255.255.1/x" },
++      { SSRF_ALLOWED_HOSTS: "10.255.255.1" },
++    ),
++  )
++  assert.throws(
++    () =>
++      assertStorageEndpointSafe(
++        { address: "http://10.255.255.1/x" },
++        { SSRF_ALLOWED_HOSTS: "127.0.0.1" },
++      ),
++    SsrfTargetBlockedError,
++  )
++})
++
++test("p2-85 裸 host:port 与 JSON 字符串 addition 都能识别", () => {
++  assert.deepEqual(collectEndpointUrls({ address: "192.168.1.10:9000" }), [
++    "http://192.168.1.10:9000",
++  ])
++  assert.throws(
++    () => assertStorageEndpointSafe('{"address":"192.168.1.10:9000"}'),
++    SsrfTargetBlockedError,
++  )
++})
++
++test("p2-85 本地路径与空串不产生候选、不抛错", () => {
++  for (const addition of [
++    { address: "/mnt/usb" },
++    { address: "/loopA/sub" },
++    { address: "" },
++    {},
++    null,
++  ]) {
++    assert.deepEqual(collectEndpointUrls(addition), [])
++    assert.doesNotThrow(() => assertStorageEndpointSafe(addition))
++  }
++})
+diff --git a/src/backend/pkg/ssrf-endpoint.ts b/src/backend/pkg/ssrf-endpoint.ts
+new file mode 100644
+index 0000000..0d84463
+--- /dev/null
++++ b/src/backend/pkg/ssrf-endpoint.ts
+@@ -0,0 +1,84 @@
++/**
++ * 存储 endpoint 的 SSRF 前置判定（r65 补丁 82，计划条目 p2-85）。
++ *
++ * 背景：部分驱动（如 webdav）的 get() 内部会先向 addition.address 连网，
++ * 守卫若只挂在 driver.get 返回 raw_url 之后的代理层，请求会先挂到超时。
++ * 因此读路径必须在调用驱动之前按 addition 的字面量判定。
++ *
++ * 约束（判据 S1-C5/S1-C6）：
++ * - 白名单只认显式环境变量 SSRF_ALLOWED_HOSTS（精确 host），不采用由
++ *   addition 自动推导的受信 host —— 后者会让任何管理员配置的私网 endpoint
++ *   无条件通过，正是 S1-C5 的反例。
++ * - 纯函数：不联网、不做 DNS、不读请求头、不读 site_url。
++ */
++import { assertSafeUrl, hostFromValue, parseAllowHostsEnv } from "./http"
++import { SsrfTargetBlockedError } from "./errs"
++
++const HOST_KEY_RE =
++  /(url|host|address|endpoint|server|domain|site|base|gateway|api)/i
++
++/**
++ * 单个字段值 → 绝对 URL；不是 endpoint 形态时返回 undefined。
++ *
++ * hostFromValue 对 "/mnt/usb" 会给 host="mnt"（WHATWG URL 把首段当 authority），
++ * 本地路径不是 endpoint，这里先按形态排除，避免把挂载路径误判成主机。
++ */
++function endpointUrlOf(value: string): string | undefined {
++  const trimmed = value.trim()
++  if (!trimmed) return undefined
++  if (trimmed.startsWith("/") || trimmed.startsWith("./")) return undefined
++  if (/^[A-Za-z]:[\\/]/.test(trimmed)) return undefined
++  if (!hostFromValue(trimmed)) return undefined
++  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
++    ? trimmed
++    : `http://${trimmed}`
++}
++
++function walk(node: any, out: string[]): void {
++  if (node == null || typeof node !== "object") return
++  for (const [key, val] of Object.entries(node)) {
++    if (typeof val === "string") {
++      if (!HOST_KEY_RE.test(key)) continue
++      const url = endpointUrlOf(val)
++      if (url) out.push(url)
++    } else if (val != null && typeof val === "object") {
++      walk(val, out)
++    }
++  }
++}
++
++/** 汇总 addition 里所有可解析成 host 的候选 URL（去重，保持首次出现顺序）。 */
++export function collectEndpointUrls(addition: any): string[] {
++  if (addition == null) return []
++  let obj = addition
++  if (typeof addition === "string") {
++    try {
++      obj = JSON.parse(addition)
++    } catch {
++      return []
++    }
++  }
++  if (typeof obj !== "object" || obj === null) return []
++  const out: string[] = []
++  walk(obj, out)
++  return Array.from(new Set(out))
++}
++
++/**
++ * 读路径前置守卫：任一候选 URL 命中私网/环回/元数据地址即抛
++ * SsrfTargetBlockedError（403）。没有候选时直接返回，不改动无法识别
++ * endpoint 的驱动行为。
++ */
++export function assertStorageEndpointSafe(addition: any, env?: any): void {
++  const urls = collectEndpointUrls(addition)
++  if (urls.length === 0) return
++  const raw = env?.["SSRF_ALLOWED_HOSTS"]
++  const allow = parseAllowHostsEnv(typeof raw === "string" ? raw : "")
++  for (const url of urls) {
++    try {
++      assertSafeUrl(url, "SSRF protection", allow)
++    } catch (e: any) {
++      throw new SsrfTargetBlockedError(String(e?.message || e))
++    }
++  }
++}
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index 2600352..3ee52e5 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -17,7 +17,8 @@ import {
+   signDownloadPath,
+   getSignExpiresIn,
+ } from "../pkg/sign"
+-import { safeErrorMessage } from "../pkg/errs"
++import { SsrfTargetBlockedError, safeErrorMessage } from "../pkg/errs"
++import { assertStorageEndpointSafe } from "../pkg/ssrf-endpoint"
+ import { encodeDownloadPath } from "../pkg/path"
+ import {
+   canonicalizePath,
+@@ -631,6 +632,21 @@ rawRouter.get("/*", async (c) => {
+           // 管理员配置的受信存储 endpoint host（可能是内网自建 S3/WebDAV/MinIO），
+           // 加上全局环境变量 SSRF_ALLOWED_HOSTS，合并为 SSRF 白名单，避免被误拦截。
+           const trustedHosts = getTrustedHosts(resolved.storage.addition, c.env)
++          // r65 补丁 82（缺陷 B）：driver.get() 内部就可能先向 addition 的
++          // endpoint 连网（webdav 的 stat 就是 PROPFIND），代理层的 SSRF 守卫
++          // 永远走不到；必须在取缓存与实例化驱动之前按字面量判定。白名单只认
++          // 显式 SSRF_ALLOWED_HOSTS，不用 addition 推导出的受信 host。
++          try {
++            assertStorageEndpointSafe(resolved.storage.addition, c.env)
++          } catch (e: any) {
++            if (e instanceof SsrfTargetBlockedError) {
++              console.warn(
++                `[rawRouter] SSRF blocked for '${reqPath}': ${e.message}`,
++              )
++              return c.text(e.message, 403)
++            }
++            throw e
++          }
+           // 下载链接缓存：与 /fs/get 共用同一份缓存（键 = storage + 虚拟路径）。
+           // 命中时直接复用直链，跳过驱动换链（网盘侧通常最贵、最易被限流）。
+           const cacheTarget: CacheTarget = {
+diff --git a/src/backend/server/webdav.ts b/src/backend/server/webdav.ts
+index 7beac3e..06595da 100644
+--- a/src/backend/server/webdav.ts
++++ b/src/backend/server/webdav.ts
+@@ -50,8 +50,11 @@ import { buildWebDavPropfindResponse, type WebDavItem } from "../internal/webdav
+ import {
+   AliasNotFoundError,
+   AliasPermissionError,
++  SsrfTargetBlockedError,
+   safeErrorMessage,
+ } from "../pkg/errs"
++import { assertStorageEndpointSafe } from "../pkg/ssrf-endpoint"
++import { resolvePath } from "../internal/model/db"
+ 
+ import { encodeDownloadPath } from "../pkg/path"
+ import { isStorageNotFoundError } from "./fs"
+@@ -379,6 +382,8 @@ export function webdavErrorResponse(c: any, e: any): Response {
+   if (e instanceof AliasNotFoundError) return c.text("Not Found", 404)
+   if (e instanceof AliasPermissionError)
+     return c.text(safeErrorMessage(e), 403)
++  if (e instanceof SsrfTargetBlockedError)
++    return c.text(safeErrorMessage(e), 403)
+   return c.text(safeErrorMessage(e), 500)
+ }
+ 
+@@ -460,6 +465,14 @@ webdavRouter.all("/*", async (c) => {
+         // 的上传、回读、改名、复制、单文件删除全被这一层挡住（见 progress.md）。
+         // 不存在的路径由驱动 get() 抛错（Local 的 ENOENT、云端的 not found），经
+         // sourceStep 的统一映射回 404；虚拟路径与存储根由 getItem 直接判为目录。
++        // r65 补丁 82（缺陷 B）：直连的私网 Webdav 在 getItem 内部就会连网；
++        // 守卫必须在这里、进入驱动之前判定，否则请求先挂到超时（S1-C5）。
++        {
++          const resolved = await resolvePath(actualPath, c.env)
++          if (resolved?.storage && resolved.isVirtual === false) {
++            assertStorageEndpointSafe(resolved.storage.addition, c.env)
++          }
++        }
+         const { item } = await sourceStep(() => getItem(actualPath, ctx))
+         if (!item) return c.text("Not found", 404)
+         const isFolder = !!item.is_dir
+@@ -495,6 +508,14 @@ webdavRouter.all("/*", async (c) => {
+         if (await deniedByMetaRead(c, user, actualPath, metaPassword)) {
+           return metaForbidden(c)
+         }
++        // r65 补丁 82（缺陷 B）：直连的私网 Webdav 在 getItem 内部就会连网；
++        // 守卫必须在这里、进入驱动之前判定，否则请求先挂到超时（S1-C5）。
++        {
++          const resolved = await resolvePath(actualPath, c.env)
++          if (resolved?.storage && resolved.isVirtual === false) {
++            assertStorageEndpointSafe(resolved.storage.addition, c.env)
++          }
++        }
+         const { item, rawUrl } = await sourceStep(() => getItem(actualPath, ctx))
+         if (!item) return c.text("Not found", 404)
+         if (item.is_dir) return c.text("Is a directory", 400)

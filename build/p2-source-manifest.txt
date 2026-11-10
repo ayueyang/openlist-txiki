@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 77
+patch_count 83
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -232,7 +232,7 @@ file 14d2bb7f4aa2a83b7dca39d10c90e64ef0ad3015c88645258fdcfdc52f178ac8 src/backen
 file ed5f0715357ce95f9c1fa0a3a95f99b70cb19a07fdae624546901923f1287579 src/backend/internal/model/store/format/sql.ts src=patch strip_header=no eol=crlf
 file 6ca8a294ed3d7ddbcf1e153174b11b21a050d791eb999437bae13bb2edc6cedf src/backend/internal/model/store/schema.ts src=patch strip_header=no eol=crlf
 file 11ec372c1e66eca40d09633a6725f0b6773293b9de283092cefaf0d6c9f18c40 src/backend/internal/model/store/store.test.ts src=patch strip_header=no eol=crlf
-file db5bb81b75f9bdefb17b01725730e25e5a7860505b420f965a6d2cfc39819466 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
+file 2bb4b24a9f1b6f4aa93dbe15cae8500a4b5fa8883efe637b3672ed71c5c3eee8 src/backend/internal/op/storage.ts src=patch strip_header=no eol=lf
 file bf75262a8886500362eef6ef78e19849a2a731672cb9414ad759510b7c1ceabe src/backend/internal/driver/proxy.ts src=patch strip_header=no eol=crlf
 file dba8e1839561d5d02e6479b0478732cfa339d20ee8edbde6ebbb0cc015205b98 src/backend/drivers/115cookie/types.ts src=repo strip_header=no eol=lf
 file 5003109757d979ef765f6c6ef038c844c12ac37873e42d605393e62b6242ce95 src/backend/drivers/115cookie/crypto.ts src=repo strip_header=no eol=lf
@@ -246,14 +246,14 @@ file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backen
 file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
-file 5339a30b91092efbdb4887b00bf6b85ca297b56b3d6f982bb3fd42f7459d1b37 src/backend/server/fs.ts src=patch strip_header=no eol=crlf
+file 549384641c6d22a066db9e55b40ac1366631f128ecf52fb55bd4117e8ba6127e src/backend/server/fs.ts src=patch strip_header=no eol=crlf
 file 30624da17d1f0c495e10bb38c55ad71e7dcd17a437a0b0a5bdcd445e32b58850 src/backend/server/proxy_request.ts src=patch strip_header=no eol=crlf
-file d24a2dc841d324f1d12cb881bb9abbcb00282a7f31d352bc4bf3ea642bea6d7b src/backend/server/raw.ts src=patch strip_header=no eol=lf
+file 85f019f62b5d674a47afae8d32b9ad35ae1055b2ce9eb3315e30f380e0073a57 src/backend/server/raw.ts src=patch strip_header=no eol=lf
 file 4c68d18731823f20feae845d1110339a4129036ec5c40cbcec7db9c1adbc9e32 src/backend/server/share.ts src=patch strip_header=no eol=crlf
 file fc71743dcfa08be936e42abad1d6914300017d73c614eaf088ca2d5b8fce7ac4 src/backend/server/task.ts src=patch strip_header=no eol=crlf
-file 2ec103b2ac1bb36af306a77fc643f34c16dbd85e894221428e69a6808356a3cd src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
+file d256eea2c69e55ff1eaeade500c04c6a456ab9c797ee41b9d5b27d2a466d152d src/backend/server/webdav.ts src=patch strip_header=no eol=crlf
 file 8766bfc8d93bf7fe7bcc9f4491ef5e22b592127e7a8b1b2cc6a7c5e4c2399da8 src/backend/txiki/config.ts src=repo strip_header=yes eol=crlf
-file e2a19d883ba697a079609d98c6f32e1f3f5af7772621bb76053735054b642c90 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
+file 708ffa1e541c3aff731c050d6a2b739fa9094e68c0e18b612813c11462a949c9 src/backend/txiki/entry.ts src=repo strip_header=no eol=crlf
 file b02020e17e8f4df17a3cb693f1ce4bde213e31a1cc6ede3b72a1d8d2bdc97ff5 src/backend/txiki/fetch-host.ts src=repo strip_header=no eol=lf
 file d50868832ba8764c755732669b7514e975b3fee1ddded29308012b834e9a79ce src/backend/txiki/guest-default.ts src=repo strip_header=yes eol=lf
 file a660a1619e951f87eb59aa83d83f4da1ed737ef87cc971cfe03a48e0490a0b64 src/backend/txiki/globals.ts src=repo strip_header=yes eol=lf
@@ -487,3 +487,37 @@ patch 76 b0ae18c44b832743549e1fbed28b9b1dce2b37811cca704d7a444afe9d9952b2 work/p
 #   1 候选返回该候选、>=2 候选 multiple targets 三条语义；write-gate.test.ts 增 Local
 #   同形桩与 0/1/2 候选、files 分支矩阵。不改 StorageDriver 接口、不实施缺陷 B。
 patch 77 0ed9b7a84182a8a137ce73505f03c4cbd029bc60796d431b15ec0255a438ab1f work/p2-77-g13-probe-exists.patch
+# 第 78 条（2026-11-09，r64 候选，缺陷 C）：alias 挂载下载 403。alias 把目标
+#   存储返回的相对 raw_url（/api/p/<目标挂载>/<文件>）原样透传，rawRouter 却把它
+#   当外网地址交给 safeProxyFetch；new URL() 对相对串抛错，isSafeUrl 回 false →
+#   403。修法：driver=alias 且 raw_url 命中本实例下载前缀时走进程内 dispatch
+#   （nonce hop 头、上限 3），绝对 URL 仍走原 SSRF 判定；不改 SSRF/白名单/alias
+#   驱动。新增 internal-dispatch.ts、raw-internal.test.ts、raw-alias-dispatch.test.ts。
+# 第 79 条（缺陷 B）：alias get() 占位 item 导致写预检恒真。get() 改 stat 语义：
+#   0 候选与全缺失抛 AliasNotFoundError，真实错误原样上抛，多 target 首成功；
+#   fs.ts 的 writeFailure 与 /get catch 映射 404。新增 get-stat.test.ts。
+# 第 80 条（缺陷 D）：DAV 写拒绝回 500。webdav 外层 catch 抽成
+#   webdavErrorResponse：路径拒绝 403、源缺失/AliasNotFound 404、
+#   AliasPermission 403、其余 500。新增 webdav-error-map.test.ts。
+patch 78 49c3ce0098ff35ee6c7f236097995cadf218022a0a9d4d46bd1bdfc7be51f6d1 work/p2-78-alias-internal-dispatch.patch
+patch 79 e44392ee7f4c696a8c443b88be75d608c35518116ae9fb7e8a3ede65650644a9 work/p2-79-alias-get-stat.patch
+patch 80 31f79108c6c5e2e675a092f0f4435ac58b04a2e1547c2730cf31cab0384f673e work/p2-80-dav-write-error-map.patch
+# 第 81 条（2026-11-10，r65 缺陷 A）：alias move/copy 目标探测用虚拟 dstDir。
+#   补丁 73 把 storage.ts 传下来的虚拟父目录交给 pickWriteTarget，而
+#   getTargetsForPath 只认 alias 相对物理路径，S2-C2/S3-C3 回 403
+#   [Alias] ... no target found。改成 dstPhys 的父目录探测；copy 另把源名与
+#   目标名分开传给 copyItems（names/dstNames），DAV 同目录改名 COPY 才能过。
+# 第 82 条（缺陷 B）：SSRF 判定前置。webdav 驱动的 get() 内部先连网，
+#   代理层守卫走不到，S1-C5 挂到 15 s 超时。新增 pkg/ssrf-endpoint.ts：
+#   读路径在 driver.get/getItem 之前按 addition 字面量判定，白名单只认显式
+#   SSRF_ALLOWED_HOSTS（精确 host）；raw.ts 与 webdav.ts 读路径各插入一次，
+#   entry.ts（适配层 src=repo）补该环境变量通道。
+# 第 83 条（缺陷 C）：自指环回在驱动层截断。alias 的 get()/list() 对
+#   paths 指向自身子路径的挂载会无限递归（每层目标继续落在同一存储），
+#   hop 截断与错误映射都在递归之外。新增 AliasRedirectLoopError；driver
+#   构造器收可选 storageConfig.id，目标解析回本存储即 403
+#   "internal redirect loop"；无 storageId 时用实例级深度 8 兜底；
+#   raw.ts 与 webdav.ts 的 webdavErrorResponse 各加一条映射。
+patch 81 f77a8d3b995cc35254296938e362cc93fa92326768eb391ecadebc667b31b366 work/p2-81-alias-write-dst.patch
+patch 82 b31ad0ca6d2e09ce05ba99fe7ac9a8694046b8dab0178446956ff882012c4c76 work/p2-82-ssrf-order.patch
+patch 83 87ff1bd7c88dc780c40d3341804897c407be45ed9858ee254203eec265c0e7b2 work/p2-83-loop-depth.patch

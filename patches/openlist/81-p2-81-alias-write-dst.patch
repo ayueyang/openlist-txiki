@@ -1,0 +1,147 @@
+diff --git a/src/backend/drivers/alias/driver.ts b/src/backend/drivers/alias/driver.ts
+index 003bfcb..5fdef57 100644
+--- a/src/backend/drivers/alias/driver.ts
++++ b/src/backend/drivers/alias/driver.ts
+@@ -325,15 +325,17 @@ export class AliasDriver implements StorageDriver {
+     dstPhys: string,
+   ): Promise<void> {
+     this.assertWritable("move")
+-    // srcPhys 是源项自身路径，dstDir 是目标父目录；分别按文件项/目录探测。
++    // srcPhys 是源项自身路径；dstPhys 是目标项自身路径。第二参 dstDir 是
++    // 虚拟父目录（含挂载前缀），不能拿去做物理探测（r65 缺陷 A）：
++    // getTargetsForPath 只认 alias 相对物理路径，传虚拟目录会拼成 0 候选。
+     const srcTarget = await this.pickWriteTarget(srcPhys, false, "move")
+-    const dstTarget = await this.pickWriteTarget(dstDir, true, "move")
+-    const storage = await this.storageModule()
+-    await storage.moveItems(
+-      this.parentPath(srcTarget),
+-      dstTarget,
+-      names,
++    const dstTarget = await this.pickWriteTarget(
++      this.parentPath(dstPhys),
++      true,
++      "move",
+     )
++    const storage = await this.storageModule()
++    await storage.moveItems(this.parentPath(srcTarget), dstTarget, names)
+   }
+ 
+   async copy(
+@@ -344,13 +346,25 @@ export class AliasDriver implements StorageDriver {
+     dstPhys: string,
+   ): Promise<void> {
+     this.assertWritable("copy")
++    // 同 move：dstDir 是虚拟父目录，目标只按 dstPhys 的父目录探测。
++    // C7-7 的目标名语义要求源名与目标名分开传：DAV 同目录改名 COPY 时
++    // storage.copyItems 的 names 是源名，dstNames 是目标名（r65 缺陷 A 第二处）。
+     const srcTarget = await this.pickWriteTarget(srcPhys, false, "copy")
+-    const dstTarget = await this.pickWriteTarget(dstDir, true, "copy")
++    const dstTarget = await this.pickWriteTarget(
++      this.parentPath(dstPhys),
++      true,
++      "copy",
++    )
++    const srcName = this.cleanPath(srcPhys).split("/").filter(Boolean).pop() || ""
++    const dstName =
++      this.cleanPath(dstPhys).split("/").filter(Boolean).pop() || names[0] || ""
+     const storage = await this.storageModule()
+     await storage.copyItems(
+       this.parentPath(srcTarget),
+       dstTarget,
+-      names,
++      [srcName],
++      undefined,
++      [dstName],
+     )
+   }
+ 
+diff --git a/src/backend/drivers/alias/write-gate.test.ts b/src/backend/drivers/alias/write-gate.test.ts
+index fa1c201..341a927 100755
+--- a/src/backend/drivers/alias/write-gate.test.ts
++++ b/src/backend/drivers/alias/write-gate.test.ts
+@@ -42,11 +42,19 @@ class StubAliasDriver extends AliasDriver {
+       removeItems: async (p: string) => {
+         calls.push(`storage.removeItems:${p}`)
+       },
+-      moveItems: async (s: string, d: string) => {
+-        calls.push(`storage.moveItems:${s}->${d}`)
++      moveItems: async (s: string, d: string, names?: string[]) => {
++        calls.push(`storage.moveItems:${s}->${d}:${(names || []).join(",")}`)
+       },
+-      copyItems: async (s: string, d: string) => {
+-        calls.push(`storage.copyItems:${s}->${d}`)
++      copyItems: async (
++        s: string,
++        d: string,
++        names?: string[],
++        _overwrite?: any,
++        dstNames?: string[],
++      ) => {
++        const n = `[${(names || []).join(",")}]`
++        const dn = dstNames === undefined ? "undefined" : `[${dstNames.join(",")}]`
++        calls.push(`storage.copyItems:${s}->${d}:names=${n}:dstNames=${dn}`)
+       },
+       putItem: async (p: string) => {
+         calls.push(`storage.putItem:${p}`)
+@@ -98,11 +106,19 @@ class LocalLikeAliasDriver extends AliasDriver {
+       removeItems: async (p: string) => {
+         calls.push(`storage.removeItems:${p}`)
+       },
+-      moveItems: async (s: string, d: string) => {
+-        calls.push(`storage.moveItems:${s}->${d}`)
++      moveItems: async (s: string, d: string, names?: string[]) => {
++        calls.push(`storage.moveItems:${s}->${d}:${(names || []).join(",")}`)
+       },
+-      copyItems: async (s: string, d: string) => {
+-        calls.push(`storage.copyItems:${s}->${d}`)
++      copyItems: async (
++        s: string,
++        d: string,
++        names?: string[],
++        _overwrite?: any,
++        dstNames?: string[],
++      ) => {
++        const n = `[${(names || []).join(",")}]`
++        const dn = dstNames === undefined ? "undefined" : `[${dstNames.join(",")}]`
++        calls.push(`storage.copyItems:${s}->${d}:names=${n}:dstNames=${dn}`)
+       },
+     }
+   }
+@@ -130,8 +146,8 @@ function sixWrites(d: AliasDriver): Array<() => Promise<void>> {
+     () => d.mkdir("/v/mk", "/mk"),
+     () => d.rename("/v/r", "/r", "r2"),
+     () => d.remove("/v/x", "/x", ["x"]),
+-    () => d.move("/v/s", "/v/t", ["f"], "/s/f", "/t/f"),
+-    () => d.copy("/v/s", "/v/t", ["f"], "/s/f", "/t/f"),
++    () => d.move("/v/ops", "/v/dir2", ["mv1.txt"], "/ops/mv1.txt", "/dir2/mv1.txt"),
++    () => d.copy("/v/ops", "/v/dir2", ["cp1.txt"], "/ops/cp1.txt", "/dir2/cp1.txt"),
+     () => d.put("/v/p", "/p", Buffer.from("x")),
+   ]
+ }
+@@ -198,6 +214,26 @@ test("p2-73 protect_same_name=false：两候选同名时取第一个存在的候
+   assert.deepEqual(d.storageCalls(), ["storage.renameItem:/local1/r"])
+ })
+ 
++test("p2-84 move/copy 目标用物理 dstPhys 探测：虚拟 dstDir 不参与", async () => {
++  const d = newDriver({ writable: true, paths: "/local1" })
++  d.probeAll = true
++  await d.move("/v/ops", "/v/dir2", ["mv1.txt"], "/ops/mv1.txt", "/dir2/mv1.txt")
++  await d.copy("/v/ops", "/v/dir2", ["cp1.txt"], "/ops/cp1.txt", "/dir2/cp1.txt")
++  assert.deepEqual(d.storageCalls(), [
++    "storage.moveItems:/local1/ops->/local1/dir2:mv1.txt",
++    "storage.copyItems:/local1/ops->/local1/dir2:names=[cp1.txt]:dstNames=[cp1.txt]",
++  ])
++})
++
++test("p2-84 DAV 改名 COPY：源名取 srcPhys、目标名取 dstPhys", async () => {
++  const d = newDriver({ writable: true, paths: "/local1" })
++  d.probeAll = true
++  await d.copy("/v", "/v", ["w4.txt"], "/w3.txt", "/w4.txt")
++  assert.deepEqual(d.storageCalls(), [
++    "storage.copyItems:/local1->/local1:names=[w3.txt]:dstNames=[w4.txt]",
++  ])
++})
++
+ test("p2-73 零候选存在：报 not found 且不落任何写调用", async () => {
+   const d = newDriver({ writable: true })
+   await assert.rejects(

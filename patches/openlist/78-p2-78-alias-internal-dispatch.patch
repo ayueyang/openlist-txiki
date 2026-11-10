@@ -1,0 +1,441 @@
+diff --git a/src/backend/server/internal-dispatch.ts b/src/backend/server/internal-dispatch.ts
+new file mode 100644
+index 0000000..fb22352
+--- /dev/null
++++ b/src/backend/server/internal-dispatch.ts
+@@ -0,0 +1,117 @@
++/**
++ * r64 补丁 78（缺陷 C）：alias 挂载下载的进程内跳转。
++ *
++ * alias 驱动把目标存储返回的**相对** raw_url（`/api/p/<目标挂载>/<文件>`）
++ * 原样透传，rawRouter 却把它当外网地址交给 safeProxyFetch：`new URL()` 对相对
++ * 串抛错，`isSafeUrl` 回 false，于是 403。本模块只做两件事：
++ *
++ * 1. 判断一个 raw_url 是不是「本实例内部的下载路径」——只看字符串形态与路径
++ *    前缀白名单，不读请求 Host、不读绑定地址、不读 trusted hosts；
++ * 2. 构造一个进程内 Request 与原样透传的 hop 头。
++ *
++ * 安全边界：
++ * - 只接受 `/api/p`、`/api/d`、`/api/sd`、`/p`、`/d`、`/sd` 前缀的相对路径；
++ * - 拒绝 `//`、反斜杠、空白/控制字符、查询串与片段、`..` 段、`%2e` 与
++ *   `%25` 二次编码残留（这些一律 pass，交回原 SSRF 判定）；
++ * - 绝对 URL 一律 pass，仍走原 SSRF 判定，不放宽任何 host；
++ * - hop 计数使用模块加载时随机生成的 nonce，客户端不可知；伪造头按 0 处理，
++ *   nonce 不匹配的头不参与任何放行判断。
++ */
++export const HOP_HEADER = "x-openlist-hop"
++
++/** 内部跳转上限：n 允许 1..3，准备发出第 4 跳时回 403。 */
++export const HOP_LIMIT = 3
++
++const INTERNAL_ORIGIN = "http://internal"
++const RAW_PREFIXES = ["/api/p", "/api/d", "/api/sd", "/p", "/d", "/sd"]
++
++function randomNonce(): string {
++  const bytes = new Uint8Array(16)
++  const webCrypto = (globalThis as any).crypto
++  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
++    webCrypto.getRandomValues(bytes)
++  } else {
++    for (let i = 0; i < bytes.length; i++) {
++      bytes[i] = Math.floor(Math.random() * 256)
++    }
++  }
++  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
++}
++
++const DISPATCH_NONCE = randomNonce()
++
++/** 解析 hop 头：nonce 不匹配或格式不合法一律按 0（外部请求）处理。 */
++export function parseHopHeader(value: string | null | undefined): number {
++  if (!value) return 0
++  const idx = value.lastIndexOf(":")
++  if (idx <= 0) return 0
++  if (value.slice(0, idx) !== DISPATCH_NONCE) return 0
++  const raw = value.slice(idx + 1)
++  if (!/^\d+$/.test(raw)) return 0
++  const n = Number(raw)
++  if (!Number.isSafeInteger(n) || n < 1) return 0
++  return n
++}
++
++/** 生成本进程内部使用的 hop 头（只发给 rawRouter 自己）。 */
++export function internalHopHeader(next: number): string {
++  return `${DISPATCH_NONCE}:${next}`
++}
++
++/**
++ * 相对 raw_url 校验：必须是本实例的下载端点路径，且不含任何越界/二次编码
++ * 残留。返回 true 时才允许进程内跳转。
++ */
++export function isInternalRawUrl(value: unknown): value is string {
++  if (typeof value !== "string") return false
++  if (!value.startsWith("/") || value.startsWith("//")) return false
++  // 反斜杠、空白、控制字符、查询串、片段：一律不当作内部路径。
++  if (/[\\\u0000-\u001f\u007f\s?#]/.test(value)) return false
++  const matched = RAW_PREFIXES.some(
++    (prefix) => value === prefix || value.startsWith(prefix + "/"),
++  )
++  if (!matched) return false
++  // 二次编码残留（%252e -> %2e -> .）与任何 %2e 编码都不放行。
++  if (value.includes("%25")) return false
++  if (/%2e/i.test(value)) return false
++  const segments = value.split("/")
++  if (segments.some((s) => s === "." || s === "..")) return false
++  return true
++}
++
++export type DispatchPlan =
++  | { action: "dispatch"; hop: number; url: string }
++  | { action: "loop" }
++  | { action: "pass" }
++
++/**
++ * 决策：pass=不是内部路径（走原判定）；dispatch=内部跳转；loop=超过上限。
++ * currentHop 来自 parseHopHeader，外部请求恒为 0。
++ */
++export function planInternalDispatch(
++  rawUrl: unknown,
++  currentHop: number,
++): DispatchPlan {
++  if (!isInternalRawUrl(rawUrl)) return { action: "pass" }
++  if (currentHop >= HOP_LIMIT) return { action: "loop" }
++  return { action: "dispatch", hop: currentHop + 1, url: rawUrl }
++}
++
++/**
++ * 构造进程内 Request：URL 主机用固定占位符 `http://internal`，路径用原
++ * raw_url（getItem 产出的 raw_url 已逐段编码，不再二次编码）。只透传 Range；
++ * 其余请求头不进入内层，避免把鉴权信息或伪造头带进第二跳。
++ */
++export function buildInternalRequest(
++  rawUrl: string,
++  hop: number,
++  opts: { method?: string; range?: string } = {},
++): Request {
++  const method =
++    (opts.method || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET"
++  const headers: Record<string, string> = {
++    [HOP_HEADER]: internalHopHeader(hop),
++  }
++  if (opts.range) headers["Range"] = opts.range
++  return new Request(INTERNAL_ORIGIN + rawUrl, { method, headers })
++}
+diff --git a/src/backend/server/raw-alias-dispatch.test.ts b/src/backend/server/raw-alias-dispatch.test.ts
+new file mode 100644
+index 0000000..0dafae7
+--- /dev/null
++++ b/src/backend/server/raw-alias-dispatch.test.ts
+@@ -0,0 +1,118 @@
++/**
++ * r64 补丁 78（缺陷 C）handler 级回归：alias 挂载下载不再被 SSRF 判定误杀。
++ *
++ * 场景与设备侧缺陷单同形：Local 存储挂在 /l1，Alias 存储挂在 /aliasPlain、
++ * paths=/l1。alias 的 get() 把目标存储返回的相对 raw_url（/api/p/l1/dup.txt）
++ * 原样透传；修前 rawRouter 把它当外网地址，safeProxyFetch 的 new URL() 抛错，
++ * 回 403 SSRF protection。修后走进程内 dispatch，Local 分支直接读文件。
++ *
++ * 全部本地，不建网络连接、不需要设备。
++ */
++import assert from "node:assert/strict"
++import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { dirname, join } from "node:path"
++import { test } from "node:test"
++import { Hono } from "hono"
++
++import { saveDb } from "../internal/model/db"
++import { rawRouter } from "./raw"
++
++const env: any = {}
++
++const app = new Hono()
++app.route("/p", rawRouter)
++
++async function makeTree(files: Record<string, string>): Promise<string> {
++  const root = await mkdtemp(join(tmpdir(), "openlist-p78-"))
++  for (const [rel, content] of Object.entries(files)) {
++    const full = join(root, rel)
++    await mkdir(dirname(full), { recursive: true })
++    await writeFile(full, content)
++  }
++  return root
++}
++
++async function seed(root: string, id: string) {
++  await saveDb(
++    {
++      settings: [],
++      users: [
++        {
++          id: 1,
++          username: "admin",
++          password: "xxx",
++          role: 2,
++          permission: 0,
++          base_path: "/",
++          disabled: false,
++        },
++      ],
++      storages: [
++        {
++          id: `${id}-local`,
++          mount_path: "/l1",
++          driver: "local",
++          disabled: false,
++          addition: JSON.stringify({ root_folder_path: root }),
++        },
++        {
++          id: `${id}-alias`,
++          mount_path: "/aliasPlain",
++          driver: "alias",
++          disabled: false,
++          // /p 端点准入（canProxy）要求 alias 自身开 web_proxy 或命中
++          // proxy_types/text_types；设备复现里 alias 正是可代理状态。
++          web_proxy: true,
++          addition: JSON.stringify({ paths: "/l1", writable: true }),
++        },
++      ],
++      shares: [],
++    },
++    env,
++  )
++}
++
++test("r64 缺陷 C：alias 挂载 GET 回源文件字节（修前 403 SSRF）", async (t) => {
++  const root = await makeTree({ "dup.txt": "abcdef" })
++  t.after(() => rm(root, { recursive: true, force: true }))
++  await seed(root, "p78-full")
++
++  const res = await app.request("/p/aliasPlain/dup.txt", { method: "GET" }, env)
++  assert.equal(res.status, 200)
++  assert.equal(res.headers.get("content-length"), "6")
++  assert.equal(await res.text(), "abcdef")
++})
++
++test("r64 缺陷 C：alias 挂载 GET 带 Range 回 206 与正确 Content-Range", async (t) => {
++  const root = await makeTree({ "dup.txt": "abcdef" })
++  t.after(() => rm(root, { recursive: true, force: true }))
++  await seed(root, "p78-range")
++
++  const res = await app.request(
++    "/p/aliasPlain/dup.txt",
++    { method: "GET", headers: { Range: "bytes=0-2" } },
++    env,
++  )
++  assert.equal(res.status, 206)
++  assert.equal(res.headers.get("content-range"), "bytes 0-2/6")
++  assert.equal(await res.text(), "abc")
++})
++
++test("r64 缺陷 C：Local 对照路径同口径（200 与 206）", async (t) => {
++  const root = await makeTree({ "dup.txt": "abcdef" })
++  t.after(() => rm(root, { recursive: true, force: true }))
++  await seed(root, "p78-local")
++
++  const full = await app.request("/p/l1/dup.txt", { method: "GET" }, env)
++  assert.equal(full.status, 200)
++  assert.equal(await full.text(), "abcdef")
++  const part = await app.request(
++    "/p/l1/dup.txt",
++    { method: "GET", headers: { Range: "bytes=0-2" } },
++    env,
++  )
++  assert.equal(part.status, 206)
++  assert.equal(part.headers.get("content-range"), "bytes 0-2/6")
++  assert.equal(await part.text(), "abc")
++})
+diff --git a/src/backend/server/raw-internal.test.ts b/src/backend/server/raw-internal.test.ts
+new file mode 100644
+index 0000000..79c7bb7
+--- /dev/null
++++ b/src/backend/server/raw-internal.test.ts
+@@ -0,0 +1,120 @@
++/**
++ * r64 补丁 78（缺陷 C）单测：alias 挂载下载的进程内跳转判定。
++ *
++ * 只测纯函数，不发网络请求、不建存储：
++ * - 相对 raw_url 放行（/api/p、/api/d、/api/sd、/p、/d、/sd）；
++ * - 绝对外网 URL 仍 pass（后续仍走原 SSRF 判定）；
++ * - `//evil`、反斜杠、`..`、`%2e`、`%25` 二次编码拒绝；
++ * - hop 上限 3，伪造 hop 头无效。
++ */
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import {
++  HOP_HEADER,
++  HOP_LIMIT,
++  buildInternalRequest,
++  internalHopHeader,
++  isInternalRawUrl,
++  parseHopHeader,
++  planInternalDispatch,
++} from "./internal-dispatch"
++
++test("r64 补丁 78：六个内部下载前缀的相对 raw_url 放行", () => {
++  for (const url of [
++    "/api/p/l1/dup.txt",
++    "/api/d/l1/dup.txt",
++    "/api/sd/share1/dup.txt",
++    "/p/l1/dup.txt",
++    "/d/l1/dup.txt",
++    "/sd/share1/dup.txt",
++  ]) {
++    assert.equal(isInternalRawUrl(url), true, url)
++    assert.deepEqual(planInternalDispatch(url, 0), {
++      action: "dispatch",
++      hop: 1,
++      url,
++    })
++  }
++})
++
++test("r64 补丁 78：绝对外网 URL 仍 pass，不进入内部跳转", () => {
++  for (const url of [
++    "https://example.com/file.bin",
++    "http://192.168.7.1:15361/api/p/l1/dup.txt",
++    "ftp://example.com/x",
++  ]) {
++    assert.equal(isInternalRawUrl(url), false, url)
++    assert.deepEqual(planInternalDispatch(url, 0), { action: "pass" })
++  }
++})
++
++test("r64 补丁 78：//evil、反斜杠、非白名单前缀拒绝", () => {
++  for (const url of [
++    "//evil.example/api/p/x",
++    "/\\evil/api/p/x",
++    "/api/x/l1/dup.txt",
++    "/raw/x",
++    "/api/px/l1/dup.txt",
++    " /api/p/x",
++  ]) {
++    assert.equal(isInternalRawUrl(url), false, url)
++  }
++})
++
++test("r64 补丁 78：.. 段、%2e 与 %25 二次编码残留拒绝", () => {
++  for (const url of [
++    "/api/p/../etc/passwd",
++    "/api/p/%2e%2e/etc/passwd",
++    "/api/p/%2E%2E/etc/passwd",
++    "/api/p/%252e%252e/etc/passwd",
++    "/api/p/x%25y",
++    "/api/p/./x",
++  ]) {
++    assert.equal(isInternalRawUrl(url), false, url)
++  }
++})
++
++test("r64 补丁 78：hop 上限 3，超限返回 loop", () => {
++  assert.deepEqual(planInternalDispatch("/api/p/x", HOP_LIMIT - 1), {
++    action: "dispatch",
++    hop: HOP_LIMIT,
++    url: "/api/p/x",
++  })
++  assert.deepEqual(planInternalDispatch("/api/p/x", HOP_LIMIT), {
++    action: "loop",
++  })
++  assert.deepEqual(planInternalDispatch("/api/p/x", HOP_LIMIT + 1), {
++    action: "loop",
++  })
++})
++
++test("r64 补丁 78：伪造 hop 头无效，本进程 hop 头可解析", () => {
++  assert.equal(parseHopHeader(""), 0)
++  assert.equal(parseHopHeader(undefined), 0)
++  assert.equal(parseHopHeader("forged:1"), 0)
++  assert.equal(parseHopHeader("deadbeefdeadbeef:2"), 0)
++  assert.equal(parseHopHeader(":1"), 0)
++  assert.equal(parseHopHeader("x:0"), 0)
++  assert.equal(parseHopHeader("x:-1"), 0)
++  assert.equal(parseHopHeader("x:1.5"), 0)
++  assert.equal(parseHopHeader(internalHopHeader(1)), 1)
++  assert.equal(parseHopHeader(internalHopHeader(HOP_LIMIT)), HOP_LIMIT)
++})
++
++test("r64 补丁 78：内部 Request 用固定占位主机，只带 hop 与 Range", () => {
++  const req = buildInternalRequest("/api/p/l1/dup.txt", 2, {
++    method: "GET",
++    range: "bytes=0-2",
++  })
++  assert.equal(req.url, "http://internal/api/p/l1/dup.txt")
++  assert.equal(req.method, "GET")
++  assert.equal(req.headers.get(HOP_HEADER), internalHopHeader(2))
++  assert.equal(req.headers.get("Range"), "bytes=0-2")
++  assert.equal(req.headers.get("Authorization"), null)
++  const head = buildInternalRequest("/api/p/l1/dup.txt", 1, {
++    method: "HEAD",
++  })
++  assert.equal(head.method, "HEAD")
++  assert.equal(head.headers.get("Range"), null)
++})
+diff --git a/src/backend/server/raw.ts b/src/backend/server/raw.ts
+index 5efa000..2600352 100644
+--- a/src/backend/server/raw.ts
++++ b/src/backend/server/raw.ts
+@@ -25,6 +25,12 @@ import {
+   isPathRejected,
+ } from "../pkg/canonical-path"
+ import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
++import {
++  HOP_HEADER,
++  buildInternalRequest,
++  parseHopHeader,
++  planInternalDispatch,
++} from "./internal-dispatch"
+ import {
+   resolveProxyDecision,
+   getDownProxyUrl,
+@@ -508,6 +514,10 @@ rawRouter.get("/*", async (c) => {
+     return c.text("relative path", 403)
+   }
+ 
++  // r64 补丁 78（缺陷 C）：hop>0 只可能来自 rawRouter 自己发出的内层请求
++  // （nonce 在模块加载时随机生成，客户端不可知）。伪造头按 0 处理。
++  const hop = parseHopHeader(c.req.header(HOP_HEADER))
++
+   try {
+     let reqPath = canonPath.path
+     // Share download: /sd/{shareId}/... — map to the real storage path
+@@ -558,7 +568,9 @@ rawRouter.get("/*", async (c) => {
+       //
+       // 此前 TS 版在此处强制要求登录用户，与 Go 不符：guest 存在时靠 guest
+       // 兜底看不出问题，guest 一被禁用，列目录/播放视频就全部 401。
+-      if (await needDownloadSign(c, reqPath)) {
++      // r64 补丁 78（缺陷 C）：内层是同一授权的延续，跳过签名校验；
++      // 外层（hop=0）的签名/权限判定保持原样。
++      if (hop === 0 && (await needDownloadSign(c, reqPath))) {
+         const sign = c.req.query("sign") || ""
+         const ok = await verifyDownloadSign(c, reqPath, sign)
+         if (!ok) {
+@@ -647,6 +659,28 @@ rawRouter.get("/*", async (c) => {
+           }
+ 
+           if (fileItem && fileItem.raw_url) {
++            // r64 补丁 78（缺陷 C）：alias 把目标存储的**相对** raw_url 原样
++            // 透传（/api/p/<目标挂载>/<文件>）。这是本实例内部的下载路径，
++            // 交给进程内 dispatch；绝对 URL（含真正的私网地址）仍走下面的
++            // 原判定，不放宽任何 host。
++            if (normDriver === "alias") {
++              const plan = planInternalDispatch(fileItem.raw_url, hop)
++              if (plan.action === "loop") {
++                console.warn(
++                  `[rawRouter] internal redirect loop for '${reqPath}' (hop=${hop})`,
++                )
++                return c.text("internal redirect loop", 403)
++              }
++              if (plan.action === "dispatch") {
++                return rawRouter.fetch(
++                  buildInternalRequest(plan.url, plan.hop, {
++                    method: c.req.method,
++                    range: c.req.header("Range"),
++                  }),
++                  c.env,
++                )
++              }
++            }
+             // 下载模式决策：对齐 Go 的 ShouldProxy()/canProxy() + webdav_policy。
+             //   - 驱动强制代理（MustProxy）> 存储 web_proxy > /p、/sd 路径 >
+             //     存储 webdav_policy > 驱动默认（PreferProxy）> 302_redirect

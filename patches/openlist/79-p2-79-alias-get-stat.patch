@@ -1,0 +1,303 @@
+diff --git a/src/backend/drivers/alias/driver.ts b/src/backend/drivers/alias/driver.ts
+index 9faf27d..003bfcb 100644
+--- a/src/backend/drivers/alias/driver.ts
++++ b/src/backend/drivers/alias/driver.ts
+@@ -1,11 +1,14 @@
+ import {
+-  calcFileType,
+   FileItem,
+   StorageDriver,
+ } from "../../internal/driver/base"
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { AliasAddition, AliasPathPair } from "./types"
+-import { AliasPermissionError } from "../../pkg/errs"
++import {
++  AliasNotFoundError,
++  AliasPermissionError,
++  isNotFoundError,
++} from "../../pkg/errs"
+ 
+ export class AliasDriver implements StorageDriver {
+   private addition: AliasAddition
+@@ -235,7 +238,6 @@ export class AliasDriver implements StorageDriver {
+ 
+   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
+     const clean = this.cleanPath(physicalPath)
+-    const name = clean.split("/").filter(Boolean).pop() || "root"
+ 
+     if (clean === "/" && this.rootOrder.length > 1) {
+       return {
+@@ -251,42 +253,33 @@ export class AliasDriver implements StorageDriver {
+ 
+     const targets = this.getTargetsForPath(physicalPath)
+     if (targets.length === 0) {
+-      return {
+-        name,
+-        size: 0,
+-        is_dir: false,
+-        modified: new Date().toISOString(),
+-        sign: "",
+-        type: calcFileType(name, false),
+-        raw_url: "",
+-      }
++      // r64 补丁 79（缺陷 B）：没匹配到任何候选就是不存在，抛类型化错误；
++      // 不再返回 size=0 的占位 item（那会让写预检把缺失目标判成已存在）。
++      throw new AliasNotFoundError(`[Alias] not found: ${physicalPath}`)
+     }
+ 
+-    const { getItem } = await import("../../internal/op/storage")
++    const storage = await this.storageModule()
++    let realError: any = null
+ 
+     for (const target of targets) {
+       try {
+-        const res = await getItem(target.targetFullPath)
++        const res = await storage.getItem(target.targetFullPath)
+         if (res?.item) {
+           return {
+             ...res.item,
+             raw_url: res.item.raw_url || res.rawUrl,
+           }
+         }
+-      } catch {
+-        // Try next candidate
++        // 驱动返回空 item 同样按不存在处理，继续下一个候选。
++      } catch (e: any) {
++        // 缺失继续尝试下一个候选；真实错误（鉴权/网络/5xx）先记下，
++        // 全部候选失败后原样上抛，不把「网络故障」伪装成 404。
++        if (!isNotFoundError(e) && realError === null) realError = e
+       }
+     }
+ 
+-    return {
+-      name,
+-      size: 0,
+-      is_dir: false,
+-      modified: new Date().toISOString(),
+-      sign: "",
+-      type: calcFileType(name, false),
+-      raw_url: "",
+-    }
++    if (realError) throw realError
++    throw new AliasNotFoundError(`[Alias] not found: ${physicalPath}`)
+   }
+ 
+   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
+diff --git a/src/backend/drivers/alias/get-stat.test.ts b/src/backend/drivers/alias/get-stat.test.ts
+new file mode 100644
+index 0000000..e8b46bf
+--- /dev/null
++++ b/src/backend/drivers/alias/get-stat.test.ts
+@@ -0,0 +1,128 @@
++/**
++ * r64 补丁 79（缺陷 B）单测：alias get() 的 stat 语义。
++ *
++ * 修前：路径不存在时 get() 返回 size=0, is_dir=false 的占位 item，
++ * 所有 getItem() 调用方都拿到「对象存在」，rename/move/copy 的写预检恒真。
++ * 修后：0 候选 / 全候选缺失抛 AliasNotFoundError；真实错误原样上抛；
++ * 多 target 仍取第一个成功候选。
++ *
++ * 用 StubAliasDriver 覆写 storageModule（沿用 write-gate.test.ts 的桩法），
++ * 不触达 internal/op/storage、不建网络连接。
++ */
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { AliasDriver } from "./driver"
++import { AliasNotFoundError, isNotFoundError } from "../../pkg/errs"
++
++type GetItemStub = (path: string) => Promise<any>
++
++class StubAliasDriver extends AliasDriver {
++  calls: string[] = []
++  getItemImpl: GetItemStub = async () => {
++    throw new Error("Object not found")
++  }
++
++  protected async storageModule(): Promise<any> {
++    const calls = this.calls
++    const impl = this.getItemImpl
++    return {
++      getItem: async (p: string) => {
++        calls.push(p)
++        return impl(p)
++      },
++    }
++  }
++}
++
++const driverWith = (paths: string, impl: GetItemStub): StubAliasDriver => {
++  const d = new StubAliasDriver({ paths, writable: true } as any)
++  d.getItemImpl = impl
++  return d
++}
++
++test("r64 补丁 79：0 候选抛 AliasNotFoundError，不返回占位 item", async () => {
++  const d = driverWith("/sub:/l1", async () => {
++    throw new Error("should not be called")
++  })
++  await assert.rejects(
++    () => d.get("/elsewhere", "/x"),
++    (e: any) => e instanceof AliasNotFoundError && e.code === 404,
++  )
++  assert.equal(d.calls.length, 0)
++})
++
++test("r64 补丁 79：全部候选缺失抛 AliasNotFoundError", async () => {
++  const d = driverWith("/l1\n/l2", async () => {
++    throw new Error("Object not found")
++  })
++  await assert.rejects(
++    () => d.get("/dup.txt", "/dup.txt"),
++    (e: any) => e instanceof AliasNotFoundError,
++  )
++  assert.deepEqual(d.calls, ["/l1/dup.txt", "/l2/dup.txt"])
++})
++
++test("r64 补丁 79：一真一缺失取真候选，raw_url 回退到 res.rawUrl", async () => {
++  const d = driverWith("/l1\n/l2", async (p) => {
++    if (p === "/l2/dup.txt") {
++      return {
++        item: { name: "dup.txt", size: 6, is_dir: false },
++        rawUrl: "/api/p/l2/dup.txt",
++      }
++    }
++    throw new Error("Object not found")
++  })
++  const item: any = await d.get("/dup.txt", "/dup.txt")
++  assert.equal(item.name, "dup.txt")
++  assert.equal(item.raw_url, "/api/p/l2/dup.txt")
++  assert.deepEqual(d.calls, ["/l1/dup.txt", "/l2/dup.txt"])
++})
++
++test("r64 补丁 79：item 自带 raw_url 时优先于 res.rawUrl", async () => {
++  const d = driverWith("/l1", async () => ({
++    item: { name: "a.bin", size: 1, is_dir: false, raw_url: "/api/p/l1/a.bin" },
++    rawUrl: "/api/d/l1/a.bin",
++  }))
++  const item: any = await d.get("/a.bin", "/a.bin")
++  assert.equal(item.raw_url, "/api/p/l1/a.bin")
++})
++
++test("r64 补丁 79：真实错误全部失败后原样上抛，不伪装成 404", async () => {
++  const real = Object.assign(new Error("upstream 503"), { code: 503 })
++  const d = driverWith("/l1\n/l2", async (p) => {
++    if (p === "/l1/x") throw real
++    throw new Error("Object not found")
++  })
++  await assert.rejects(
++    () => d.get("/x", "/x"),
++    (e: any) => e === real && !(e instanceof AliasNotFoundError),
++  )
++  assert.equal(d.calls.length, 2)
++})
++
++test("r64 补丁 79：多 target 首个成功即返回，不再探测后续候选", async () => {
++  const d = driverWith("/l1\n/l2", async (p) => ({
++    item: { name: "dup.txt", size: 6, is_dir: false, raw_url: `/api/p${p}` },
++    rawUrl: `/api/d${p}`,
++  }))
++  const item: any = await d.get("/dup.txt", "/dup.txt")
++  assert.equal(item.raw_url, "/api/p/l1/dup.txt")
++  assert.deepEqual(d.calls, ["/l1/dup.txt"])
++})
++
++test("r64 补丁 79：isNotFoundError 认 404/1004/ENOENT/ENOTDIR 与 not found 文案", () => {
++  for (const e of [
++    { code: 404 },
++    { code: 1004 },
++    { code: "ENOENT" },
++    { code: "ENOTDIR" },
++    { message: "Object not found" },
++    { message: "Storage not found" },
++  ]) {
++    assert.equal(isNotFoundError(e), true, JSON.stringify(e))
++  }
++  for (const e of [null, {}, { code: 403 }, { message: "permission denied" }]) {
++    assert.equal(isNotFoundError(e), false, JSON.stringify(e))
++  }
++})
+diff --git a/src/backend/pkg/errs.ts b/src/backend/pkg/errs.ts
+index a77b0dd..9831309 100644
+--- a/src/backend/pkg/errs.ts
++++ b/src/backend/pkg/errs.ts
+@@ -78,3 +78,31 @@ export class AliasPermissionError extends Error {
+     this.name = "AliasPermissionError"
+   }
+ }
++
++/**
++ * r64 补丁 79（缺陷 B）：alias 路径不存在。
++ *
++ * alias 的 get() 从「返回 size=0 占位 item」改成 stat 语义后抛这个类型；
++ * 调用方按类型映射成 404。不要继承 AliasPermissionError，否则现有 403
++ * 映射会把「缺失」当「无权限」。
++ */
++export class AliasNotFoundError extends Error {
++  code = 404
++
++  constructor(message: string) {
++    super(message)
++    this.name = "AliasNotFoundError"
++  }
++}
++
++/**
++ * 「不存在」类错误判定：alias 驱动逐候选回退时用（code 优先，文案兜底）。
++ * 只用于决定是否继续尝试下一个候选；真实错误仍按原类型上抛，不在这里吞掉。
++ */
++export function isNotFoundError(e: any): boolean {
++  if (!e) return false
++  const code = e?.code
++  if (code === 404 || code === 1004 || code === "ENOENT" || code === "ENOTDIR")
++    return true
++  return /not found/i.test(String(e?.message || ""))
++}
+diff --git a/src/backend/server/fs.ts b/src/backend/server/fs.ts
+index 93a3163..895cfba 100644
+--- a/src/backend/server/fs.ts
++++ b/src/backend/server/fs.ts
+@@ -50,7 +50,11 @@ import {
+   isEncryptPath,
+   getSignExpiresIn,
+ } from "../pkg/sign"
+-import { AliasPermissionError, safeErrorMessage } from "../pkg/errs"
++import {
++  AliasNotFoundError,
++  AliasPermissionError,
++  safeErrorMessage,
++} from "../pkg/errs"
+ import { encodeDownloadPath } from "../pkg/path"
+ import { contentLengthOf, drainBody, pipeBody } from "../pkg/upload-stream"
+ import { search } from "../internal/op/search"
+@@ -864,6 +868,10 @@ fsRouter.post("/get", async (c) => {
+   } catch (err: any) {
+     // P1-18：getActualPath 在 try 之外抛出的 PathRejectedError 会落在这里
+     if (isPathRejected(err)) return pathRejectedResponse(c, err)
++    // r64 补丁 79（缺陷 B）：alias get() 对缺失路径抛 AliasNotFoundError，
++    // 按 404 收口；其它错误口径不变（Local 缺失仍按原样 500）。
++    if (err instanceof AliasNotFoundError)
++      return c.json({ code: 404, message: safeErrorMessage(err), data: null }, 404)
+     return c.json({ code: 500, message: safeErrorMessage(err), data: null })
+   }
+ })
+@@ -924,6 +932,8 @@ async function writeTargetExists(
+   try {
+     const resolved = await resolvePath(targetPath)
+     if (resolved.isVirtual) return false
++    // 依赖 getItem 的 stat 语义：alias 缺失会抛 AliasNotFoundError（r64 补丁 79），
++    // catch 按不存在处理，真实错误留给后续驱动调用由 writeFailure 归一。
+     const { item } = await getItem(targetPath, requestContext)
+     return Boolean(item)
+   } catch {
+@@ -959,6 +969,10 @@ function writeFailure(c: any, e: any): Response {
+       { code: 403, message: `file [${e.itemName}] exists`, data: null },
+       403,
+     )
++  // r64 补丁 79（缺陷 B）：alias get() 的 stat 语义把缺失抛成类型化 404，
++  // 与 storage-not-found 的 404 口径一致；不能兜成 500。
++  if (e instanceof AliasNotFoundError)
++    return c.json({ code: 404, message: safeErrorMessage(e), data: null }, 404)
+   // P2-73：alias 的 writable=false / 同名保护拒绝，回 403 而不是 500。
+   if (e instanceof AliasPermissionError)
+     return c.json({ code: 403, message: e.message, data: null }, 403)
