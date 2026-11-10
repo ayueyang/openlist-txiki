@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 83
+patch_count 87
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -265,7 +265,7 @@ file b11c0ced7ec61c56aa56c6cfdee9b74f41896c901c3b9b33f3368b479a9e753a src/backen
 file 5947ee3ef746e784eba084265b03017510a81ac54648927e2bc1d4cb0315c9eb src/backend/txiki/shims/path.ts src=repo strip_header=yes eol=lf
 file c15a27dac45238029a945fe2e692915dffb62887a291d49383fa16a76e32512d src/backend/txiki/sqlite-d1.ts src=repo strip_header=yes eol=lf
 file bf3b415cb81fa4ad79d4174aaef7faf9d866879c5ee3761f73d817f7f9855f2c src/backend/txiki/static-site.ts src=repo strip_header=yes eol=lf
-file 8c597387887f53129e45c45f112ac187d4fa06787f89873e339e20b943b64909 src/backend/txiki/upload-sweep.ts src=repo strip_header=yes eol=lf
+file 8ecfc80eb65f74c8a3288df9dc4b47097f049f6c2f223884d19904094aa941c3 src/backend/txiki/upload-sweep.ts src=repo strip_header=yes eol=lf
 file f04d15cc749fe3c16169995a034c9f7e1f050ed93f4f1b9c82619721d83dc68c src/backend/pkg/upload-stream.ts src=patch strip_header=no eol=lf
 file aa6e50ae9166aef39fe5292a4445d0efc91e8a5d5bd5d84a8ec1f630222985ad src/backend/server/s3.ts src=patch strip_header=no eol=crlf
 file 6c40344aa5ef40e846d8df984311d78e87dfe6efda1f6eb81ac262ced98a3167 src/backend/pkg/canonical-path.ts src=patch strip_header=no eol=crlf
@@ -521,3 +521,17 @@ patch 80 31f79108c6c5e2e675a092f0f4435ac58b04a2e1547c2730cf31cab0384f673e work/p
 patch 81 f77a8d3b995cc35254296938e362cc93fa92326768eb391ecadebc667b31b366 work/p2-81-alias-write-dst.patch
 patch 82 b31ad0ca6d2e09ce05ba99fe7ac9a8694046b8dab0178446956ff882012c4c76 work/p2-82-ssrf-order.patch
 patch 83 87ff1bd7c88dc780c40d3341804897c407be45ed9858ee254203eec265c0e7b2 work/p2-83-loop-depth.patch
+# 第 84 条（2026-11-10，r66 功能批 SPEC p2-77）：seafile 上传落盘暂存 + 流式 multipart。
+#   新增 internal/upload/spool.ts（seafile/terabox/weiyun 共用；语义取自 115open 已验证实现），
+#   seafile 的 put 改为 beginStream + write + commit，内存峰值降到 64KiB 读块。
+#   适配层 upload-sweep.ts（src=repo）增加 spool 残留按 24h TTL 清理。
+# 第 85 条（SPEC p2-78）：terabox 按 A 的 calculateChunkSize 串行分片、每片 md5，
+#   precreate 用固定占位 md5，create 带真实 block_list 并检查 errno。
+# 第 86 条（SPEC p2-79）：weiyun preUpload 增加可选 reader（1MiB 读块算 sha1），
+#   通道上传从 spool 按 1MiB 切片；协议顺序与 A/O 一致。
+# 第 87 条（SPEC p2-80）：189pc Addition 补 11 个字段，枚举显式校验；type=family 在
+#   init 最前面显式拒绝；order_by/order_direction 落地；validate_code 进登录表单。
+patch 84 d435e59a420806c1fc12a08eece131ef4c853e6a4e355a0cdd4b9d73b37f3f96 work/p2-84-spool-seafile.patch
+patch 85 53fd7d9745ce1d4837d9ff8b7ddb0fa9d468710ccbca45d0bcb9072bb9d5bdc6 work/p2-85-terabox-parts.patch
+patch 86 8593944b9f0dd04b4c06ded16ddd82303acb6826d10270b88d952367ba8c62b9 work/p2-86-weiyun-spool.patch
+patch 87 ae3fd3cd5f8ef8d7a736a7f44e9d8267b460da172c51c3533b92d18ef41bc91e work/p2-87-189pc-fields.patch

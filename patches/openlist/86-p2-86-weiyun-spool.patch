@@ -1,0 +1,552 @@
+diff --git a/src/backend/drivers/weiyun/driver.ts b/src/backend/drivers/weiyun/driver.ts
+index 6095618..d6bd8d7 100644
+--- a/src/backend/drivers/weiyun/driver.ts
++++ b/src/backend/drivers/weiyun/driver.ts
+@@ -8,8 +8,18 @@ import {
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { WeiyunAddition, WeiyunFile, WeiyunFolder } from "./types"
+ import { WeiyunClient } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  resolveSpoolDir,
++  unlinkSpool,
++} from "../../internal/upload/spool"
+ 
+ const SUBREQUEST_LIMIT = 45
++/** begin 时至少预留 fileSize + 64MiB。 */
++const SPOOL_MIN_FREE = 64 * 1024 * 1024
+ const UPLOAD_CHUNK_SIZE = 1024 * 1024 // 1MB per chunk
+ 
+ interface WeiyunUploadSession {
+@@ -544,65 +554,174 @@ export class WeiyunDriver implements StorageDriver {
+     throw new Error("[WeiYun] 微云接口不支持复制操作 (Copy not supported)")
+   }
+ 
+-  async put(
+-    _virtualPath: string,
++  /**
++   * 本地维护：txiki 上传内存上限。preUpload 的 sha1/md5 从 spool 按 1MiB 读，
++   * 通道上传按 1MiB 从 spool 切片；内存上限 = 1MiB + 读缓冲，与文件大小无关。
++   * 协议顺序保持 A/O 一致：preUpload（含秒传）→ 按通道 offset/len 上传。
++   */
++  async beginStream(
+     physicalPath: string,
+-    content: Buffer,
+-  ): Promise<void> {
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
+     const parts = String(physicalPath || "")
+       .split("/")
+       .filter(Boolean)
+     const fileName = parts.pop()
+     if (!fileName) throw new Error("[WeiYun] 上传路径无效")
+-
+     const parentPath = "/" + parts.join("/")
+     const parent = await this.resolveFolder(parentPath)
+ 
+-    const preData = await this.client.preUpload(
+-      parent.pdirKey,
+-      parent.dirKey,
+-      fileName,
+-      content.length,
+-      content,
+-      4,
+-      1,
++    const dir = resolveSpoolDir("weiyun")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known ? (expectedSize as number) + SPOOL_MIN_FREE : SPOOL_MIN_FREE,
+     )
+ 
+-    if (preData.file_exist) {
+-      return // Fast upload succeeded
+-    }
++    const spoolPath = `${dir}/weiyun-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
+ 
+-    const auth = {
+-      upload_key: preData.upload_key || "",
+-      ex: preData.ex || "",
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
+     }
+-
+-    let channels = preData.channel_list || []
+-    if (channels.length === 0) {
+-      channels = [{ id: 0, offset: 0, len: content.length }]
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[weiyun] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
+     }
+ 
+-    for (const ch of channels) {
+-      let cur = { ...ch }
+-      while (cur.offset < content.length) {
+-        const sliceLen = Math.min(
+-          cur.len || UPLOAD_CHUNK_SIZE,
+-          content.length - cur.offset,
+-        )
+-        const chunk = content.subarray(cur.offset, cur.offset + sliceLen)
+-        const res = await this.client.uploadPiece(cur, auth, chunk)
+-        if (res.upload_state === 2) {
+-          break
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("weiyun beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("weiyun 上传声明长度与实际不符")
+         }
+-        if (res.channel) {
+-          cur = res.channel
+-        } else {
+-          cur.offset += sliceLen
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("weiyun beginStream 已结束，不能重复 commit")
++        state = "done"
++        let reader: Awaited<ReturnType<typeof openSpoolFile>> | null = null
++        try {
++          await fh.close()
++          reader = await openSpoolFile(spoolPath, "r")
++          const readAt = async (offset: number, len: number) => {
++            if (len <= 0) return new Uint8Array(0)
++            const buf = new Uint8Array(len)
++            let got = 0
++            while (got < len) {
++              const n = await reader!.readAt(buf.subarray(got), offset + got)
++              if (!(n > 0)) throw new Error("[WeiYun] spool 读取提前结束")
++              got += n
++            }
++            return buf
++          }
++
++          const preData = await this.client.preUpload(
++            parent.pdirKey,
++            parent.dirKey,
++            fileName,
++            size,
++            new Uint8Array(0),
++            4,
++            1,
++            readAt,
++          )
++
++          if (preData.file_exist) {
++            return // Fast upload succeeded
++          }
++
++          const auth = {
++            upload_key: preData.upload_key || "",
++            ex: preData.ex || "",
++          }
++
++          let channels = preData.channel_list || []
++          if (channels.length === 0) {
++            channels = [{ id: 0, offset: 0, len: size }]
++          }
++
++          for (const ch of channels) {
++            let cur = { ...ch }
++            // 通道边界照 A 的 io.NewSectionReader(file, offset, len)：只发本通道的
++            // [offset, offset+len)，不冲进下一个通道。
++            const channelEnd = Math.min(
++              size,
++              ch.offset + (ch.len > 0 ? ch.len : size),
++            )
++            while (cur.offset < channelEnd) {
++              // 再按 1MiB 夹一层：内存上限 = 1MiB，与通道 len 无关（A 按通道整段发，
++              // 本移植为 512MB 设备收窄；chunk 总字节与顺序不变）。
++              const sliceLen = Math.min(
++                cur.len || UPLOAD_CHUNK_SIZE,
++                UPLOAD_CHUNK_SIZE,
++                channelEnd - cur.offset,
++              )
++              const chunk = await readAt(cur.offset, sliceLen)
++              const res = await this.client.uploadPiece(cur, auth, chunk)
++              if (res.upload_state === 2) {
++                break
++              }
++              if (res.channel) {
++                cur = res.channel
++              } else {
++                cur.offset += sliceLen
++              }
++            }
++          }
++        } finally {
++          if (reader) {
++            try {
++              await reader.close()
++            } catch {}
++          }
++          await closeQuietly()
++          await removeSpool()
+         }
+-      }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
+     }
+   }
+ 
++  async put(
++    _virtualPath: string,
++    physicalPath: string,
++    content: Buffer,
++  ): Promise<void> {
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
++  }
++
+   // ---- 分片会话上传接口（支持边缘与网页前端大文件直接分片上传） ----
+ 
+   async createUploadSession(
+diff --git a/src/backend/drivers/weiyun/stream.test.ts b/src/backend/drivers/weiyun/stream.test.ts
+new file mode 100755
+index 0000000..3f080b5
+--- /dev/null
++++ b/src/backend/drivers/weiyun/stream.test.ts
+@@ -0,0 +1,259 @@
++// SPEC p2-79（补丁 86）：weiyun 落盘暂存 + 分片上传单元测试。
++// mock globalThis.fetch 与 globalThis.tjs：不连网、不需要真实微云账号。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { WeiyunDriver } from "./driver"
++import { WeiyunClient } from "./util"
++
++const MB = 1024 * 1024
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++interface FetchCall {
++  url: string
++  body: any
++}
++interface UploadRec {
++  bytes: Uint8Array
++}
++
++let calls: FetchCall[] = []
++let spoolDir = ""
++let readLens: number[] = []
++let uploads: UploadRec[] = []
++let uploadFailAt = -1
++let uploadCount = 0
++let hashReadCount = -1
++let preData: any = {}
++let fileExist = false
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json", getSetCookie: () => [] },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function errResponse(status: number): any {
++  return {
++    ok: false,
++    status,
++    headers: { get: () => "text/plain", getSetCookie: () => [] },
++    text: async () => "boom",
++    json: async () => ({}),
++  }
++}
++
++/** 从 weiyun upload 的 multipart 请求体里取出文件段。 */
++function extractFilePart(body: Uint8Array): Uint8Array {
++  const text = Buffer.from(body.subarray(0, Math.min(body.length, 2048))).toString("latin1")
++  const marker = 'name="upload"; filename="blob"'
++  const mi = text.indexOf(marker)
++  assert.ok(mi >= 0, "multipart 里没有 upload 文件段")
++  const sep = text.indexOf("\r\n\r\n", mi)
++  assert.ok(sep >= 0)
++  const start = sep + 4
++  const endMarker = Buffer.from("\r\n------WebKitFormBoundaryIifrOqiswelC8nfe--\r\n", "latin1")
++  const ei = Buffer.from(body).indexOf(endMarker, start)
++  assert.ok(ei >= 0, "multipart 尾部标记缺失")
++  return body.subarray(start, ei)
++}
++
++function makeDriver(): WeiyunDriver {
++  const d = new WeiyunDriver({ cookies: "wyctoken=t" } as any)
++  ;(d as any).resolveFolder = async () => ({ pdirKey: "pdir", dirKey: "dir" })
++  return d
++}
++
++beforeEach(async () => {
++  calls = []
++  readLens = []
++  uploads = []
++  uploadFailAt = -1
++  uploadCount = 0
++  hashReadCount = -1
++  fileExist = false
++  preData = {
++    file_exist: false,
++    upload_key: "k",
++    ex: "e",
++    channel_list: [{ id: 0, offset: 0, len: 4 * MB }],
++  }
++  spoolDir = await mkdtemp(join(tmpdir(), "weiyun-p86-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => (await fh.write(chunk)).bytesWritten,
++        read: async (buf: Uint8Array, position: number) => {
++          readLens.push(buf.byteLength)
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    calls.push({ url, body: init?.body })
++    if (url.includes("ftn_pre_upload")) {
++      return jsonResponse({
++        ret: 0,
++        data: {
++          rsp_body: {
++            RspMsg_body: {
++              weiyunPreUploadMsgRsp_body: {
++                ...preData,
++                file_exist: fileExist || preData.file_exist,
++              },
++            },
++          },
++        },
++      })
++    }
++    if (url.includes("ftnup_v2")) {
++      if (hashReadCount < 0) hashReadCount = readLens.length
++      const idx = uploadCount++
++      if (idx === uploadFailAt) return errResponse(500)
++      uploads.push({ bytes: extractFilePart(new Uint8Array(init.body)) })
++      return jsonResponse({
++        ret: 0,
++        data: {
++          rsp_body: {
++            RspMsg_body: {
++              "weiyun.UploadPieceMsgRsp_body": { upload_state: 1 },
++            },
++          },
++        },
++      })
++    }
++    throw new Error("unexpected fetch: " + url)
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++test("1 preUpload 块表：reader 路径与 content 路径逐项相同、offset/长度符合 1MiB 约定", async () => {
++  const client = new WeiyunClient({ cookies: "" } as any)
++  const size = 6.5 * MB
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * 13 + 5) & 0xff
++
++  const seen: Array<[number, number]> = []
++  const reader = async (offset: number, len: number) => {
++    seen.push([offset, len])
++    return src.subarray(offset, offset + len)
++  }
++
++  await client.preUpload("pdir", "dir", "a.bin", size, src, 4, 1)
++  const bodyContent = calls[calls.length - 1].body as string
++  await client.preUpload("pdir", "dir", "a.bin", size, new Uint8Array(0), 4, 1, reader)
++  const bodyReader = calls[calls.length - 1].body as string
++
++  const pick = (s: string) =>
++    JSON.parse(s).req_body.ReqMsg_body["weiyun.PreUploadMsgReq_body"]
++  const a = pick(bodyContent)
++  const b = pick(bodyReader)
++  assert.deepEqual(b.block_info_list, a.block_info_list)
++  assert.deepEqual(b.block_info_list.map((x: any) => x.size), [MB, MB, MB, MB, MB, MB, 0.5 * MB])
++  assert.equal(b.check_sha, a.check_sha)
++  assert.equal(b.check_data, a.check_data)
++
++  assert.deepEqual(
++    seen.map(([o, l]) => [o, l]),
++    [
++      [0, MB],
++      [MB, MB],
++      [2 * MB, MB],
++      [3 * MB, MB],
++      [4 * MB, MB],
++      [5 * MB, MB],
++      [6 * MB, 0.5 * MB],
++    ],
++  )
++})
++
++test("2/5 6.5MiB 三通道：片长 <=1MiB、拼起来等于源、读块 <=1MiB", async () => {
++  preData = {
++    file_exist: false,
++    upload_key: "k",
++    ex: "e",
++    channel_list: [
++      { id: 0, offset: 0, len: 4 * MB },
++      { id: 1, offset: 4 * MB, len: 2 * MB },
++      { id: 2, offset: 6 * MB, len: 0.5 * MB },
++    ],
++  }
++  const d = makeDriver()
++  const size = 6.5 * MB
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * 29 + 11) & 0xff
++  const w = await (d as any).beginStream("docs/a.bin", size)
++  await w.write(src)
++  await w.commit()
++
++  assert.equal(uploads.length, 7, "4+2+0.5MiB 按 1MiB 切片")
++  assert.ok(uploads.every((u) => u.bytes.length <= MB))
++  const joined = new Uint8Array(size)
++  let off = 0
++  for (const u of uploads) {
++    joined.set(u.bytes, off)
++    off += u.bytes.length
++  }
++  assert.equal(off, size)
++  assert.deepEqual(joined, src)
++
++  assert.ok(Math.max(...readLens) <= MB)
++  // 首次上传 fetch 之前的那一次 readAt 属于第一片上传数据，其余是哈希阶段。
++  assert.equal(hashReadCount - 1, Math.ceil(size / MB), "哈希阶段按 1MiB 读块")
++  assert.ok(!readLens.includes(size), "不得出现整文件大小的读")
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("3 秒传：file_exist=true 不发片、spool 已删", async () => {
++  fileExist = true
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/a.bin", 2 * MB)
++  await w.write(new Uint8Array(2 * MB))
++  await w.commit()
++  assert.equal(uploads.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("4 失败：第 2 片抛错、上抛、spool 已删、后续片不再发", async () => {
++  uploadFailAt = 1
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/a.bin", 6.5 * MB)
++  await w.write(new Uint8Array(6.5 * MB))
++  await assert.rejects(() => w.commit(), /HTTP 500/)
++  assert.equal(uploadCount, 2)
++  assert.equal(uploads.length, 1)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("6 put 兼容路径：2MiB 走同一实现、字节一致", async () => {
++  const d = makeDriver()
++  const src = new Uint8Array(2 * MB)
++  for (let i = 0; i < src.length; i++) src[i] = (i * 3 + 2) & 0xff
++  await d.put("/docs/a.bin", "docs/a.bin", Buffer.from(src))
++  assert.equal(uploads.length, 2)
++  assert.deepEqual(uploads[0].bytes, src.subarray(0, MB))
++  assert.deepEqual(uploads[1].bytes, src.subarray(MB))
++  assert.deepEqual(await readdir(spoolDir), [])
++})
+diff --git a/src/backend/drivers/weiyun/util.ts b/src/backend/drivers/weiyun/util.ts
+index 6b42344..8323b82 100644
+--- a/src/backend/drivers/weiyun/util.ts
++++ b/src/backend/drivers/weiyun/util.ts
+@@ -555,6 +555,7 @@ export class WeiyunClient {
+     content: Uint8Array | Buffer,
+     channelCount = 4,
+     fileExistOption = 1,
++    reader?: (offset: number, len: number) => Promise<Uint8Array>,
+   ): Promise<PreUploadData> {
+     const blockSize = 1024 * 1024
+     let beforeBlockSize = 0
+@@ -578,8 +579,14 @@ export class WeiyunClient {
+     const blockInfoList: BlockInfo[] = []
+     const sha = new IncrementalSha1()
+ 
++    // 有 reader 时按块从盘读（txiki 上传内存上限）；无 reader 时保持原 content 路径。
++    const readBlock = reader
++      ? (offset: number, len: number) => reader(offset, len)
++      : async (offset: number, len: number) =>
++          content.subarray(offset, offset + len)
++
+     for (let offset = 0; offset < beforeBlockSize; offset += blockSize) {
+-      const slice = content.subarray(offset, offset + blockSize)
++      const slice = await readBlock(offset, blockSize)
+       sha.update(slice)
+       blockInfoList.push({
+         sha: sha.getStateHex(),
+@@ -588,17 +595,13 @@ export class WeiyunClient {
+       })
+     }
+ 
+-    const checkPointSlice = content.subarray(
+-      beforeBlockSize,
+-      beforeBlockSize + lastBlockSize - checkBlockSize,
+-    )
++    const tail = await readBlock(beforeBlockSize, lastBlockSize)
++    const splitAt = lastBlockSize - checkBlockSize
++    const checkPointSlice = tail.subarray(0, splitAt)
+     sha.update(checkPointSlice)
+     const checkSha = sha.getStateHex()
+ 
+-    const checkDataSlice = content.subarray(
+-      beforeBlockSize + lastBlockSize - checkBlockSize,
+-      fileSize,
+-    )
++    const checkDataSlice = tail.subarray(splitAt)
+     sha.update(checkDataSlice)
+     const checkData = uint8ArrayToBase64(checkDataSlice)
+     const fileHash = sha.digestHex()

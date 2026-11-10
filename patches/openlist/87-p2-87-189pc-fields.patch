@@ -1,0 +1,329 @@
+diff --git a/src/backend/drivers/189pc/addition.test.ts b/src/backend/drivers/189pc/addition.test.ts
+new file mode 100755
+index 0000000..d30f30e
+--- /dev/null
++++ b/src/backend/drivers/189pc/addition.test.ts
+@@ -0,0 +1,162 @@
++// SPEC p2-80（补丁 87）：189pc 配置字段保真与显式失败。零网络。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++
++import { Cloud189PCDriver, normalizeCloud189PCAddition } from "./driver"
++
++const realFetch = globalThis.fetch
++let fetchCount = 0
++let loginBody: URLSearchParams | null = null
++let loginResp: any = {
++  result: 0,
++  accessToken: "at",
++  sessionKey: "sk",
++  sessionSecret: "ss",
++  refreshToken: "rt",
++  tokenType: "Bearer",
++  familyId: 0,
++  keepAlive: 1,
++}
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function file(id: number, name: string, size: number, isFolder = false) {
++  return {
++    id,
++    parentId: 0,
++    name,
++    size,
++    createDate: "2026-01-02T03:04:05",
++    lastOpTime: "2026-01-02T03:04:05",
++    isFolder,
++  }
++}
++
++beforeEach(() => {
++  fetchCount = 0
++  loginBody = null
++  loginResp = {
++    result: 0,
++    accessToken: "at",
++    sessionKey: "sk",
++    sessionSecret: "ss",
++    refreshToken: "rt",
++    tokenType: "Bearer",
++    familyId: 0,
++    keepAlive: 1,
++  }
++  globalThis.fetch = (async (_input: any, init?: any) => {
++    fetchCount++
++    if (init?.body) loginBody = new URLSearchParams(String(init.body))
++    return jsonResponse(loginResp)
++  }) as any
++})
++
++afterEach(() => {
++  globalThis.fetch = realFetch
++})
++
++test("1 默认值", () => {
++  const a = normalizeCloud189PCAddition({})
++  assert.equal(a.order_by, "filename")
++  assert.equal(a.order_direction, "asc")
++  assert.equal(a.type, "personal")
++  assert.equal(a.upload_method, "stream")
++  assert.equal(a.upload_thread, "3")
++  assert.equal(a.strip_emoji, false)
++  assert.equal(a.family_transfer, false)
++  assert.equal(a.rapid_upload, false)
++  assert.equal(a.no_use_ocr, false)
++  assert.equal(a.family_id, "")
++  assert.equal(a.validate_code, "")
++})
++
++test("2 非法枚举显式抛错（含字段名与可选值）", () => {
++  assert.throws(
++    () => normalizeCloud189PCAddition({ order_by: "mtime" }),
++    /无效的 order_by=mtime.*filename,filesize,lastOpTime/,
++  )
++  assert.throws(
++    () => normalizeCloud189PCAddition({ type: "team" }),
++    /无效的 type=team.*personal,family/,
++  )
++  assert.throws(
++    () => normalizeCloud189PCAddition({ upload_method: "fast" }),
++    /无效的 upload_method=fast.*stream,rapid,old/,
++  )
++})
++
++test("3 upload_thread 收敛", () => {
++  assert.equal(normalizeCloud189PCAddition({ upload_thread: "0" }).upload_thread, "3")
++  assert.equal(normalizeCloud189PCAddition({ upload_thread: "33" }).upload_thread, "3")
++  assert.equal(normalizeCloud189PCAddition({ upload_thread: "abc" }).upload_thread, "3")
++  assert.equal(normalizeCloud189PCAddition({ upload_thread: "16" }).upload_thread, "16")
++})
++
++test("4 type=family：init 在任何 fetch 之前抛错", async () => {
++  const d = new Cloud189PCDriver({ username: "u", password: "p", type: "family" } as any)
++  await assert.rejects(() => d.init(), /type=family 未实现/)
++  assert.equal(fetchCount, 0)
++})
++
++test("5 排序：filesize/desc 与 filename/asc", async () => {
++  const d = new Cloud189PCDriver({ username: "u", password: "p", order_by: "filesize", order_direction: "desc" } as any)
++  let page = 0
++  ;(d as any).client.requestAPI = async () => {
++    page++
++    if (page === 1) {
++      return { folderList: [], fileList: [file(1, "a", 3), file(2, "b", 1)], recordCount: 4 }
++    }
++    return { folderList: [], fileList: [file(3, "c", 4), file(4, "d", 2)], recordCount: 4 }
++  }
++  const desc = await d.list("-11")
++  assert.deepEqual(desc.map((x) => x.size), [4, 3, 2, 1])
++
++  const d2 = new Cloud189PCDriver({ username: "u", password: "p" } as any)
++  page = 0
++  ;(d2 as any).client.requestAPI = async () => {
++    page++
++    if (page === 1) {
++      return { folderList: [], fileList: [file(1, "b", 3), file(2, "a", 1)], recordCount: 4 }
++    }
++    return { folderList: [], fileList: [file(3, "d", 4), file(4, "c", 2)], recordCount: 4 }
++  }
++  const asc = await d2.list("-11")
++  assert.deepEqual(asc.map((x) => x.name), ["a", "b", "c", "d"])
++})
++
++test("6 validate_code：非空进登录表单，空则不含该键", async () => {
++  const d = new Cloud189PCDriver({ username: "u", password: "p", validate_code: " 1234 " } as any)
++  await (d as any).login()
++  assert.ok(loginBody)
++  assert.equal(loginBody!.get("validateCode"), "1234")
++
++  loginBody = null
++  const d2 = new Cloud189PCDriver({ username: "u", password: "p" } as any)
++  await (d2 as any).login()
++  assert.ok(loginBody)
++  assert.equal((loginBody as any)!.has("validateCode"), false)
++})
++
++test("7 老配置不回退", () => {
++  const d = new Cloud189PCDriver({ username: "u", password: "p" } as any)
++  const a = (d as any).addition
++  assert.equal(a.order_by, "filename")
++  assert.equal(a.type, "personal")
++  assert.equal(a.upload_thread, "3")
++})
++
++test("8 登录失败验证码文案", async () => {
++  loginResp = { result: 10001, msg: "验证码错误" }
++  const d = new Cloud189PCDriver({ username: "u", password: "p" } as any)
++  await assert.rejects(() => (d as any).login(), /validate_code/)
++})
+diff --git a/src/backend/drivers/189pc/driver.ts b/src/backend/drivers/189pc/driver.ts
+index 7b7e956..ef7b2d8 100644
+--- a/src/backend/drivers/189pc/driver.ts
++++ b/src/backend/drivers/189pc/driver.ts
+@@ -53,6 +53,23 @@ function cloud189PCFileToFileItem(file: Cloud189PCFile): FileItem {
+   }
+ }
+ 
++/** 枚举校验：非法值显式拒绝（A 有表单层约束，W 没有，只能在这里拦）。 */
++function pickEnum(
++  field: string,
++  value: any,
++  allowed: string[],
++  fallback: string,
++): string {
++  const raw = value === undefined || value === null ? "" : String(value).trim()
++  const v = raw || fallback
++  if (!allowed.includes(v)) {
++    throw new Error(
++      `[189pc] 无效的 ${field}=${v}，可选：${allowed.join(",")}`,
++    )
++  }
++  return v
++}
++
+ export function normalizeCloud189PCAddition(a: any): Cloud189PCAddition {
+   const norm = { ...(a || {}) } as any
+   norm.username = (norm.username || "").trim()
+@@ -63,6 +80,43 @@ export function normalizeCloud189PCAddition(a: any): Cloud189PCAddition {
+   norm.session_key = norm.session_key || ""
+   norm.session_secret = norm.session_secret || ""
+   norm.login_type = norm.login_type || "1"
++  // r66 补丁 87：11 个字段的默认值与校验（追加在已有赋值之后）。
++  norm.order_by = pickEnum(
++    "order_by",
++    norm.order_by,
++    ["filename", "filesize", "lastOpTime"],
++    "filename",
++  )
++  norm.order_direction = pickEnum(
++    "order_direction",
++    norm.order_direction,
++    ["asc", "desc"],
++    "asc",
++  )
++  norm.type = pickEnum("type", norm.type, ["personal", "family"], "personal")
++  norm.upload_method = pickEnum(
++    "upload_method",
++    norm.upload_method,
++    ["stream", "rapid", "old"],
++    "stream",
++  )
++  // 照 A driver.go:73-77：Atoi 失败或 <1 或 >32 回落 3。
++  const threadRaw =
++    norm.upload_thread === undefined || norm.upload_thread === null
++      ? ""
++      : String(norm.upload_thread).trim()
++  let thread = 3
++  if (/^\d+$/.test(threadRaw)) {
++    const n = parseInt(threadRaw, 10)
++    if (n >= 1 && n <= 32) thread = n
++  }
++  norm.upload_thread = String(thread)
++  norm.strip_emoji = !!norm.strip_emoji
++  norm.family_transfer = !!norm.family_transfer
++  norm.rapid_upload = !!norm.rapid_upload
++  norm.no_use_ocr = !!norm.no_use_ocr
++  norm.family_id = String(norm.family_id || "").trim()
++  norm.validate_code = String(norm.validate_code || "").trim()
+   return norm as Cloud189PCAddition
+ }
+ 
+@@ -103,6 +157,12 @@ export class Cloud189PCDriver implements StorageDriver {
+   }
+ 
+   async init(): Promise<void> {
++    // r66 补丁 87：家庭云没有实现，必须在任何网络调用之前显式失败。
++    if (this.addition.type === "family") {
++      throw new Error(
++        "[189pc] type=family 未实现：本移植没有家庭云列表/上传，拒绝静默按个人云挂载",
++      )
++    }
+     // Check if we have valid session
+     if (this.addition.session_key && this.addition.session_secret) {
+       // Try to use existing session
+@@ -134,7 +194,7 @@ export class Cloud189PCDriver implements StorageDriver {
+ 
+   private async login(): Promise<void> {
+     // Get RSA public key
+-    const params = {
++    const params: Record<string, string> = {
+       appId: "600002434",
+       accountType: this.addition.login_type || "1",
+       userName: this.addition.username,
+@@ -143,6 +203,10 @@ export class Cloud189PCDriver implements StorageDriver {
+       returnUrl: "https://m.cloud.189.cn/zhuanti/2020/loginSuccess/index.html",
+       mailSuffix: "@189.cn",
+     }
++    // r66 补丁 87：validate_code 非空才进表单（空则请求体与旧版逐字节相同）。
++    if (this.addition.validate_code) {
++      params.validateCode = this.addition.validate_code
++    }
+ 
+     const resp = await this.client.request(LoginURL, {
+       method: "POST",
+@@ -153,7 +217,11 @@ export class Cloud189PCDriver implements StorageDriver {
+     })
+ 
+     if (!resp || resp.result !== 0) {
+-      throw new Error(`Login failed: ${resp?.msg || "Unknown error"}`)
++      const msg = String(resp?.msg || "Unknown error")
++      const hint = /验证码|验证|code|captcha/i.test(msg)
++        ? "；需要验证码时请先填 validate_code 再保存"
++        : ""
++      throw new Error(`Login failed: ${msg}${hint}`)
+     }
+ 
+     const loginResp = resp as Cloud189PCLoginResp
+@@ -220,7 +288,18 @@ export class Cloud189PCDriver implements StorageDriver {
+       pageNum++
+     }
+ 
+-    return sortFileItems(allFiles, "name", "asc")
++    // r66 补丁 87：order_by/order_direction 落地（A utils.go:217）。
++    const orderByKey =
++      this.addition.order_by === "filesize"
++        ? "size"
++        : this.addition.order_by === "lastOpTime"
++          ? "modified"
++          : "name"
++    return sortFileItems(
++      allFiles,
++      orderByKey,
++      this.addition.order_direction,
++    )
+   }
+ 
+   async link(file: FileItem): Promise<{ url: string; headers?: Record<string, string> }> {
+diff --git a/src/backend/drivers/189pc/types.ts b/src/backend/drivers/189pc/types.ts
+index 8d55550..6aa0830 100644
+--- a/src/backend/drivers/189pc/types.ts
++++ b/src/backend/drivers/189pc/types.ts
+@@ -10,6 +10,18 @@ export interface Cloud189PCAddition {
+   session_key?: string
+   session_secret?: string
+   login_type?: string
++  // r66 补丁 87：与 A meta.go 对齐的 11 个字段（配置保真；语义见 driver.ts）
++  validate_code?: string
++  strip_emoji?: boolean
++  order_by?: string
++  order_direction?: string
++  type?: string
++  family_id?: string
++  upload_method?: string
++  upload_thread?: string
++  family_transfer?: boolean
++  rapid_upload?: boolean
++  no_use_ocr?: boolean
+ }
+ 
+ export interface Cloud189PCLoginResp {

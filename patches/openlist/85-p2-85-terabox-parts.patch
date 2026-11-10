@@ -1,0 +1,539 @@
+diff --git a/src/backend/drivers/terabox/driver.ts b/src/backend/drivers/terabox/driver.ts
+index e6a4fe3..ab51671 100644
+--- a/src/backend/drivers/terabox/driver.ts
++++ b/src/backend/drivers/terabox/driver.ts
+@@ -11,8 +11,44 @@ import {
+   TeraboxListResp,
+   TeraboxLocateUploadResp,
+   TeraboxPrecreateResp,
++  TeraboxCreateResp,
+ } from "./types"
+ import { TeraboxApiClient } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  resolveSpoolDir,
++  unlinkSpool,
++} from "../../internal/upload/spool"
++
++/** A drivers/terabox/util.go:21 initialChunkSize */
++const INITIAL_CHUNK_SIZE = 4 * 1024 * 1024
++/** A drivers/terabox/util.go:22 initialSizeThreshold */
++const INITIAL_SIZE_THRESHOLD = 4 * 1024 * 1024 * 1024
++/** precreate 占位 md5：A driver.go:151-155，主动放弃秒传判定。 */
++const PRECREATE_BLOCK_1 = "5910a591dd8fc18c32a8f3df4fdc1761"
++const PRECREATE_BLOCK_2 = "a5fc157d78e6ad1c7e114b056c92821e"
++/** begin 时至少预留 fileSize + 64MiB。 */
++const SPOOL_MIN_FREE = 64 * 1024 * 1024
++const TERABOX_UA =
++  "terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox"
++
++/**
++ * 逐字移植 A drivers/terabox/util.go:274-288。
++ * 用乘法而不是 <<：JS 的位移是 32 位，2GiB 档会溢出成负数。
++ */
++export function calculateChunkSize(size: number): number {
++  let chunkSize = INITIAL_CHUNK_SIZE
++  let threshold = INITIAL_SIZE_THRESHOLD
++  if (size < chunkSize) return size
++  while (size > threshold) {
++    chunkSize *= 2
++    threshold *= 2
++  }
++  return chunkSize
++}
+ 
+ export class TeraboxDriver implements StorageDriver {
+   private addition: TeraboxAddition
+@@ -246,89 +282,208 @@ export class TeraboxDriver implements StorageDriver {
+     ])
+   }
+ 
+-  async put(
+-    virtualPath: string,
++  /**
++   * 本地维护：txiki 上传内存上限。落盘暂存 + 按 A 的 calculateChunkSize 串行
++   * 分片；内存上限 = 一个分片。block_list 用每片 md5，与 A driver.go:249-262 一致。
++   */
++  async beginStream(
+     physicalPath: string,
+-    content: Buffer,
+-  ): Promise<void> {
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
+     const clean = this.cleanPath(physicalPath)
+     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"
+     const fileName = clean.split("/").pop() || "upload"
+ 
+-    const locateRes = await fetch(
+-      "https://jp-data.terabox.com/rest/2.0/pcs/file?method=locateupload",
++    const dir = resolveSpoolDir("terabox")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known ? (expectedSize as number) + SPOOL_MIN_FREE : SPOOL_MIN_FREE,
+     )
+-    const locateData: TeraboxLocateUploadResp = await locateRes.json()
+-    const uploadHost = locateData.host || "d.terabox.com"
+-
+-    const contentMd5 = md5(new Uint8Array(content))
+-    const precreateBody = {
+-      path: clean,
+-      autoinit: "1",
+-      target_path: parentPath,
+-      block_list: JSON.stringify([contentMd5]),
+-      local_mtime: String(Math.floor(Date.now() / 1000)),
+-      file_limit_switch_v34: "true",
+-    }
+ 
+-    const precreateRes: TeraboxPrecreateResp = await this.client.request(
+-      "/api/precreate",
+-      {
+-        method: "POST",
+-        isFormData: true,
+-        body: precreateBody,
+-      },
+-    )
++    const spoolPath = `${dir}/terabox-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
+ 
+-    if (precreateRes.errno !== 0) {
+-      throw new Error(`TeraBox precreate failed (errno: ${precreateRes.errno})`)
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
+     }
+-
+-    // Direct rapid return
+-    if (precreateRes.return_type === 2) {
+-      return
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[terabox] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
+     }
+ 
+-    const uploadUrl = `https://${uploadHost}/rest/2.0/pcs/superfile2?method=upload&path=${encodeURIComponent(clean)}&uploadid=${encodeURIComponent(precreateRes.uploadid)}&partseq=0`
+-
+-    const formData = new FormData()
+-    formData.append(
+-      "file",
+-      new Blob([new Uint8Array(content)], { type: "application/octet-stream" }),
+-      fileName,
+-    )
+-
+-    const uploadRes = await fetch(uploadUrl, {
+-      method: "POST",
+-      headers: {
+-        Cookie: this.addition.cookie,
+-        "User-Agent":
+-          "terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox",
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("terabox beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("terabox 上传声明长度与实际不符")
++        }
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("terabox beginStream 已结束，不能重复 commit")
++        state = "done"
++        let reader: Awaited<ReturnType<typeof openSpoolFile>> | null = null
++        try {
++          await fh.close()
++          // a) locateupload（域名选择逻辑照旧）
++          const locateRes = await fetch(
++            "https://jp-data.terabox.com/rest/2.0/pcs/file?method=locateupload",
++          )
++          const locateData: TeraboxLocateUploadResp = await locateRes.json()
++          const uploadHost = locateData.host || "d.terabox.com"
++
++          // b) precreate：固定占位 md5（>4MiB 两个、否则一个）
++          const precreateBlockListStr =
++            size > INITIAL_CHUNK_SIZE
++              ? `["${PRECREATE_BLOCK_1}","${PRECREATE_BLOCK_2}"]`
++              : `["${PRECREATE_BLOCK_1}"]`
++          const precreateRes: TeraboxPrecreateResp = await this.client.request(
++            "/api/precreate",
++            {
++              method: "POST",
++              isFormData: true,
++              body: {
++                path: clean,
++                autoinit: "1",
++                target_path: parentPath,
++                block_list: precreateBlockListStr,
++                local_mtime: String(Math.floor(Date.now() / 1000)),
++                file_limit_switch_v34: "true",
++              },
++            },
++          )
++          if (precreateRes.errno !== 0) {
++            throw new Error(
++              `TeraBox precreate failed (errno: ${precreateRes.errno})`,
++            )
++          }
++          if (precreateRes.return_type === 2) {
++            return
++          }
++
++          // c) 分片循环：串行，每片单独 md5，失败即整体失败
++          const chunkSize = calculateChunkSize(size)
++          const count = size === 0 ? 0 : Math.ceil(size / chunkSize)
++          const uploadBlockList: string[] = []
++          if (count > 0) {
++            reader = await openSpoolFile(spoolPath, "r")
++          }
++          for (let partseq = 0; partseq < count; partseq++) {
++            const byteSize = Math.min(chunkSize, size - partseq * chunkSize)
++            const partBuf = new Uint8Array(byteSize)
++            let got = 0
++            while (got < byteSize) {
++              const n = await reader!.readAt(
++                partBuf.subarray(got),
++                partseq * chunkSize + got,
++              )
++              if (!(n > 0)) throw new Error("terabox spool 读取提前结束")
++              got += n
++            }
++            uploadBlockList.push(md5(partBuf))
++
++            const uploadUrl =
++              `https://${uploadHost}/rest/2.0/pcs/superfile2?method=upload` +
++              `&path=${encodeURIComponent(clean)}` +
++              `&uploadid=${encodeURIComponent(precreateRes.uploadid)}` +
++              `&partseq=${partseq}`
++            const formData = new FormData()
++            formData.append(
++              "file",
++              new Blob([partBuf], { type: "application/octet-stream" }),
++              fileName,
++            )
++            const uploadRes = await fetch(uploadUrl, {
++              method: "POST",
++              headers: {
++                Cookie: this.addition.cookie,
++                "User-Agent": TERABOX_UA,
++              },
++              body: formData,
++            })
++            if (!uploadRes.ok) {
++              throw new Error(
++                `[TeraBox] part ${partseq + 1}/${count} failed: HTTP ${uploadRes.status}`,
++              )
++            }
++          }
++
++          // d) create：block_list = 各片 md5
++          const createRes: TeraboxCreateResp = await this.client.request(
++            "/api/create",
++            {
++              method: "POST",
++              isFormData: true,
++              params: {
++                isdir: "0",
++                rtype: "1",
++              },
++              body: {
++                path: clean,
++                size: String(size),
++                uploadid: precreateRes.uploadid,
++                target_path: parentPath,
++                block_list: JSON.stringify(uploadBlockList),
++                local_mtime: String(Math.floor(Date.now() / 1000)),
++              },
++            },
++          )
++          if (createRes?.errno !== 0) {
++            throw new Error(
++              `[TeraBox] create failed (errno: ${createRes?.errno})`,
++            )
++          }
++        } finally {
++          if (reader) {
++            try {
++              await reader.close()
++            } catch {}
++          }
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
+       },
+-      body: formData,
+-    })
+-
+-    if (!uploadRes.ok) {
+-      throw new Error(`TeraBox upload chunk failed: ${uploadRes.statusText}`)
+-    }
+-
+-    const createBody = {
+-      path: clean,
+-      size: String(content.length),
+-      uploadid: precreateRes.uploadid,
+-      target_path: parentPath,
+-      block_list: JSON.stringify([contentMd5]),
+-      local_mtime: String(Math.floor(Date.now() / 1000)),
+     }
++  }
+ 
+-    await this.client.request("/api/create", {
+-      method: "POST",
+-      isFormData: true,
+-      params: {
+-        isdir: "0",
+-        rtype: "1",
+-      },
+-      body: createBody,
+-    })
++  async put(
++    virtualPath: string,
++    physicalPath: string,
++    content: Buffer,
++  ): Promise<void> {
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
+   }
+ }
+diff --git a/src/backend/drivers/terabox/part-upload.test.ts b/src/backend/drivers/terabox/part-upload.test.ts
+new file mode 100755
+index 0000000..3cb933e
+--- /dev/null
++++ b/src/backend/drivers/terabox/part-upload.test.ts
+@@ -0,0 +1,205 @@
++// SPEC p2-78（补丁 85）：terabox 分片上传与落盘暂存单元测试。
++// mock globalThis.fetch 与 globalThis.tjs：不连网、不需要真实 terabox 账号。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { createHash } from "node:crypto"
++
++import { TeraboxDriver, calculateChunkSize } from "./driver"
++
++const MB = 1024 * 1024
++const GB = 1024 * MB
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++interface FetchCall {
++  url: string
++  method: string
++  body: any
++}
++interface PartRec {
++  partseq: number
++  bytes: Uint8Array
++}
++
++let calls: FetchCall[] = []
++let spoolDir = ""
++let readLens: number[] = []
++let parts: PartRec[] = []
++let precreateResp: any = { errno: 0, return_type: 1, uploadid: "up-1" }
++let partFailAt = -1
++let createResp: any = { errno: 0 }
++let createBody: URLSearchParams | null = null
++let createCount = 0
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function okResponse(): any {
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => "{}",
++    json: async () => ({}),
++  }
++}
++
++function errResponse(status: number): any {
++  return {
++    ok: false,
++    status,
++    headers: { get: () => "text/plain" },
++    text: async () => "boom",
++    json: async () => ({}),
++  }
++}
++
++function makeDriver(): TeraboxDriver {
++  return new TeraboxDriver({ cookie: "test-cookie" } as any)
++}
++
++beforeEach(async () => {
++  calls = []
++  readLens = []
++  parts = []
++  partFailAt = -1
++  precreateResp = { errno: 0, return_type: 1, uploadid: "up-1" }
++  createResp = { errno: 0 }
++  createBody = null
++  createCount = 0
++  spoolDir = await mkdtemp(join(tmpdir(), "terabox-p85-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => (await fh.write(chunk)).bytesWritten,
++        read: async (buf: Uint8Array, position: number) => {
++          readLens.push(buf.byteLength)
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    const method = String(init?.method || "GET").toUpperCase()
++    calls.push({ url, method, body: init?.body })
++    if (url.includes("method=locateupload")) {
++      return jsonResponse({ host: "d.terabox.com" })
++    }
++    if (url.includes("/api/precreate")) {
++      return jsonResponse(precreateResp)
++    }
++    if (url.includes("/rest/2.0/pcs/superfile2")) {
++      const u = new URL(url)
++      const partseq = Number(u.searchParams.get("partseq"))
++      const form: FormData = init.body
++      const file = form.get("file") as File
++      const bytes = new Uint8Array(await file.arrayBuffer())
++      parts.push({ partseq, bytes })
++      if (partFailAt === partseq) return errResponse(500)
++      return okResponse()
++    }
++    if (url.includes("/api/create")) {
++      createCount++
++      createBody = new URLSearchParams(String(init.body))
++      return jsonResponse(createResp)
++    }
++    throw new Error("unexpected fetch: " + url)
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++test("1 calculateChunkSize 表驱动", () => {
++  assert.equal(calculateChunkSize(1), 1)
++  assert.equal(calculateChunkSize(4 * MB), 4 * MB)
++  assert.equal(calculateChunkSize(4 * MB + 1), 4 * MB)
++  assert.equal(calculateChunkSize(5 * MB), 4 * MB)
++  assert.equal(calculateChunkSize(4 * GB + 1), 8 * MB)
++  assert.equal(calculateChunkSize(8 * GB + 1), 16 * MB)
++})
++
++test("2/3/6 10MiB：precreate 1 次、分片 3 次、create 1 次、block_list 3 项", async () => {
++  const d = makeDriver()
++  const src = new Uint8Array(10 * MB)
++  for (let i = 0; i < src.length; i++) src[i] = (i * 17 + 3) & 0xff
++  const w = await (d as any).beginStream("docs/big.bin", 10 * MB)
++  await w.write(src)
++  await w.commit()
++
++  const pre = calls.filter((c) => c.url.includes("/api/precreate"))
++  assert.equal(pre.length, 1)
++  assert.equal(parts.length, 3)
++  assert.deepEqual(parts.map((p) => p.partseq), [0, 1, 2])
++  assert.deepEqual(parts.map((p) => p.bytes.length), [4 * MB, 4 * MB, 2 * MB])
++  for (let i = 0; i < 3; i++) {
++    const off = i * 4 * MB
++    const wantMd5 = createHash("md5").update(src.subarray(off, off + parts[i].bytes.length)).digest("hex")
++    const gotMd5 = createHash("md5").update(parts[i].bytes).digest("hex")
++    assert.equal(gotMd5, wantMd5)
++  }
++  assert.equal(createCount, 1)
++  assert.ok(createBody)
++  const blockList = JSON.parse(createBody!.get("block_list") || "[]")
++  assert.equal(blockList.length, 3)
++  const fullMd5 = createHash("md5").update(src).digest("hex")
++  assert.ok(!blockList.includes(fullMd5))
++  assert.equal(createBody!.get("size"), String(10 * MB))
++
++  assert.equal(readLens.length, 3, "每片一次 readAt")
++  assert.ok(Math.max(...readLens) <= 4 * MB)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("4 第 2 片回 500：只发 2 片、错误含 part 2/3、spool 已删", async () => {
++  partFailAt = 1
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/big.bin", 10 * MB)
++  await w.write(new Uint8Array(10 * MB))
++  await assert.rejects(() => w.commit(), /part 2\/3 failed: HTTP 500/)
++  assert.equal(parts.length, 2)
++  assert.equal(createCount, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("5 秒传：return_type=2 不再发片、不调 create、spool 已删", async () => {
++  precreateResp = { errno: 0, return_type: 2, uploadid: "up-2" }
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/big.bin", 10 * MB)
++  await w.write(new Uint8Array(10 * MB))
++  await w.commit()
++  assert.equal(parts.length, 0)
++  assert.equal(createCount, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("7 put 兼容路径：3MiB 走同一实现、片上字节一致", async () => {
++  const d = makeDriver()
++  const src = new Uint8Array(3 * MB)
++  for (let i = 0; i < src.length; i++) src[i] = (i * 7 + 1) & 0xff
++  await d.put("/docs/small.bin", "docs/small.bin", Buffer.from(src))
++  assert.equal(parts.length, 1)
++  assert.deepEqual(parts[0].bytes, src)
++  assert.deepEqual(await readdir(spoolDir), [])
++})

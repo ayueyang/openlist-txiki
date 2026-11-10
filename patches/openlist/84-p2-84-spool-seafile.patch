@@ -1,0 +1,678 @@
+diff --git a/src/backend/drivers/seafile/driver.ts b/src/backend/drivers/seafile/driver.ts
+index e4749fc..b930a9a 100644
+--- a/src/backend/drivers/seafile/driver.ts
++++ b/src/backend/drivers/seafile/driver.ts
+@@ -6,6 +6,51 @@ import {
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { SeafileAddition, SeafileLibraryItem, SeafileRepoItem } from "./types"
+ import { SeafileApiClient } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  resolveSpoolDir,
++  unlinkSpool,
++  SpoolHandle,
++} from "../../internal/upload/spool"
++
++/** begin 时至少预留 fileSize + 64MiB。 */
++const SPOOL_MIN_FREE = 64 * 1024 * 1024
++/** 出站流读块，与 txiki/shims/fs.ts 的 createReadStream 同口径。 */
++const SPOOL_READ_CHUNK = 64 * 1024
++
++/**
++ * 从 spool 读句柄建出站流：pull 驱动、64KiB 一块、空闲不读。
++ * 不用 txiki/shims/fs 的 createReadStream：那是适配层文件，静态 import 会把
++ * tjs:path 拖进 Node 单测，驱动文件必须保持 node 可加载。
++ */
++function spoolReadStream(
++  handle: SpoolHandle,
++  size: number,
++): ReadableStream<Uint8Array> {
++  let pos = 0
++  return new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      if (pos >= size) {
++        controller.close()
++        return
++      }
++      const want = Math.min(SPOOL_READ_CHUNK, size - pos)
++      const buf = new Uint8Array(want)
++      let got = 0
++      while (got < want) {
++        const n = await handle.readAt(buf.subarray(got), pos + got)
++        if (!(n > 0)) throw new Error("seafile spool 读取提前结束")
++        got += n
++      }
++      pos += want
++      controller.enqueue(buf)
++      if (pos >= size) controller.close()
++    },
++  })
++}
+ 
+ export class SeafileDriver implements StorageDriver {
+   private addition: SeafileAddition
+@@ -338,39 +383,117 @@ export class SeafileDriver implements StorageDriver {
+     )
+   }
+ 
+-  async put(
+-    virtualPath: string,
++  /**
++   * 本地维护：txiki 上传内存上限。先把数据顺序落盘到 spool，commit 时从盘
++   * 流式 multipart 发给 upload-link；内存峰值 = 64KiB 读块。
++   * A drivers/seafile/driver.go:200 的语义（io.Reader 进 multipart）不变。
++   */
++  async beginStream(
+     physicalPath: string,
+-    content: Buffer,
+-  ): Promise<void> {
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
+     const { repoId, innerPath } = await this.resolveRepoAndPath(physicalPath)
+     const parentPath = innerPath.split("/").slice(0, -1).join("/") || "/"
+     const fileName = innerPath.split("/").pop() || "upload"
+ 
+-    const uploadLinkRes = await this.client.request<string>(
+-      `/api2/repos/${encodeURIComponent(repoId)}/upload-link/`,
+-      {
+-        params: { p: parentPath },
+-      },
++    const dir = resolveSpoolDir("seafile")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known ? (expectedSize as number) + SPOOL_MIN_FREE : SPOOL_MIN_FREE,
+     )
+ 
+-    const uploadUrl = (uploadLinkRes || "").replace(/^"|"$/g, "").trim()
+-    if (!uploadUrl) {
+-      throw new Error("Failed to get Seafile upload link")
++    const spoolPath = `${dir}/seafile-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
++
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
++    }
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[seafile] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
+     }
+ 
+-    const formData = new FormData()
+-    formData.append("parent_dir", parentPath)
+-    formData.append("replace", "1")
+-    formData.append(
+-      "file",
+-      new Blob([new Uint8Array(content)], { type: "application/octet-stream" }),
+-      fileName,
+-    )
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("seafile beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("seafile 上传声明长度与实际不符")
++        }
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("seafile beginStream 已结束，不能重复 commit")
++        state = "done"
++        try {
++          await fh.close()
++          const uploadLinkRes = await this.client.request<string>(
++            `/api2/repos/${encodeURIComponent(repoId)}/upload-link/`,
++            {
++              params: { p: parentPath },
++            },
++          )
++          const uploadUrl = (uploadLinkRes || "").replace(/^"|"$/g, "").trim()
++          if (!uploadUrl) {
++            throw new Error("Failed to get Seafile upload link")
++          }
++          const reader = await openSpoolFile(spoolPath, "r")
++          try {
++            await this.client.postMultipartStream(
++              uploadUrl,
++              { parent_dir: parentPath, replace: "1" },
++              { name: fileName, stream: spoolReadStream(reader, size) },
++            )
++          } finally {
++            try {
++              await reader.close()
++            } catch {}
++          }
++        } finally {
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
++    }
++  }
+ 
+-    await this.client.request(uploadUrl, {
+-      method: "POST",
+-      body: formData,
+-    })
++  async put(
++    virtualPath: string,
++    physicalPath: string,
++    content: Buffer,
++  ): Promise<void> {
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
+   }
+ }
+diff --git a/src/backend/drivers/seafile/stream.test.ts b/src/backend/drivers/seafile/stream.test.ts
+new file mode 100644
+index 0000000..da11564
+--- /dev/null
++++ b/src/backend/drivers/seafile/stream.test.ts
+@@ -0,0 +1,219 @@
++// SPEC p2-77（补丁 84）：seafile 落盘暂存 + 流式 multipart 单元测试。
++// 全部 mock globalThis.fetch 与 globalThis.tjs：不连网、不需要真实 seafile。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { SeafileDriver } from "./driver"
++
++const MB = 1024 * 1024
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++interface FetchCall {
++  url: string
++  method: string
++  body: any
++  duplex?: string
++}
++
++let calls: FetchCall[] = []
++let spoolDir = ""
++let readLens: number[] = []
++let uploadStatus = 200
++let uploadText = ""
++let statFsBavail = 1024 * 1024
++let fullBody: Uint8Array | null = null
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function textResponse(status: number, text: string): any {
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    headers: { get: () => "text/plain" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++async function readAllStream(body: any): Promise<Uint8Array> {
++  const reader = body.getReader()
++  const chunks: Uint8Array[] = []
++  let total = 0
++  for (;;) {
++    const { done, value } = await reader.read()
++    if (done) break
++    chunks.push(value)
++    total += value.byteLength
++  }
++  const out = new Uint8Array(total)
++  let off = 0
++  for (const c of chunks) {
++    out.set(c, off)
++    off += c.byteLength
++  }
++  return out
++}
++
++function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from = 0): number {
++  outer: for (let i = from; i + needle.length <= haystack.length; i++) {
++    for (let j = 0; j < needle.length; j++) {
++      if (haystack[i + j] !== needle[j]) continue outer
++    }
++    return i
++  }
++  return -1
++}
++
++function makeDriver(): SeafileDriver {
++  return new SeafileDriver({
++    address: "https://seafile.test",
++    token: "test-token",
++    repo_id: "repo-1",
++  } as any)
++}
++
++beforeEach(async () => {
++  calls = []
++  readLens = []
++  uploadStatus = 200
++  uploadText = ""
++  statFsBavail = 1024 * 1024
++  fullBody = null
++  spoolDir = await mkdtemp(join(tmpdir(), "seafile-p84-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: statFsBavail }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => {
++          const r = await fh.write(chunk)
++          return r.bytesWritten
++        },
++        read: async (buf: Uint8Array, position: number) => {
++          readLens.push(buf.byteLength)
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    const method = String(init?.method || "GET").toUpperCase()
++    calls.push({ url, method, body: init?.body, duplex: init?.duplex })
++    if (url.includes("/upload-link/")) {
++      return jsonResponse("https://upload.seafile.test/u/abc")
++    }
++    if (url.startsWith("https://upload.seafile.test/")) {
++      fullBody = await readAllStream(init.body)
++      return textResponse(uploadStatus, uploadText || "ok")
++    }
++    throw new Error("unexpected fetch: " + url)
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++test("1 能力探测：beginStream 存在", () => {
++  const d = makeDriver()
++  assert.equal(typeof (d as any).beginStream, "function")
++})
++
++test("7 空间不足：写第一块前抛错", async () => {
++  statFsBavail = 1
++  const d = makeDriver()
++  await assert.rejects(
++    () => (d as any).beginStream("docs/a.bin", 5 * MB),
++    /空间不足/,
++  )
++  assert.equal(calls.length, 0)
++})
++
++test("2/3 5MiB 三块写入：2 次 fetch、body 是流、读块 <=64KiB、字节一致", async () => {
++  const d = makeDriver()
++  const src = new Uint8Array(5 * MB)
++  for (let i = 0; i < src.length; i++) src[i] = (i * 31 + 7) & 0xff
++
++  const w = await (d as any).beginStream("docs/a.bin", 5 * MB)
++  await w.write(src.subarray(0, 2 * MB))
++  await w.write(src.subarray(2 * MB, 4 * MB))
++  await w.write(src.subarray(4 * MB, 5 * MB))
++  await w.commit()
++
++  assert.equal(calls.length, 2, "upload-link + 上传 POST")
++  assert.ok(calls[1].body instanceof ReadableStream, "POST body 必须是 ReadableStream")
++  assert.equal(calls[1].duplex, "half")
++  assert.ok(String(calls[1].url).includes("upload.seafile.test"))
++
++  // 从流里取回完整 body 再解析文件段（fetch mock 已读一遍；这里重放不便，
++  // 改为在 mock 内保存）。见下方 fullBody。
++  const body = fullBody!
++  assert.ok(body.byteLength > 5 * MB)
++  const head = Buffer.from(body).toString("latin1")
++  assert.ok(head.includes("name=\"parent_dir\"") && head.includes("docs"))
++  assert.ok(head.includes("name=\"replace\"") && head.includes("\r\n\r\n1\r\n"))
++  const marker = Buffer.from("filename=\"a.bin\"", "latin1")
++  const mi = indexOfBytes(body, marker)
++  assert.ok(mi > 0, "multipart 头里必须有文件名")
++  const sep = indexOfBytes(body, Buffer.from("\r\n\r\n", "latin1"), mi)
++  assert.ok(sep > 0)
++  const fileStart = sep + 4
++  const fileBytes = body.subarray(fileStart, fileStart + src.length)
++  assert.deepEqual(fileBytes, src)
++  const tail = Buffer.from(body.subarray(fileStart + src.length)).toString("latin1")
++  assert.match(tail, /^\r\n------openlist-[0-9a-f]{32}--\r\n$/)
++
++  assert.ok(readLens.length > 0, "读块必须经过 tjs.read")
++  assert.ok(Math.max(...readLens) <= 65536, "读块上限 64KiB")
++  assert.equal(readLens.reduce((a, b) => a + b, 0), 5 * MB)
++})
++
++test("4 4xx：错误含 403 与前 300 字符，spool 已删", async () => {
++  uploadStatus = 403
++  uploadText = "denied by policy: token invalid or expired"
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/a.bin", 3)
++  await w.write(new Uint8Array([1, 2, 3]))
++  await assert.rejects(() => w.commit(), (e: any) => {
++    assert.match(String(e.message), /403/)
++    assert.ok(String(e.message).includes(uploadText.slice(0, 300)))
++    return true
++  })
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("5 abort：不发上传 POST，spool 已删", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/a.bin", 2 * MB)
++  await w.write(new Uint8Array(MB))
++  await w.abort()
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("6 长度不符：expectedSize=10 写 11 字节即抛错", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("docs/a.bin", 10)
++  await assert.rejects(() => w.write(new Uint8Array(11)), /声明长度与实际不符/)
++  assert.equal(calls.length, 0)
++})
+diff --git a/src/backend/drivers/seafile/util.ts b/src/backend/drivers/seafile/util.ts
+index 3c2ca19..fb5ba1b 100644
+--- a/src/backend/drivers/seafile/util.ts
++++ b/src/backend/drivers/seafile/util.ts
+@@ -3,6 +3,7 @@ import {
+   SeafileAuthTokenResp,
+   SeafileLibraryItem,
+ } from "./types"
++import { randomHex } from "../../internal/upload/spool"
+ 
+ export class SeafileApiClient {
+   private addition: SeafileAddition
+@@ -140,6 +141,78 @@ export class SeafileApiClient {
+     return text as unknown as T
+   }
+ 
++  /**
++   * 本地维护：txiki 上传内存上限。seafile 的 PUT 走流式 multipart：
++   * 文件来自盘上的 spool，按 64KiB 拉块进请求体，内存不随文件大小增长。
++   * duplex: "half" 是 txiki fetch polyfill 对 ReadableStream 请求体的硬要求。
++   */
++  async postMultipartStream(
++    url: string,
++    fields: Record<string, string>,
++    file: { name: string; stream: ReadableStream<Uint8Array> },
++  ): Promise<void> {
++    const boundary = `----openlist-${randomHex(16)}`
++    const enc = new TextEncoder()
++    let head = ""
++    for (const [k, v] of Object.entries(fields)) {
++      head += `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`
++    }
++    head +=
++      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file.name}"` +
++      `\r\nContent-Type: application/octet-stream\r\n\r\n`
++    const headBytes = enc.encode(head)
++    const tailBytes = enc.encode(`\r\n--${boundary}--\r\n`)
++    const reader = file.stream.getReader()
++    let phase: 0 | 1 | 2 = 0
++    const body = new ReadableStream<Uint8Array>({
++      async pull(controller) {
++        if (phase === 0) {
++          phase = 1
++          controller.enqueue(headBytes)
++          return
++        }
++        if (phase === 1) {
++          const { done, value } = await reader.read()
++          if (done) {
++            phase = 2
++            controller.enqueue(tailBytes)
++            controller.close()
++            return
++          }
++          controller.enqueue(value)
++        }
++      },
++      async cancel(reason) {
++        try {
++          await reader.cancel(reason)
++        } catch {}
++      },
++    })
++    const headers: Record<string, string> = {
++      Accept: "application/json",
++      "Content-Type": `multipart/form-data; boundary=${boundary}`,
++    }
++    if (this.authorization) headers["Authorization"] = this.authorization
++    const res = await fetch(url, {
++      method: "POST",
++      headers,
++      body,
++      duplex: "half",
++    } as any)
++    if (!res.ok) {
++      let text = ""
++      try {
++        text = await res.text()
++      } catch {}
++      throw new Error(
++        `Seafile upload failed (${res.status}): ${text.slice(0, 300)}`,
++      )
++    }
++    try {
++      await res.body?.cancel()
++    } catch {}
++  }
++
+   async getLibraryInfo(repoId: string): Promise<SeafileLibraryItem> {
+     return this.request<SeafileLibraryItem>(`/api2/repos/${repoId}/`)
+   }
+diff --git a/src/backend/internal/upload/spool.ts b/src/backend/internal/upload/spool.ts
+new file mode 100755
+index 0000000..eae3c2b
+--- /dev/null
++++ b/src/backend/internal/upload/spool.ts
+@@ -0,0 +1,158 @@
++/**
++ * 上传落盘暂存（spool）公共模块。
++ *
++ * 语义取自 115open 已验证的实现（补丁 70/71）：上传先顺序写盘，commit 时再从盘
++ * 按块读，内存峰值与文件大小无关。本模块不持有任何驱动状态；owner 只用于错误文案。
++ *
++ * 目录解析顺序：UPLOAD_SPOOL_DIR > dirname(TJS_DB)/upload-spool > TJS_DATA_DIR/upload-spool。
++ * 三者皆无则抛错，禁止回退 /tmp（设备上 /tmp 是 tmpfs）。
++ * 残留文件由 txiki/upload-sweep 按 24h TTL 清理（前缀 <owner>-*.part）。
++ */
++
++function tjsFs(): any {
++  const t = (globalThis as any).tjs
++  return t && typeof t.open === "function" ? t : null
++}
++
++function isErrno(e: any, name: string): boolean {
++  return e?.code === name || String(e?.message || e).includes(name)
++}
++
++export function resolveSpoolDir(owner: string): string {
++  const t = (globalThis as any).tjs
++  const env = (t && t.env) || {}
++  const explicit = env.UPLOAD_SPOOL_DIR
++  if (explicit) return String(explicit).replace(/[\/]+$/, "")
++  const db = env.TJS_DB
++  if (db) {
++    const s = String(db)
++    const idx = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"))
++    if (idx > 0) return `${s.slice(0, idx)}/upload-spool`
++  }
++  const dataDir = env.TJS_DATA_DIR
++  if (dataDir) return `${String(dataDir).replace(/[\/]+$/, "")}/upload-spool`
++  throw new Error(
++    `${owner} 上传暂存目录不可用：请设置 UPLOAD_SPOOL_DIR、TJS_DB 或 TJS_DATA_DIR` +
++      "（禁止回退 /tmp：设备上是 tmpfs）",
++  )
++}
++
++export async function ensureDir(dir: string): Promise<void> {
++  const t = tjsFs()
++  if (!t || typeof t.makeDir !== "function") {
++    const fsp: any = await import("node:fs/promises")
++    await fsp.mkdir(dir, { recursive: true })
++    return
++  }
++  const parts = dir.split("/").filter(Boolean)
++  let cur = dir.startsWith("/") ? "" : "."
++  for (const p of parts) {
++    cur = cur === "" ? `/${p}` : `${cur}/${p}`
++    try {
++      await t.makeDir(cur)
++    } catch (e: any) {
++      if (!isErrno(e, "EEXIST")) throw e
++    }
++  }
++}
++
++export interface SpoolHandle {
++  write(chunk: Uint8Array): Promise<void>
++  readAt(buf: Uint8Array, position: number): Promise<number>
++  close(): Promise<void>
++}
++
++export async function openSpoolFile(
++  p: string,
++  mode: "w" | "r",
++): Promise<SpoolHandle> {
++  const t = tjsFs()
++  if (t) {
++    const h = await t.open(p, mode)
++    return {
++      write: async (chunk) => {
++        let off = 0
++        while (off < chunk.byteLength) {
++          const n = Number(await h.write(chunk.subarray(off)))
++          if (!(n > 0)) throw new Error("spool 写入失败")
++          off += n
++        }
++      },
++      readAt: async (buf, position) => {
++        const n = await h.read(buf, position)
++        return n === null || n === undefined ? 0 : Number(n)
++      },
++      close: async () => {
++        await h.close()
++      },
++    }
++  }
++  const fsp: any = await import("node:fs/promises")
++  const h = await fsp.open(p, mode)
++  return {
++    write: async (chunk) => {
++      let off = 0
++      while (off < chunk.byteLength) {
++        const r = await h.write(chunk.subarray(off))
++        const n = Number(r?.bytesWritten ?? r ?? 0)
++        if (!(n > 0)) throw new Error("spool 写入失败")
++        off += n
++      }
++    },
++    readAt: async (buf, position) => {
++      const r = await h.read(buf, 0, buf.length, position)
++      return Number(r?.bytesRead || 0)
++    },
++    close: async () => {
++      await h.close()
++    },
++  }
++}
++
++export async function unlinkSpool(p: string): Promise<void> {
++  const t = tjsFs()
++  if (t && typeof t.unlink === "function") {
++    await t.unlink(p)
++    return
++  }
++  // tjs 26.9.0 没有 unlink，全局只有 remove；先按能力探测再回退 Node。
++  if (t && typeof t.remove === "function") {
++    await t.remove(p)
++    return
++  }
++  const fsp: any = await import("node:fs/promises")
++  await fsp.unlink(p)
++}
++
++async function availableBytes(dir: string): Promise<number | null> {
++  const t = (globalThis as any).tjs
++  if (!t || typeof t.statFs !== "function") return null
++  const st = await t.statFs(dir)
++  const bsize = Number(st?.bsize)
++  const bavail = Number(st?.bavail)
++  // bavail 为 -1 表示文件系统不报可用块，按未知处理（不阻断上传）。
++  if (!Number.isFinite(bsize) || !Number.isFinite(bavail)) return null
++  if (bsize <= 0 || bavail < 0) return null
++  return bavail * bsize
++}
++
++export async function assertSpoolSpace(
++  dir: string,
++  needed: number,
++): Promise<void> {
++  const avail = await availableBytes(dir)
++  if (avail === null) return
++  if (avail < needed) {
++    throw new Error(
++      `上传暂存空间不足：需要 ${needed} 字节，可用 ${avail} 字节（${dir}）`,
++    )
++  }
++}
++
++export function randomHex(bytes: number): string {
++  const b = new Uint8Array(bytes)
++  crypto.getRandomValues(b)
++  return Array.from(b)
++    .map((x) => x.toString(16).padStart(2, "0"))
++    .join("")
++}
