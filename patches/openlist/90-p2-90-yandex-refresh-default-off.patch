@@ -1,0 +1,192 @@
+diff --git a/src/backend/drivers/yandex/refresh.test.ts b/src/backend/drivers/yandex/refresh.test.ts
+new file mode 100644
+index 0000000..b5a9d48
+--- /dev/null
++++ b/src/backend/drivers/yandex/refresh.test.ts
+@@ -0,0 +1,102 @@
++// SPEC p2-90：默认直连 oauth.yandex.com，第三方在线刷新必须显式 opt-in（RED 先行）
++import assert from "node:assert/strict"
++import test from "node:test"
++import { YandexApiClient, normalizeYandexAddition } from "./util"
++
++interface Call {
++  url: string
++  method: string
++  body: string
++}
++
++function stubFetch(payload: any = { access_token: "a", refresh_token: "b" }) {
++  const calls: Call[] = []
++  const original = globalThis.fetch
++  globalThis.fetch = (async (input: any, init?: any) => {
++    calls.push({
++      url: String(input),
++      method: String(init?.method || "GET").toUpperCase(),
++      body: String(init?.body ?? ""),
++    })
++    return new Response(JSON.stringify(payload), {
++      status: 200,
++      headers: { "content-type": "application/json" },
++    })
++  }) as typeof fetch
++  return { calls, restore: () => { globalThis.fetch = original } }
++}
++
++test("默认配置直连 oauth.yandex.com/token，不带 refresh_ui", async () => {
++  const { calls, restore } = stubFetch()
++  try {
++    const client = new YandexApiClient({ refresh_token: "r" })
++    await client.refreshToken()
++    assert.equal(calls.length, 1)
++    const u = new URL(calls[0].url)
++    assert.equal(u.origin + u.pathname, "https://oauth.yandex.com/token")
++    assert.equal(u.search.includes("refresh_ui"), false)
++    assert.equal(calls[0].method, "POST")
++    assert.match(calls[0].body, /grant_type=refresh_token/)
++    assert.match(calls[0].body, /refresh_token=r/)
++    assert.match(calls[0].body, /client_id=a78d5a69054042fa936f6c77f9a0ae8b/)
++    assert.match(calls[0].body, /client_secret=9c119bbb04b346d2a52aa64401936b2b/)
++  } finally {
++    restore()
++  }
++})
++
++test('字符串 "false" 归一成布尔 false，仍走直连', async () => {
++  const { calls, restore } = stubFetch()
++  try {
++    const client = new YandexApiClient({
++      refresh_token: "r",
++      use_online_api: "false" as any,
++    })
++    await client.refreshToken()
++    const u = new URL(calls[0].url)
++    assert.equal(u.origin + u.pathname, "https://oauth.yandex.com/token")
++  } finally {
++    restore()
++  }
++})
++
++test("显式 opt-in 才走第三方地址，且带 refresh_ui", async () => {
++  const { calls, restore } = stubFetch()
++  try {
++    const client = new YandexApiClient({
++      refresh_token: "r",
++      use_online_api: true,
++      api_url_address: "http://127.0.0.1:9/x",
++    })
++    await client.refreshToken()
++    assert.equal(calls.length, 1)
++    const u = new URL(calls[0].url)
++    assert.equal(u.origin + u.pathname, "http://127.0.0.1:9/x")
++    assert.equal(u.searchParams.get("refresh_ui"), "r")
++  } finally {
++    restore()
++  }
++})
++
++test("init() 只刷新一次，回调拿到新 token", async () => {
++  const { calls, restore } = stubFetch({ access_token: "acc1", refresh_token: "ref1" })
++  try {
++    const seen: any[] = []
++    const client = new YandexApiClient(
++      { refresh_token: "r" },
++      async (tokens) => { seen.push(tokens) },
++    )
++    await client.init()
++    assert.equal(calls.length, 1)
++    assert.deepEqual(seen, [{ accessToken: "acc1", refreshToken: "ref1" }])
++  } finally {
++    restore()
++  }
++})
++
++test("normalize 补齐默认 client_id/client_secret 且 use_online_api 归一为布尔", () => {
++  const norm: any = normalizeYandexAddition({ refresh_token: "r" } as any)
++  assert.equal(norm.client_id, "a78d5a69054042fa936f6c77f9a0ae8b")
++  assert.equal(norm.client_secret, "9c119bbb04b346d2a52aa64401936b2b")
++  assert.equal(norm.use_online_api, false)
++})
+diff --git a/src/backend/drivers/yandex/util.ts b/src/backend/drivers/yandex/util.ts
+index f088154..5c69f69 100644
+--- a/src/backend/drivers/yandex/util.ts
++++ b/src/backend/drivers/yandex/util.ts
+@@ -7,6 +7,21 @@ import {
+   YandexUploadResp,
+ } from "./types"
+ 
++// 本地维护（SPEC p2-90）：对齐 alist 直连 OAuth；第三方在线刷新改为显式 opt-in。
++const YANDEX_CLIENT_ID = "a78d5a69054042fa936f6c77f9a0ae8b"
++const YANDEX_CLIENT_SECRET = "9c119bbb04b346d2a52aa64401936b2b"
++
++export function normalizeYandexAddition(a: YandexAddition): YandexAddition {
++  const norm: any = { ...(a || {}) }
++  norm.use_online_api =
++    norm.use_online_api === true ||
++    (typeof norm.use_online_api === "string" &&
++      norm.use_online_api.trim().toLowerCase() === "true")
++  norm.client_id = (norm.client_id || "").trim() || YANDEX_CLIENT_ID
++  norm.client_secret = (norm.client_secret || "").trim() || YANDEX_CLIENT_SECRET
++  return norm as YandexAddition
++}
++
+ export class YandexApiClient {
+   private addition: YandexAddition
+   private accessToken: string = ""
+@@ -23,16 +38,20 @@ export class YandexApiClient {
+       refreshToken: string
+     }) => Promise<void>,
+   ) {
+-    this.addition = addition
+-    this.refreshTokenVal = addition.refresh_token || ""
++    this.addition = normalizeYandexAddition(addition)
++    this.refreshTokenVal = this.addition.refresh_token || ""
+     this.onTokenRefreshed = onTokenRefreshed
+   }
+ 
+   async refreshToken(): Promise<void> {
+-    if (this.addition.use_online_api !== false) {
++    if (this.addition.use_online_api === true) {
+       const apiUrl =
+         this.addition.api_url_address ||
+         "https://api.oplist.org/yandexui/renewapi"
++      console.warn(
++        "[Yandex] online token refresh enabled: refresh_token will be sent to " +
++          apiUrl,
++      )
+       const url = `${apiUrl}?refresh_ui=${encodeURIComponent(this.refreshTokenVal)}&server_use=true&driver_txt=yandexui_go`
+ 
+       const res = await fetch(url, {
+diff --git a/src/backend/server/admin.ts b/src/backend/server/admin.ts
+index c5e44df..606b58b 100644
+--- a/src/backend/server/admin.ts
++++ b/src/backend/server/admin.ts
+@@ -3303,7 +3303,7 @@ const driverConfigs: Record<string, any> = {
+       {
+         name: "use_online_api",
+         type: "bool",
+-        default: "true",
++        default: "false",
+         required: false,
+       },
+       {
+diff --git a/src/backend/server/driver_list.test.ts b/src/backend/server/driver_list.test.ts
+index f450fbe..0be2114 100644
+--- a/src/backend/server/driver_list.test.ts
++++ b/src/backend/server/driver_list.test.ts
+@@ -240,3 +240,16 @@ test("driver/list 的 WPS 元数据 no_upload=true（SPEC p2-88）", async () =>
+   assert.ok(wps, "WPS 必须出现在驱动列表中")
+   assert.equal(wps.config.no_upload, true)
+ })
++test("driver/list 的 YandexDisk use_online_api 默认 false（SPEC p2-90）", async () => {
++  const env = await setupEnv()
++  const res = await makeApp().request(
++    "/api/admin/driver/list",
++    { method: "GET", headers: authHeaders },
++    env,
++  )
++  const body: any = await res.json()
++  const yandex = body.data["YandexDisk"]
++  assert.ok(yandex, "YandexDisk 必须出现在驱动列表中")
++  const field = yandex.additional.find((f: any) => f.name === "use_online_api")
++  assert.equal(field.default, "false")
++})

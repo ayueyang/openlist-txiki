@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 87
+patch_count 91
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -242,7 +242,7 @@ file bf178726e27ed9ec313d9822f75d1ed134b3fcb60dc410ee300660a29c070e9e src/backen
 file 7efe4b23569f8458439d00bce562f5c3aaec6afebdb51c00bae7b7648e741907 src/backend/internal/webdav/webdav.ts src=patch strip_header=no eol=crlf
 file 3b0bc05837d6676e6adac59ebe03d708899f519e73163c712b42eb420ae6ff26 src/backend/pkg/password.ts src=patch strip_header=no eol=crlf
 file 668b9f0f2b862c31fefdf32406a5e846f99fde272242957d7e7c3e56cd81bb1a src/backend/pkg/xml.ts src=patch strip_header=no eol=crlf
-file 6a5f33e168340f3564189f0a1821bcb46af7c218751d1bec9473d1b5da7cd114 src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
+file 4a65a9dcfabcc2bbc68638e760ae03881f37d506c6f215b29836ae84f5139716 src/backend/server/admin.ts src=repo strip_header=yes eol=crlf
 file 10dca80e2498ca4183fa7f2660e264e2437e3d56b099a0386f5173667aa80c9e src/backend/server/storage_189pc_api.test.ts src=repo strip_header=no eol=lf
 file c99b408aefde2b7c597440786db284c91a8cbce82fc84a005d8dc1b20532338d src/backend/server/auth.ts src=patch strip_header=no eol=crlf
 file fa0f8317854389e8da1a52899c9f3e8f1296c04d1b572b623f3b06a3d2262a0d src/backend/server/copy-task.ts src=patch strip_header=no eol=lf
@@ -535,3 +535,16 @@ patch 84 d435e59a420806c1fc12a08eece131ef4c853e6a4e355a0cdd4b9d73b37f3f96 work/p
 patch 85 53fd7d9745ce1d4837d9ff8b7ddb0fa9d468710ccbca45d0bcb9072bb9d5bdc6 work/p2-85-terabox-parts.patch
 patch 86 8593944b9f0dd04b4c06ded16ddd82303acb6826d10270b88d952367ba8c62b9 work/p2-86-weiyun-spool.patch
 patch 87 ae3fd3cd5f8ef8d7a736a7f44e9d8267b460da172c51c3533b92d18ef41bc91e work/p2-87-189pc-fields.patch
+# 第 88 条（2026-11-10，r67 功能批 SPEC p2-88）：WPS 上传 fail-closed。
+#   put 第一行抛错；新增 beginStream 同样抛错，storage.ts 的能力探测在读 body 前失败；
+#   admin.ts 的 WPS no_upload=true；不实现 create_update/multipart 上传。
+# 第 89 条（SPEC p2-89）：weiyun list 去掉 CF Workers 的 45 页 SUBREQUEST_LIMIT 预算，
+#   保留 count=500 与 finish_flag/空页终止；预算字段删除后其余 8 处无 break 的计数引用一并删除。
+# 第 90 条（SPEC p2-90）：yandex 默认直连 oauth.yandex.com，use_online_api 归一为严格布尔、
+#   默认 false；client_id/client_secret 补 A 的默认值；在线刷新仅显式 opt-in 且打告警。
+# 第 91 条（SPEC p2-91）：wopan init 的 family 探测 fail-closed，缺 defaultHomeId 也抛错；
+#   initData 三个可选 catch 不动。
+patch 88 44d47fd152fce29ebbb0f1ddf0cb98c891f3d2efd082c2a2af744d2e39ef9f6b work/p2-88-wps-put-failclosed.patch
+patch 89 4245c5b8a01a7f6f09cfc9948d9a46358772dc8271b3f281cc7ac321df67b048 work/p2-89-weiyun-list-unbounded.patch
+patch 90 c733bea792171e2f38ecf20777b78419aa90fce049d31ed3fdc38d407c856365 work/p2-90-yandex-refresh-default-off.patch
+patch 91 f99c47e2181f4b39af500bdd93e2110064fa315b5941f9f36eb38cebf2410633 work/p2-91-wopan-init-failclosed.patch

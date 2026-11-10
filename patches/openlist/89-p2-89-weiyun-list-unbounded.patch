@@ -1,0 +1,197 @@
+diff --git a/src/backend/drivers/weiyun/driver.ts b/src/backend/drivers/weiyun/driver.ts
+index d6bd8d7..3fcdd13 100644
+--- a/src/backend/drivers/weiyun/driver.ts
++++ b/src/backend/drivers/weiyun/driver.ts
+@@ -17,7 +17,6 @@ import {
+   unlinkSpool,
+ } from "../../internal/upload/spool"
+ 
+-const SUBREQUEST_LIMIT = 45
+ /** begin 时至少预留 fileSize + 64MiB。 */
+ const SPOOL_MIN_FREE = 64 * 1024 * 1024
+ const UPLOAD_CHUNK_SIZE = 1024 * 1024 // 1MB per chunk
+@@ -124,8 +123,6 @@ export class WeiyunDriver implements StorageDriver {
+ 
+   /** Cache: physicalPath -> ResolvedFolderInfo */
+   private pathFolderCache = new Map<string, ResolvedFolderInfo>()
+-  /** CF Workers subrequest budget */
+-  private budget = { used: 0, limit: SUBREQUEST_LIMIT }
+ 
+   constructor(
+     addition: WeiyunAddition,
+@@ -223,13 +220,6 @@ export class WeiyunDriver implements StorageDriver {
+         continue
+       }
+ 
+-      this.budget.used++
+-      if (this.budget.used >= this.budget.limit) {
+-        console.warn(
+-          `[WeiYun] Cloudflare Worker subrequest budget limit (${this.budget.limit}) reached.`,
+-        )
+-      }
+-
+       const listData = await this.client.diskDirFileList(current.dirKey, {
+         count: 500,
+         getType: 1, // Only directories
+@@ -283,7 +273,6 @@ export class WeiyunDriver implements StorageDriver {
+     const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
+     const parent = await this.resolveFolder(parentPath)
+ 
+-    this.budget.used++
+     const listData = await this.client.diskDirFileList(parent.dirKey, {
+       count: 500,
+       getType: 0, // File and dir
+@@ -313,7 +302,6 @@ export class WeiyunDriver implements StorageDriver {
+   }
+ 
+   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+-    this.budget.used = 0
+     const folderInfo = await this.resolveFolder(physicalPath)
+ 
+     const allFolders: WeiyunFolder[] = []
+@@ -321,14 +309,6 @@ export class WeiyunDriver implements StorageDriver {
+ 
+     let start = 0
+     while (true) {
+-      this.budget.used++
+-      if (this.budget.used >= this.budget.limit) {
+-        console.warn(
+-          `[WeiYun] Subrequest budget limit (${this.budget.limit}) reached while listing ${physicalPath}`,
+-        )
+-        break
+-      }
+-
+       const sortField =
+         this.addition.order_by === "size"
+           ? 3
+@@ -380,7 +360,6 @@ export class WeiyunDriver implements StorageDriver {
+   }
+ 
+   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
+-    this.budget.used = 0
+     const clean =
+       "/" +
+       String(physicalPath || "")
+@@ -430,7 +409,6 @@ export class WeiyunDriver implements StorageDriver {
+   }
+ 
+   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
+-    this.budget.used = 0
+     const parts = String(physicalPath || "")
+       .split("/")
+       .filter(Boolean)
+@@ -450,7 +428,6 @@ export class WeiyunDriver implements StorageDriver {
+     physicalPath: string,
+     newName: string,
+   ): Promise<void> {
+-    this.budget.used = 0
+     const { file, folder, parent, isDir } = await this.resolveFile(physicalPath)
+     if (isDir && folder) {
+       await this.client.diskDirAttrModify(
+@@ -480,7 +457,6 @@ export class WeiyunDriver implements StorageDriver {
+     physicalPath: string,
+     _names: string[],
+   ): Promise<void> {
+-    this.budget.used = 0
+     const { file, folder, parent, isDir } = await this.resolveFile(physicalPath)
+     if (isDir && folder) {
+       await this.client.diskDirDelete({
+@@ -506,7 +482,6 @@ export class WeiyunDriver implements StorageDriver {
+     srcPhysical: string,
+     _dstPhysical: string,
+   ): Promise<void> {
+-    this.budget.used = 0
+     const {
+       file,
+       folder,
+@@ -736,7 +711,6 @@ export class WeiyunDriver implements StorageDriver {
+     chunkSize: number
+     session: string
+   }> {
+-    this.budget.used = 0
+     const parent = await this.resolveFolder(physicalDir || "/")
+     const chunkSize = UPLOAD_CHUNK_SIZE
+     const partCount = Math.max(
+diff --git a/src/backend/drivers/weiyun/list.test.ts b/src/backend/drivers/weiyun/list.test.ts
+new file mode 100644
+index 0000000..31990ae
+--- /dev/null
++++ b/src/backend/drivers/weiyun/list.test.ts
+@@ -0,0 +1,77 @@
++// SPEC p2-89：weiyun list 不得被 45 页预算静默截断（RED 先行，见 raw/20-before-p89-weiyun.log）
++import assert from "node:assert/strict"
++import test from "node:test"
++import { WeiyunDriver } from "./driver"
++
++function makeDriver(pages: number, mode: "finish" | "empty" | "error" = "finish") {
++  const driver = new WeiyunDriver({ cookie: "test" } as any, async () => {})
++  const calls: number[] = []
++  ;(driver as any).resolveFolder = async () => ({ dirKey: "k" })
++  ;(driver as any).client.diskDirFileList = async (
++    _dirKey: string,
++    opts: { start: number },
++  ) => {
++    calls.push(opts.start)
++    if (mode === "error") throw new Error("upstream boom")
++    if (mode === "empty") return { dir_list: [], file_list: [], finish_flag: false }
++    const index = opts.start
++    return {
++      dir_list: [],
++      file_list: [
++        {
++          filename: `f${index}.bin`,
++          file_id: `id${index}`,
++          file_size: 1,
++          file_ctime: 1700000000,
++          file_mtime: 1700000000,
++        },
++      ],
++      finish_flag: index >= pages - 1,
++    }
++  }
++  return { driver, calls }
++}
++
++test("46 页：列表完整，调用 46 次（旧上限第 45 轮前 break）", async () => {
++  const { driver, calls } = makeDriver(46)
++  const items = await driver.list("/weiyun", "/")
++  assert.equal(items.length, 46)
++  assert.equal(calls.length, 46)
++})
++
++test("45 页：第 45 页不被预算拦下", async () => {
++  const { driver, calls } = makeDriver(45)
++  const items = await driver.list("/weiyun", "/")
++  assert.equal(items.length, 45)
++  assert.equal(calls.length, 45)
++})
++
++test("并发两个 list 不共享预算，各自 30 页完整", async () => {
++  const { driver, calls } = makeDriver(30)
++  const [a, b] = await Promise.all([
++    driver.list("/weiyun", "/a"),
++    driver.list("/weiyun", "/b"),
++  ])
++  assert.equal(a.length, 30)
++  assert.equal(b.length, 30)
++  assert.equal(calls.length, 60)
++})
++
++test("单页 finish_flag=true：只请求 1 次", async () => {
++  const { driver, calls } = makeDriver(1)
++  const items = await driver.list("/weiyun", "/")
++  assert.equal(items.length, 1)
++  assert.equal(calls.length, 1)
++})
++
++test("空页且 finish_flag=false：请求 1 次后停止，返回空数组", async () => {
++  const { driver, calls } = makeDriver(1, "empty")
++  const items = await driver.list("/weiyun", "/")
++  assert.equal(items.length, 0)
++  assert.equal(calls.length, 1)
++})
++
++test("上游抛错：原样抛出，不返回半截列表", async () => {
++  const { driver } = makeDriver(1, "error")
++  await assert.rejects(driver.list("/weiyun", "/"), /upstream boom/)
++})

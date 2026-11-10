@@ -1,0 +1,89 @@
+diff --git a/src/backend/drivers/wopan/driver.ts b/src/backend/drivers/wopan/driver.ts
+index d3df28e..440f2c3 100644
+--- a/src/backend/drivers/wopan/driver.ts
++++ b/src/backend/drivers/wopan/driver.ts
+@@ -90,11 +90,18 @@ export class WoPanDriver implements StorageDriver {
+   }
+ 
+   async init(): Promise<void> {
++    // 本地维护（SPEC p2-91）：family 探测是初始化必过项，对齐 alist wopan initClient。
+     await this.client.initData()
+-    const fml = await this.client.familyUserCurrentEncode().catch(() => null)
+-    if (fml?.defaultHomeId !== undefined && fml.defaultHomeId !== null) {
+-      this.defaultFamilyId = String(fml.defaultHomeId)
++    let fml: any
++    try {
++      fml = await this.client.familyUserCurrentEncode()
++    } catch (e: any) {
++      throw new Error(`[WoPan] query family failed: ${e?.message || e}`)
+     }
++    if (fml?.defaultHomeId === undefined || fml.defaultHomeId === null) {
++      throw new Error("[WoPan] family response missing defaultHomeId")
++    }
++    this.defaultFamilyId = String(fml.defaultHomeId)
+   }
+ 
+   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+diff --git a/src/backend/drivers/wopan/init.test.ts b/src/backend/drivers/wopan/init.test.ts
+new file mode 100644
+index 0000000..9f0a008
+--- /dev/null
++++ b/src/backend/drivers/wopan/init.test.ts
+@@ -0,0 +1,57 @@
++// SPEC p2-91：wopan init 的 family 探测必须 fail-closed（RED 先行）
++import assert from "node:assert/strict"
++import test from "node:test"
++import { WoPanDriver } from "./driver"
++
++function makeDriver(
++  family: () => Promise<any>,
++  initData: () => Promise<void> = async () => {},
++) {
++  const driver: any = new WoPanDriver({
++    access_token: "a",
++    refresh_token: "r",
++  } as any)
++  const counts = { initData: 0, family: 0 }
++  driver.client.initData = async () => {
++    counts.initData++
++    await initData()
++  }
++  driver.client.familyUserCurrentEncode = async () => {
++    counts.family++
++    return family()
++  }
++  return { driver, counts }
++}
++
++test("family 探测失败：init 抛错并带原始 message", async () => {
++  const { driver, counts } = makeDriver(async () => {
++    throw new Error("boom")
++  })
++  await assert.rejects(driver.init(), /query family failed: boom/)
++  assert.equal(counts.initData, 1)
++  assert.equal(counts.family, 1)
++})
++
++test("family 响应缺 defaultHomeId：init 抛错", async () => {
++  const { driver } = makeDriver(async () => ({}))
++  await assert.rejects(driver.init(), /missing defaultHomeId/)
++})
++
++test("family 正常：defaultFamilyId 记录为字符串", async () => {
++  const { driver, counts } = makeDriver(async () => ({ defaultHomeId: 123 }))
++  await driver.init()
++  assert.equal((driver as any).defaultFamilyId, "123")
++  assert.equal(counts.initData, 1)
++  assert.equal(counts.family, 1)
++})
++
++test("initData 失败：原样抛出，不进入 family", async () => {
++  const { driver, counts } = makeDriver(
++    async () => ({ defaultHomeId: 1 }),
++    async () => {
++      throw new Error("initData down")
++    },
++  )
++  await assert.rejects(driver.init(), /initData down/)
++  assert.equal(counts.family, 0)
++})

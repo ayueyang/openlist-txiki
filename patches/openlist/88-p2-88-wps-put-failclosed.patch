@@ -1,0 +1,138 @@
+diff --git a/src/backend/drivers/wps/driver.test.ts b/src/backend/drivers/wps/driver.test.ts
+index d830410..1baf6e2 100644
+--- a/src/backend/drivers/wps/driver.test.ts
++++ b/src/backend/drivers/wps/driver.test.ts
+@@ -71,3 +71,45 @@ test("WpsDriver instantiation and methods", async () => {
+   const link = await driver.link("/我的文档/doc.docx", "/我的文档/doc.docx")
+   assert.equal(link.url, "https://ks3.kdocs.cn/download/doc.docx")
+ })
++
++// ---- SPEC p2-88：上传 fail-closed（RED 先行，见 raw/10-before-p88-wps.log） ----
++
++test("WPS beginStream 存在且第一行即失败", async () => {
++  const driver = new WpsDriver({ cookie: "wps_sid=test_session_id", mode: "Personal" })
++  assert.equal(typeof (driver as any).beginStream, "function")
++  await assert.rejects(
++    (driver as any).beginStream("/我的文档/a.txt", "/我的文档/a.txt"),
++    /not implemented/,
++  )
++})
++
++test("WPS put 直接抛错，不再静默返回", async () => {
++  const driver = new WpsDriver({ cookie: "wps_sid=test_session_id", mode: "Personal" })
++  await assert.rejects(
++    driver.put("/我的文档/a.txt", "/我的文档/a.txt", Buffer.from("x")),
++    /not implemented/,
++  )
++})
++
++test("WPS 上传失败发生在任何网络请求之前", async () => {
++  const driver = new WpsDriver({ cookie: "wps_sid=test_session_id", mode: "Personal" })
++  const originalFetch = globalThis.fetch
++  let calls = 0
++  globalThis.fetch = (async () => {
++    calls++
++    return new Response("", { status: 200 })
++  }) as typeof fetch
++  try {
++    await assert.rejects(
++      driver.put("/我的文档/a.txt", "/我的文档/a.txt", Buffer.from("x")),
++      /not implemented/,
++    )
++    await assert.rejects(
++      (driver as any).beginStream("/我的文档/a.txt", "/我的文档/a.txt"),
++      /not implemented/,
++    )
++    assert.equal(calls, 0)
++  } finally {
++    globalThis.fetch = originalFetch
++  }
++})
+diff --git a/src/backend/drivers/wps/driver.ts b/src/backend/drivers/wps/driver.ts
+index 0ad7836..7c9fbd6 100644
+--- a/src/backend/drivers/wps/driver.ts
++++ b/src/backend/drivers/wps/driver.ts
+@@ -7,6 +7,12 @@ import { sortFileItems } from "../../internal/driver/sort"
+ import { WpsAddition, WpsFileInfo } from "./types"
+ import { WpsApiClient } from "./util"
+ 
++// 本地维护（SPEC p2-88）：txiki 侧没有 WPS 的 create_update/multipart 上传协议，
++// 上传先 fail-closed，待真实 API 实现后删除本函数与两处 throw。
++function wpsUnsupported(op: string): Error {
++  return new Error(`WPS driver upload is not implemented in txiki runtime (${op})`)
++}
++
+ interface ResolvedNode {
+   kind: "root" | "group" | "folder" | "file"
+   groupId: number
+@@ -294,21 +300,24 @@ export class WpsDriver implements StorageDriver {
+   }
+ 
+   async put(
+-    virtualPath: string,
+-    physicalPath: string,
+-    content: Buffer | Uint8Array,
++    _virtualPath: string,
++    _physicalPath: string,
++    _content: Buffer | Uint8Array,
+   ): Promise<void> {
+-    // WPS direct upload requires chunked upload protocol
+-    const clean = this.cleanPath(physicalPath)
+-    const parentPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
+-    const fileName = clean.substring(clean.lastIndexOf("/") + 1)
+-    const parentNode = await this.resolvePath(parentPath)
+-    if (!parentNode || !parentNode.isDir) {
+-      throw new Error(`Parent directory not found: ${parentPath}`)
+-    }
++    // SPEC p2-88：不再“探测父目录后假装成功”，任何上传入口第一行即失败。
++    throw wpsUnsupported("put")
++  }
+ 
+-    // Direct upload stub
+-    console.warn(`[WPS] direct small upload for ${fileName}`)
++  async beginStream(
++    _physicalPath: string,
++    _expectedSize?: number,
++  ): Promise<{
++    write(c: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
++    // SPEC p2-88：让 storage.ts 的能力探测命中流式入口，在读 body 之前失败。
++    throw wpsUnsupported("beginStream")
+   }
+ 
+   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {
+diff --git a/src/backend/server/admin.ts b/src/backend/server/admin.ts
+index 42c018e..c5e44df 100644
+--- a/src/backend/server/admin.ts
++++ b/src/backend/server/admin.ts
+@@ -3652,7 +3652,7 @@ const driverConfigs: Record<string, any> = {
+       only_local: false,
+       only_proxy: false,
+       no_cache: false,
+-      no_upload: false,
++      no_upload: true,
+       need_ms: false,
+       default_root: "/",
+     },
+diff --git a/src/backend/server/driver_list.test.ts b/src/backend/server/driver_list.test.ts
+index 3050e7c..f450fbe 100644
+--- a/src/backend/server/driver_list.test.ts
++++ b/src/backend/server/driver_list.test.ts
+@@ -228,3 +228,15 @@ test("存储列表中的驱动配置可被 driver/info 复用（前端编辑页
+     )
+   }
+ })
++test("driver/list 的 WPS 元数据 no_upload=true（SPEC p2-88）", async () => {
++  const env = await setupEnv()
++  const res = await makeApp().request(
++    "/api/admin/driver/list",
++    { method: "GET", headers: authHeaders },
++    env,
++  )
++  const body: any = await res.json()
++  const wps = body.data["WPS"]
++  assert.ok(wps, "WPS 必须出现在驱动列表中")
++  assert.equal(wps.config.no_upload, true)
++})
