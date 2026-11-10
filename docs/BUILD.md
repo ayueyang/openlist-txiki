@@ -1,6 +1,6 @@
-# 从源码构建（openlist-txiki 0.1.0-r67）
+# 从源码构建（openlist-txiki 0.1.0-r68）
 
-本归档是 openlist-txiki 0.1.0-r67 的完整对应源码：
+本归档是 openlist-txiki 0.1.0-r68 的完整对应源码：
 
     upstream/                 上游 OpenList-Worker，commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
                               （CRLF 工作区，浅克隆 .git 只含该提交；不含 node_modules）
@@ -114,7 +114,7 @@ ls -l zig-out/bin/tjs
 ## 3. 打包 apk
 
 ```sh
-VERSION=0.1.0-r67
+VERSION=0.1.0-r68
 STAGE=/tmp/r17-stage SCRIPTS=$PWD/scripts OUT=/tmp/openlist-txiki-$VERSION.apk \
   APK=/path/to/apk sh scripts/build-apk.sh
 ```
@@ -126,14 +126,14 @@ stage 文件集为固定 12 个文件（另有 dist/ 下 222 件前端产物按�
 ## 3.1 从源码归档复算桌面两件（linux tar.gz / win x64 zip）
 
 归档带齐了复算所需的四件：`build/make-archives.py`（渲染器）、`build/assets/*.in`（四份模板）、
-`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.0.1.0-r67.json`（输入锚点）。
+`scripts/build-archives.py`（组装器）、`scripts/build-archives.inputs.0.1.0-r68.json`（输入锚点）。
 inputs.json 里的七个路径一律写 `${NAME}` 占位符，不含任何本机路径；复算前自己填一份变量文件：
 
 ```sh
 cp scripts/build-archives.vars.example.json /tmp/vars.json
 # 按下面的字段来源改 /tmp/vars.json 的七个值（相对仓根或绝对路径都行）
 python scripts/build-archives.py \
-  --inputs scripts/build-archives.inputs.0.1.0-r67.json \
+  --inputs scripts/build-archives.inputs.0.1.0-r68.json \
   --out /tmp/desktop --renderer build/make-archives.py \
   --vars /tmp/vars.json
 ```

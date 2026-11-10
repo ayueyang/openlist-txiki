@@ -1,16 +1,17 @@
 diff --git a/src/backend/drivers/weiyun/driver.ts b/src/backend/drivers/weiyun/driver.ts
-index d6bd8d7..3fcdd13 100644
+index d6bd8d7..3acff2e 100644
 --- a/src/backend/drivers/weiyun/driver.ts
 +++ b/src/backend/drivers/weiyun/driver.ts
-@@ -17,7 +17,6 @@ import {
+@@ -17,7 +17,7 @@ import {
    unlinkSpool,
  } from "../../internal/upload/spool"
  
 -const SUBREQUEST_LIMIT = 45
++// 本地维护（SPEC p2-89）：txiki 无 CF 子请求预算，移除 45 页硬上限；Workers 侧保留原分支
  /** begin 时至少预留 fileSize + 64MiB。 */
  const SPOOL_MIN_FREE = 64 * 1024 * 1024
  const UPLOAD_CHUNK_SIZE = 1024 * 1024 // 1MB per chunk
-@@ -124,8 +123,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -124,8 +124,6 @@ export class WeiyunDriver implements StorageDriver {
  
    /** Cache: physicalPath -> ResolvedFolderInfo */
    private pathFolderCache = new Map<string, ResolvedFolderInfo>()
@@ -19,7 +20,7 @@ index d6bd8d7..3fcdd13 100644
  
    constructor(
      addition: WeiyunAddition,
-@@ -223,13 +220,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -223,13 +221,6 @@ export class WeiyunDriver implements StorageDriver {
          continue
        }
  
@@ -33,7 +34,7 @@ index d6bd8d7..3fcdd13 100644
        const listData = await this.client.diskDirFileList(current.dirKey, {
          count: 500,
          getType: 1, // Only directories
-@@ -283,7 +273,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -283,7 +274,6 @@ export class WeiyunDriver implements StorageDriver {
      const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
      const parent = await this.resolveFolder(parentPath)
  
@@ -41,7 +42,7 @@ index d6bd8d7..3fcdd13 100644
      const listData = await this.client.diskDirFileList(parent.dirKey, {
        count: 500,
        getType: 0, // File and dir
-@@ -313,7 +302,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -313,7 +303,6 @@ export class WeiyunDriver implements StorageDriver {
    }
  
    async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
@@ -49,7 +50,7 @@ index d6bd8d7..3fcdd13 100644
      const folderInfo = await this.resolveFolder(physicalPath)
  
      const allFolders: WeiyunFolder[] = []
-@@ -321,14 +309,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -321,14 +310,6 @@ export class WeiyunDriver implements StorageDriver {
  
      let start = 0
      while (true) {
@@ -64,7 +65,7 @@ index d6bd8d7..3fcdd13 100644
        const sortField =
          this.addition.order_by === "size"
            ? 3
-@@ -380,7 +360,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -380,7 +361,6 @@ export class WeiyunDriver implements StorageDriver {
    }
  
    async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
@@ -72,7 +73,7 @@ index d6bd8d7..3fcdd13 100644
      const clean =
        "/" +
        String(physicalPath || "")
-@@ -430,7 +409,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -430,7 +410,6 @@ export class WeiyunDriver implements StorageDriver {
    }
  
    async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
@@ -80,7 +81,7 @@ index d6bd8d7..3fcdd13 100644
      const parts = String(physicalPath || "")
        .split("/")
        .filter(Boolean)
-@@ -450,7 +428,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -450,7 +429,6 @@ export class WeiyunDriver implements StorageDriver {
      physicalPath: string,
      newName: string,
    ): Promise<void> {
@@ -88,7 +89,7 @@ index d6bd8d7..3fcdd13 100644
      const { file, folder, parent, isDir } = await this.resolveFile(physicalPath)
      if (isDir && folder) {
        await this.client.diskDirAttrModify(
-@@ -480,7 +457,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -480,7 +458,6 @@ export class WeiyunDriver implements StorageDriver {
      physicalPath: string,
      _names: string[],
    ): Promise<void> {
@@ -96,7 +97,7 @@ index d6bd8d7..3fcdd13 100644
      const { file, folder, parent, isDir } = await this.resolveFile(physicalPath)
      if (isDir && folder) {
        await this.client.diskDirDelete({
-@@ -506,7 +482,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -506,7 +483,6 @@ export class WeiyunDriver implements StorageDriver {
      srcPhysical: string,
      _dstPhysical: string,
    ): Promise<void> {
@@ -104,7 +105,7 @@ index d6bd8d7..3fcdd13 100644
      const {
        file,
        folder,
-@@ -736,7 +711,6 @@ export class WeiyunDriver implements StorageDriver {
+@@ -736,7 +712,6 @@ export class WeiyunDriver implements StorageDriver {
      chunkSize: number
      session: string
    }> {

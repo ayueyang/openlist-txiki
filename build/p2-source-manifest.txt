@@ -416,7 +416,7 @@ patch 53 71ea7c2eb736a5d5575c18605aaa893ab2f833c3c98835f0ff86cdf5d68a56dc work/p
 patch 54 23ff85f05c6fbe7f8f30ebbe61dd1569080d3e6935bc0050695fe5ffabefcf5d work/p2-54-f10-139-movecopy-put.patch
 patch 55 7e7c03ae4c882578d30ad2fb3e45ab97e071b3247431d1b427ced048c00eae5b work/p2-55-f11-ali-share-refresh.patch
 #
-# 第 56-59 条（2026-11-08，r57 驱动正确性修复，对应 ARCH-3WAY-V7 的 D5/D2/D3/D7）：
+# 第 56-59 条（2026-11-08，r57 驱动正确性修复，对应规格 D5/D2/D3/D7）：
 #   56 115 分页：util.ts getFiles 由单请求 limit=1000/offset=0 改为按 count 翻页
 #      （offset 取已取条数，无 count 时按短页收尾），新增 util.test.ts（mock 1500 项）。
 #   57 123_share 签名时区：signPath 的 nowStr 固定用 CST(+8) 构造，不再用本机时区
@@ -545,6 +545,6 @@ patch 87 ae3fd3cd5f8ef8d7a736a7f44e9d8267b460da172c51c3533b92d18ef41bc91e work/p
 # 第 91 条（SPEC p2-91）：wopan init 的 family 探测 fail-closed，缺 defaultHomeId 也抛错；
 #   initData 三个可选 catch 不动。
 patch 88 44d47fd152fce29ebbb0f1ddf0cb98c891f3d2efd082c2a2af744d2e39ef9f6b work/p2-88-wps-put-failclosed.patch
-patch 89 4245c5b8a01a7f6f09cfc9948d9a46358772dc8271b3f281cc7ac321df67b048 work/p2-89-weiyun-list-unbounded.patch
+patch 89 3934cbc757a3c83684cfea2b8e5887eb88a79c2f32c6998c659e3dc56433fa6b work/p2-89-weiyun-list-unbounded.patch
 patch 90 c733bea792171e2f38ecf20777b78419aa90fce049d31ed3fdc38d407c856365 work/p2-90-yandex-refresh-default-off.patch
 patch 91 f99c47e2181f4b39af500bdd93e2110064fa315b5941f9f36eb38cebf2410633 work/p2-91-wopan-init-failclosed.patch
