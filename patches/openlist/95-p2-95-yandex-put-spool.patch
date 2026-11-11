@@ -1,0 +1,362 @@
+diff --git a/src/backend/drivers/yandex/driver.ts b/src/backend/drivers/yandex/driver.ts
+index 7468571..345634d 100644
+--- a/src/backend/drivers/yandex/driver.ts
++++ b/src/backend/drivers/yandex/driver.ts
+@@ -1,3 +1,4 @@
++// 本地维护（SPEC p2-95）：txiki 上传先落盘 spool，再用 ReadableStream + Content-Length PUT。
+ import {
+   calcFileType,
+   FileItem,
+@@ -6,6 +7,19 @@ import {
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { YandexAddition, YandexFilesResp } from "./types"
+ import { YandexApiClient } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  resolveSpoolDir,
++  spoolReadStream,
++  unlinkSpool,
++  SpoolHandle,
++} from "../../internal/upload/spool"
++
++/** begin 时至少预留 expectedSize + 64MiB。 */
++const YANDEX_SPOOL_MIN_FREE = 64 * 1024 * 1024
+ 
+ export class YandexDriver implements StorageDriver {
+   private addition: YandexAddition
+@@ -182,25 +196,120 @@ export class YandexDriver implements StorageDriver {
+     })
+   }
+ 
+-  async put(
+-    virtualPath: string,
++  /**
++   * 本地维护：上传先顺序写 spool，commit 时取 upload link，再用 spool 的
++   * ReadableStream + Content-Length 单 PUT；内存峰值 = 64KiB 读块。
++   */
++  async beginStream(
+     physicalPath: string,
+-    content: Buffer,
+-  ): Promise<void> {
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
+     const clean = this.cleanPath(physicalPath)
+-    const uploadUrl = await this.client.getUploadLink(clean)
++    const dir = resolveSpoolDir("yandex")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known
++        ? (expectedSize as number) + YANDEX_SPOOL_MIN_FREE
++        : YANDEX_SPOOL_MIN_FREE,
++    )
++    const spoolPath = `${dir}/yandex-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
+ 
+-    const res = await fetch(uploadUrl, {
+-      method: "PUT",
+-      headers: {
+-        "Content-Length": String(content.length),
+-        "Content-Type": "application/octet-stream",
+-      },
+-      body: new Uint8Array(content),
+-    })
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
++    }
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[yandex] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
++    }
+ 
+-    if (!res.ok) {
+-      throw new Error(`Yandex upload failed: ${res.statusText}`)
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("yandex beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("yandex 上传声明长度与实际不符")
++        }
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("yandex beginStream 已结束，不能重复 commit")
++        state = "done"
++        let reader: SpoolHandle | null = null
++        try {
++          await fh.close()
++          const uploadUrl = await this.client.getUploadLink(clean)
++          if (!uploadUrl) throw new Error("Yandex upload link missing href")
++          if (size > 0) reader = await openSpoolFile(spoolPath, "r")
++          const init: any = {
++            method: "PUT",
++            headers: {
++              "Content-Length": String(size),
++              "Content-Type": "application/octet-stream",
++            },
++            body:
++              size === 0
++                ? new Uint8Array(0)
++                : spoolReadStream(reader as SpoolHandle, size, "yandex"),
++            ...(size === 0 ? {} : { duplex: "half" }),
++          }
++          const res = await fetch(uploadUrl, init)
++          if (!res.ok) {
++            const text = await res.text()
++            throw new Error(
++              `Yandex upload failed (${res.status}): ${text.slice(0, 300)}`,
++            )
++          }
++        } finally {
++          if (reader) {
++            try {
++              await reader.close()
++            } catch {}
++          }
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
+     }
+   }
++
++  async put(
++    virtualPath: string,
++    physicalPath: string,
++    content: Buffer,
++  ): Promise<void> {
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
++  }
+ }
+diff --git a/src/backend/drivers/yandex/stream.test.ts b/src/backend/drivers/yandex/stream.test.ts
+new file mode 100644
+index 0000000..51d3eb8
+--- /dev/null
++++ b/src/backend/drivers/yandex/stream.test.ts
+@@ -0,0 +1,191 @@
++// SPEC p2-95（补丁 95）：Yandex Disk 落盘暂存 + 流式 PUT 单元测试。
++// mock globalThis.tjs 与 fetch、注入 client.getUploadLink：不连网、不需要真实 Yandex 账号。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { YandexDriver } from "./driver"
++
++const MB = 1024 * 1024
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++let spoolDir = ""
++let readLens: number[] = []
++let readTotal = 0
++let linkCalls: string[] = []
++let uploadHref = "https://upload.example.net/put?a=1"
++let calls: Array<{ url: string; method: string; headers: Record<string, string>; body: any; duplex?: string }> = []
++let putStatus = 200
++let putText = ""
++let putChunkLens: number[] = []
++let putBodyBytes = new Uint8Array(0)
++
++function makeSrc(size: number, seed = 19): Uint8Array {
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * seed + 9) & 0xff
++  return src
++}
++
++function makeDriver(): YandexDriver {
++  const d = new YandexDriver({ token: "t" } as any)
++  ;(d as any).client = {
++    getUploadLink: async (path: string) => {
++      linkCalls.push(path)
++      return uploadHref
++    },
++  }
++  return d
++}
++
++beforeEach(async () => {
++  readLens = []
++  readTotal = 0
++  linkCalls = []
++  uploadHref = "https://upload.example.net/put?a=1"
++  calls = []
++  putStatus = 200
++  putText = ""
++  putChunkLens = []
++  putBodyBytes = new Uint8Array(0)
++  spoolDir = await mkdtemp(join(tmpdir(), "yandex-p95-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => (await fh.write(chunk)).bytesWritten,
++        read: async (buf: Uint8Array, position: number) => {
++          readLens.push(buf.byteLength)
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          readTotal += r.bytesRead
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    // 真实 fetch 在 resolve 前读完请求体；mock 同点消费，避免驱动 finally 关句柄后 EBADF。
++    if (init?.body instanceof ReadableStream) {
++      const parts: Uint8Array[] = []
++      const reader = init.body.getReader()
++      for (;;) {
++        const { done, value } = await reader.read()
++        if (done) break
++        putChunkLens.push(value.byteLength)
++        parts.push(value)
++      }
++      putBodyBytes = new Uint8Array(Buffer.concat(parts.map((p) => Buffer.from(p))))
++    }
++    calls.push({
++      url: String(input),
++      method: String(init?.method || "GET").toUpperCase(),
++      headers: (init?.headers || {}) as Record<string, string>,
++      body: init?.body,
++      duplex: init?.duplex,
++    })
++    if (putStatus !== 200) {
++      return {
++        ok: false,
++        status: putStatus,
++        headers: { get: () => "text/plain" },
++        text: async () => putText,
++        json: async () => ({}),
++      }
++    }
++    return {
++      ok: true,
++      status: 200,
++      headers: { get: () => "text/plain" },
++      text: async () => "",
++      json: async () => ({}),
++    } as any
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++test("1 beginStream 存在", () => {
++  assert.equal(typeof (makeDriver() as any).beginStream, "function")
++})
++
++test("2 5MiB：取链接 1 次 + PUT 1 次、流式、字节一致、读块 <= 64KiB", async () => {
++  const size = 5 * MB
++  const src = makeSrc(size)
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/a.bin", size)
++  await w.write(src)
++  await w.commit()
++
++  assert.deepEqual(linkCalls, ["/yandex-test/a.bin"])
++  assert.equal(calls.length, 1)
++  const c = calls[0]
++  assert.equal(c.method, "PUT")
++  assert.equal(c.url, uploadHref)
++  assert.ok(c.body instanceof ReadableStream, "body 是 ReadableStream")
++  assert.equal(c.duplex, "half")
++  assert.equal(c.headers["Content-Length"], String(size))
++
++  assert.ok(Math.max(...putChunkLens) <= 64 * 1024)
++  assert.equal(readTotal, size)
++  assert.equal(putBodyBytes.byteLength, size)
++  assert.deepEqual(putBodyBytes, src)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("3 0 字节：body 是 Uint8Array(0)，Content-Length 0", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/empty.bin", 0)
++  await w.commit()
++  const c = calls[0]
++  assert.ok(c.body instanceof Uint8Array)
++  assert.equal(c.body.byteLength, 0)
++  assert.equal(c.headers["Content-Length"], "0")
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("4 链接为空：commit 抛 upload link missing href，PUT 0 次，spool 已清", async () => {
++  uploadHref = ""
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/a.bin", MB)
++  await w.write(new Uint8Array(MB))
++  await assert.rejects(() => w.commit(), /Yandex upload link missing href/)
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("5 PUT 507 + 文本：commit 抛错含状态与文本，spool 已清", async () => {
++  putStatus = 507
++  putText = "quota exceeded"
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/a.bin", MB)
++  await w.write(new Uint8Array(MB))
++  await assert.rejects(() => w.commit(), /Yandex upload failed \(507\): quota exceeded/)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("6 abort：fetch 0 次，spool 已清", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/a.bin", MB)
++  await w.write(new Uint8Array(MB))
++  await w.abort()
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("7 声明长度 10 写 11：write 抛错，fetch 0 次，spool 已清", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/yandex-test/a.bin", 10)
++  await assert.rejects(() => w.write(new Uint8Array(11)), /yandex 上传声明长度与实际不符/)
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})

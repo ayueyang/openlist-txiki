@@ -1,0 +1,567 @@
+diff --git a/src/backend/drivers/thunder/driver.ts b/src/backend/drivers/thunder/driver.ts
+index ea0d019..99a65ef 100644
+--- a/src/backend/drivers/thunder/driver.ts
++++ b/src/backend/drivers/thunder/driver.ts
+@@ -1,3 +1,4 @@
++// 本地维护（SPEC p2-93）：txiki 上传先落盘 spool，gcid 从盘按块流式计算。
+ import {
+   calcFileType,
+   FileItem,
+@@ -13,7 +14,7 @@ import {
+   ThunderUploadTaskResp,
+ } from "./types"
+ import {
+-  calcGcid,
++  calcGcidFromSpool,
+   FILE,
+   FILE_API_URL,
+   FOLDER,
+@@ -21,6 +22,19 @@ import {
+   ThunderClient,
+   UPLOAD_TYPE_RESUMABLE,
+ } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  resolveSpoolDir,
++  spoolReadStream,
++  unlinkSpool,
++  SpoolHandle,
++} from "../../internal/upload/spool"
++
++/** begin 时至少预留 expectedSize + 64MiB。 */
++const THUNDER_SPOOL_MIN_FREE = 64 * 1024 * 1024
+ 
+ function thunderFileToFileItem(
+   f: ThunderFile,
+@@ -302,61 +316,162 @@ export class ThunderDriver implements StorageDriver {
+     })
+   }
+ 
+-  async put(
+-    _virtualPath: string,
++  /**
++   * 本地维护：上传先顺序写 spool，commit 时从盘按块算 gcid，再用同一份 spool
++   * 作为 S3 PUT 的请求体（ReadableStream + Content-Length），不整包进内存。
++   */
++  async beginStream(
+     physicalPath: string,
+-    content: Buffer,
+-  ): Promise<void> {
+-    const parts = physicalPath.split("/").filter(Boolean)
+-    const fileName = parts.pop() || "file"
+-    const parentPath = "/" + parts.join("/")
+-    const parentId = this.resolveFolderId(parentPath)
+-    const gcid = calcGcid(content)
+-
+-    const resp = await this.client.authRequest<ThunderUploadTaskResp>(
+-      FILE_API_URL,
+-      {
+-        method: "POST",
+-        body: {
+-          kind: FILE,
+-          parent_id: parentId,
+-          name: fileName,
+-          size: content.length.toString(),
+-          hash: gcid,
+-          upload_type: UPLOAD_TYPE_RESUMABLE,
+-          space: this.addition.space || "",
+-        },
+-      },
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
++    const dir = resolveSpoolDir("thunder")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known
++        ? (expectedSize as number) + THUNDER_SPOOL_MIN_FREE
++        : THUNDER_SPOOL_MIN_FREE,
+     )
+-
+-    if (resp.upload_type === UPLOAD_TYPE_RESUMABLE && resp.resumable?.params) {
+-      const params = resp.resumable.params
+-      let endpoint = params.endpoint
+-      if (endpoint.startsWith(params.bucket + ".")) {
+-        endpoint = endpoint.slice(params.bucket.length + 1)
+-      }
+-      if (!endpoint.startsWith("http://") && !endpoint.startsWith("https://")) {
+-        endpoint = `https://${endpoint}`
+-      }
+-
+-      const uploadUrl = `${endpoint.replace(/\/$/, "")}/${params.bucket}/${params.key}`
+-      const headers: Record<string, string> = {
+-        "x-amz-security-token": params.security_token,
++    const spoolPath = `${dir}/thunder-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
++
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
++    }
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[thunder] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
+       }
++    }
+ 
+-      const uploadRes = await fetch(uploadUrl, {
+-        method: "PUT",
+-        headers,
+-        body: content as any,
+-      })
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("thunder beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("thunder 上传声明长度与实际不符")
++        }
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("thunder beginStream 已结束，不能重复 commit")
++        state = "done"
++        let reader: SpoolHandle | null = null
++        try {
++          await fh.close()
++          reader = await openSpoolFile(spoolPath, "r")
++          const gcid = await calcGcidFromSpool(reader.readAt, size)
++
++          const parts = physicalPath.split("/").filter(Boolean)
++          const fileName = parts.pop() || "file"
++          const parentPath = "/" + parts.join("/")
++          const parentId = this.resolveFolderId(parentPath)
++
++          const resp = await this.client.authRequest<ThunderUploadTaskResp>(
++            FILE_API_URL,
++            {
++              method: "POST",
++              body: {
++                kind: FILE,
++                parent_id: parentId,
++                name: fileName,
++                size: size.toString(),
++                hash: gcid,
++                upload_type: UPLOAD_TYPE_RESUMABLE,
++                space: this.addition.space || "",
++              },
++            },
++          )
+ 
+-      if (!uploadRes.ok) {
+-        throw new Error(
+-          `S3 Upload failed: ${uploadRes.status} ${uploadRes.statusText}`,
+-        )
+-      }
++          if (
++            resp.upload_type === UPLOAD_TYPE_RESUMABLE &&
++            resp.resumable?.params
++          ) {
++            const params = resp.resumable.params
++            let endpoint = params.endpoint
++            if (endpoint.startsWith(params.bucket + ".")) {
++              endpoint = endpoint.slice(params.bucket.length + 1)
++            }
++            if (
++              !endpoint.startsWith("http://") &&
++              !endpoint.startsWith("https://")
++            ) {
++              endpoint = `https://${endpoint}`
++            }
++
++            const uploadUrl = `${endpoint.replace(/\/$/, "")}/${params.bucket}/${params.key}`
++            const init: any = {
++              method: "PUT",
++              headers: {
++                "x-amz-security-token": params.security_token,
++                "Content-Length": String(size),
++              },
++              body:
++                size === 0
++                  ? new Uint8Array(0)
++                  : spoolReadStream(reader, size, "thunder"),
++              ...(size === 0 ? {} : { duplex: "half" }),
++            }
++
++            const uploadRes = await fetch(uploadUrl, init)
++
++            if (!uploadRes.ok) {
++              const text = await uploadRes.text()
++              throw new Error(
++                `Thunder S3 upload failed (${uploadRes.status}): ${text.slice(0, 300)}`,
++              )
++            }
++          }
++        } finally {
++          if (reader) {
++            try {
++              await reader.close()
++            } catch {}
++          }
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
+     }
+   }
++
++  async put(
++    _virtualPath: string,
++    physicalPath: string,
++    content: Buffer,
++  ): Promise<void> {
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
++  }
+ }
+ 
+ export class ThunderExpertDriver extends ThunderDriver {
+diff --git a/src/backend/drivers/thunder/stream.test.ts b/src/backend/drivers/thunder/stream.test.ts
+new file mode 100644
+index 0000000..a555456
+--- /dev/null
++++ b/src/backend/drivers/thunder/stream.test.ts
+@@ -0,0 +1,245 @@
++// SPEC p2-93（补丁 93）：迅雷 gcid 流式计算与落盘暂存单元测试。
++// mock globalThis.tjs 与 fetch、注入 client.authRequest：不连网、不需要真实迅雷账号。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { ThunderDriver } from "./driver"
++import { calcGcid } from "./util"
++import * as thunderUtil from "./util"
++
++const MB = 1024 * 1024
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++const realDigest = globalThis.crypto.subtle.digest
++
++let spoolDir = ""
++let readLens: number[] = []
++let readTotal = 0
++let digestCalls = 0
++let authCalls: Array<{ url: string; opts: any }> = []
++let putCalls: Array<{ url: string; headers: Record<string, string>; body: any; duplex?: string }> = []
++let putChunkLens: number[] = []
++let putBodyBytes = new Uint8Array(0)
++let putStatus = 200
++let authResp: any = null
++
++function makeSrc(size: number, seed = 13): Uint8Array {
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * seed + 5) & 0xff
++  return src
++}
++
++function makeDriver(): ThunderDriver {
++  const d = new ThunderDriver({ username: "u", password: "p", root_folder_id: "root" } as any)
++  ;(d as any).client = {
++    authRequest: async (url: string, opts: any) => {
++      authCalls.push({ url, opts })
++      return authResp
++    },
++  }
++  return d
++}
++
++beforeEach(async () => {
++  readLens = []
++  readTotal = 0
++  digestCalls = 0
++  authCalls = []
++  putCalls = []
++  putChunkLens = []
++  putBodyBytes = new Uint8Array(0)
++  putStatus = 200
++  authResp = {
++    upload_type: "UPLOAD_TYPE_RESUMABLE",
++    resumable: {
++      params: { endpoint: "up.example.com", bucket: "bkt", key: "k", security_token: "tok" },
++    },
++  }
++  spoolDir = await mkdtemp(join(tmpdir(), "thunder-p93-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => (await fh.write(chunk)).bytesWritten,
++        read: async (buf: Uint8Array, position: number) => {
++          readLens.push(buf.byteLength)
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          readTotal += r.bytesRead
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  ;(globalThis.crypto.subtle as any).digest = (alg: any, data: any) => {
++    digestCalls++
++    return realDigest.call(globalThis.crypto.subtle, alg, data)
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    // 真实 fetch 在 resolve 前读完请求体；这里同样在调用点消费，避免驱动
++    // 按 SPEC 在 finally 关读句柄后测试再读流（否则 EBADF）。
++    if (init?.body instanceof ReadableStream) {
++      const parts: Uint8Array[] = []
++      const reader = init.body.getReader()
++      for (;;) {
++        const { done, value } = await reader.read()
++        if (done) break
++        putChunkLens.push(value.byteLength)
++        parts.push(value)
++      }
++      putBodyBytes = new Uint8Array(Buffer.concat(parts.map((p) => Buffer.from(p))))
++    }
++    putCalls.push({
++      url,
++      headers: (init?.headers || {}) as Record<string, string>,
++      body: init?.body,
++      duplex: init?.duplex,
++    })
++    if (putStatus !== 200) {
++      return {
++        ok: false,
++        status: putStatus,
++        headers: { get: () => "text/plain" },
++        text: async () => "denied",
++        json: async () => ({}),
++      }
++    }
++    return {
++      ok: true,
++      status: 200,
++      headers: { get: () => "text/plain" },
++      text: async () => "",
++      json: async () => ({}),
++    } as any
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  ;(globalThis.crypto.subtle as any).digest = realDigest
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++/** 把 spool 文件当 readAt 源，模拟驱动内部的读法。 */
++function fileReader(path: string) {
++  return async (buf: Uint8Array, position: number): Promise<number> => {
++    readLens.push(buf.byteLength)
++    const fh = await fsp.open(path, "r")
++    try {
++      const r = await fh.read(buf, 0, buf.byteLength, position)
++      readTotal += r.bytesRead
++      return r.bytesRead
++    } finally {
++      await fh.close()
++    }
++  }
++}
++
++test("1 beginStream 与 calcGcidFromSpool 存在", () => {
++  assert.equal(typeof (makeDriver() as any).beginStream, "function")
++  assert.equal(typeof (thunderUtil as any).calcGcidFromSpool, "function")
++})
++
++test("2 gcid 兼容：5MiB / 3MiB+1 / 0 字节与整包 calcGcid 相同", async () => {
++  assert.equal(typeof (thunderUtil as any).calcGcidFromSpool, "function")
++  for (const size of [5 * MB, 3 * MB + 1, 0]) {
++    const src = makeSrc(size)
++    const p = join(spoolDir, `cmp-${size}.bin`)
++    await fsp.writeFile(p, src)
++    const got = await (thunderUtil as any).calcGcidFromSpool(fileReader(p), size)
++    assert.equal(got, calcGcid(src), `size=${size}`)
++  }
++  const empty = await (thunderUtil as any).calcGcidFromSpool(fileReader(join(spoolDir, "cmp-0.bin")), 0)
++  assert.equal(empty, "da39a3ee5e6b4b0d3255bfef95601890afd80709")
++})
++
++test("3 5MiB 流式：读块 <= 2MiB、总读 5MiB、digest 21 次", async () => {
++  const size = 5 * MB
++  const src = makeSrc(size)
++  const p = join(spoolDir, "stream.bin")
++  await fsp.writeFile(p, src)
++  digestCalls = 0
++  readLens = []
++  readTotal = 0
++  const got = await (thunderUtil as any).calcGcidFromSpool(fileReader(p), size)
++  assert.equal(got, calcGcid(src))
++  assert.ok(Math.max(...readLens) <= 2 * MB)
++  assert.equal(readTotal, size)
++  assert.equal(digestCalls, 21)
++})
++
++test("4 5MiB 上传：authRequest 1 次、S3 流式 PUT、字节一致", async () => {
++  const size = 5 * MB
++  const src = makeSrc(size)
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/thunder-test/a.bin", size)
++  await w.write(src)
++  await w.commit()
++
++  assert.equal(authCalls.length, 1)
++  const body = authCalls[0].opts.body
++  assert.equal(body.hash, calcGcid(src))
++  assert.equal(body.size, String(size))
++  assert.equal(body.name, "a.bin")
++  assert.equal(body.parent_id, "thunder-test")
++
++  assert.equal(putCalls.length, 1)
++  const put = putCalls[0]
++  assert.equal(put.url, "https://up.example.com/bkt/k")
++  assert.equal(put.headers["Content-Length"], String(size))
++  assert.equal(put.headers["x-amz-security-token"], "tok")
++  assert.equal(put.duplex, "half")
++  assert.ok(put.body instanceof ReadableStream, "S3 body 是 ReadableStream")
++
++  assert.ok(Math.max(...putChunkLens) <= 64 * 1024)
++  assert.equal(putBodyBytes.byteLength, size)
++  assert.deepEqual(putBodyBytes, src)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("5 0 字节：gcid 空文件、S3 body 是 Uint8Array(0)", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/thunder-test/empty.bin", 0)
++  await w.commit()
++  assert.equal(authCalls[0].opts.body.hash, "da39a3ee5e6b4b0d3255bfef95601890afd80709")
++  assert.equal(authCalls[0].opts.body.size, "0")
++  assert.ok(putCalls[0].body instanceof Uint8Array)
++  assert.equal(putCalls[0].body.byteLength, 0)
++  assert.equal(putCalls[0].headers["Content-Length"], "0")
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("6 S3 403：commit 抛错含 403，spool 已清", async () => {
++  putStatus = 403
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/thunder-test/a.bin", MB)
++  await w.write(new Uint8Array(MB))
++  await assert.rejects(() => w.commit(), /403/)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("7 abort：authRequest 0 次、fetch 0 次、spool 已清", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/thunder-test/a.bin", MB)
++  await w.write(new Uint8Array(MB))
++  await w.abort()
++  assert.equal(authCalls.length, 0)
++  assert.equal(putCalls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("8 声明长度 10 写 11：write 抛错，authRequest 0 次", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/thunder-test/a.bin", 10)
++  await assert.rejects(() => w.write(new Uint8Array(11)), /thunder 上传声明长度与实际不符/)
++  assert.equal(authCalls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
+diff --git a/src/backend/drivers/thunder/util.ts b/src/backend/drivers/thunder/util.ts
+index d32b6ba..760a83d 100644
+--- a/src/backend/drivers/thunder/util.ts
++++ b/src/backend/drivers/thunder/util.ts
+@@ -52,12 +52,21 @@ export function generateDeviceSign(
+   return `div101.${deviceID}${md5Result}`
+ }
+ 
+-export function calcGcid(data: Buffer | Uint8Array): string {
+-  const size = data.length
++/**
++ * gcid 分块大小：256KiB 起，size/psize > 512 且 psize < 2MiB 时翻倍。
++ * 与 A/O 的 calcBlockSize 同逻辑；calcGcid 与流式实现共用。
++ */
++export function calcGcidBlockSize(size: number): number {
+   let psize = 0x40000 // 256KB
+   while (size / psize > 0x200 && psize < 0x200000) {
+     psize = psize << 1
+   }
++  return psize
++}
++
++export function calcGcid(data: Buffer | Uint8Array): string {
++  const size = data.length
++  const psize = calcGcidBlockSize(size)
+ 
+   const chunkDigests: CryptoJS.lib.WordArray[] = []
+   for (let offset = 0; offset < size; offset += psize) {
+@@ -76,6 +85,38 @@ export function calcGcid(data: Buffer | Uint8Array): string {
+   return CryptoJS.SHA1(combined).toString(CryptoJS.enc.Hex)
+ }
+ 
++/**
++ * 从落盘 spool 按块流式算 gcid：每块 SHA-1，再把摘要串整体 SHA-1。
++ * 语义与 calcGcid 完全一致，内存只与块大小有关（<=2MiB）。
++ */
++export async function calcGcidFromSpool(
++  readAt: (buf: Uint8Array, position: number) => Promise<number>,
++  size: number,
++): Promise<string> {
++  const psize = calcGcidBlockSize(size)
++  const digests: Uint8Array[] = []
++  let pos = 0
++  while (pos < size) {
++    const want = Math.min(psize, size - pos)
++    const buf = new Uint8Array(want)
++    let got = 0
++    while (got < want) {
++      const n = await readAt(buf.subarray(got), pos + got)
++      if (!(n > 0)) throw new Error("thunder gcid 读取提前结束")
++      got += n
++    }
++    const d = await crypto.subtle.digest("SHA-1", buf)
++    digests.push(new Uint8Array(d))
++    pos += want
++  }
++  const all = new Uint8Array(digests.length * 20)
++  for (let i = 0; i < digests.length; i++) all.set(digests[i], i * 20)
++  const final = await crypto.subtle.digest("SHA-1", all)
++  return Array.from(new Uint8Array(final))
++    .map((x) => x.toString(16).padStart(2, "0"))
++    .join("")
++}
++
+ export interface ThunderClientOptions {
+   algorithms?: string[]
+   timestamp?: string

@@ -7,18 +7,18 @@
 
 不是 OpenList Go 版的重写。上游的存储驱动、WebDAV、分享、任务逻辑都保留，只把运行时从 Workers 换成 txiki.js。
 
-## 本版（0.1.0-r68）
+## 本版（0.1.0-r69）
 
-- 补丁栈 91 条不变。本版是文字与发布卫生批，不改产品代码语义；唯一代码面变更是在补丁 89 的
-  `src/backend/drivers/weiyun/driver.ts` 第 20 行加一行本地维护注释，说明 txiki 没有 Cloudflare
-  Workers 的子请求预算、所以移除 45 页上限；注释在压缩时被剥离，bundle 与 r67 相同（单文件控制组
-  逐字节相同；拆分形态只有 chunk 文件名因构建哈希级联变化，内容归一后逐文件相同）。
-- 本版相对 r67 的发布件变化：
-  - 源码包根 README 与本文件同一份，不再带内部代号与过期计数；
-  - Release 增加第九件 `SHA256SUMS.release.txt`，可自查全部八个发布件；
-  - README 去掉写死版本的设备描述、标注旧实测数字的版本、写明 txiki-js 包的验签表现与装法。
-- 设备实测沿用 r67（本版未改产品代码），数字见下；r68 没有重跑设备门。
-- 验证面（r67 实测）：静态检查 12 项、设备回归 88 项，0 失败。设备 88 项 = 77 通过 + 4 通过另带说明 + 6 已知限制 + 1 无账号未验证。
+- 补丁栈 95 条（从 r68 的 91 条增加 92..95）。四条上传写路径改为“先落盘 spool，再流式上传”，
+  内存峰值不再随文件大小增长：
+  - 92 Dropbox：大文件改走官方 upload_session 三步（start / append_v2 / finish），每片 20 MiB；
+  - 93 迅雷：gcid 改为从盘按块流式计算（256 KiB 起，最大 2 MiB），S3 用流式 PUT；
+  - 94 又拍云 USS、95 Yandex Disk：用 ReadableStream + Content-Length 单 PUT。
+  - 公共 spool 模块新增 readSpoolExact / spoolReadStream 两个通用读函数，既有 seafile/terabox/weiyun 实现不动。
+  0 字节文件仍走空 body 单请求。读路径、列目录、下载与协议语义不变。
+- 设备实测沿用 r68 的 1 GiB 下载数据；本版没有重跑设备门。四条写路径的真实账号成功面
+  由 bench 另测，本版只交构建件与单元测试。
+- 发布件与校验方式与 r68 相同：九件，`SHA256SUMS.release.txt` 8 行。
 
 ### 本版已知限制
 
@@ -36,7 +36,7 @@
 在 Nokia XG-040G-MF（Airoha AN7583DT，双核 A53，512MB RAM）上实测过：
 
 - 5244 端口跑着设备上本项目的安装树（r66/r67 实测），与 alist-encrypt（5344）并存；本包默认 5345，可与它们共存
-- 登录、列目录、下载与 Range（1GB 单文件下载 sha 一致，峰值内存无增长；r66 实测，r67/r68 未复测）
+- 登录、列目录、下载与 Range（1 GiB 单文件下载 sha 一致，峰值内存无增长；r68 实测 97.48 MiB/s、n=3、sha 3/3、服务端峰值 VmHWM 25,484 kB）
 - WebDAV 服务端（只读 + 写方法）与 WebDAV 客户端驱动
 - 上传流式落盘，不把整文件读进内存
 - 复制任务（SQLite 持久化、进度、取消，重启后无僵尸任务）
@@ -64,7 +64,7 @@
 ## 安装（OpenWrt，aarch64）
 
 ```sh
-apk add --allow-untrusted ./openlist-txiki-0.1.0-r68.apk
+apk add --allow-untrusted ./openlist-txiki-0.1.0-r69.apk
 cat /etc/openlist-txiki/admin.pass          # 初始管理员口令，权限 600
 /etc/init.d/openlist-txiki start
 curl -s http://127.0.0.1:5345/api/public/settings
@@ -74,16 +74,16 @@ curl -s http://127.0.0.1:5345/api/public/settings
 
 | 文件 | 说明 |
 |---|---|
-| openlist-txiki-0.1.0-r68.apk | standard，自带 tjs，完整前端 |
-| openlist-txiki-0.1.0-r68-lite.apk | lite，自带 tjs，精简前端 |
-| openlist-txiki-0.1.0-r68-shared-tjs.apk | standard，共享系统 tjs |
-| openlist-txiki-0.1.0-r68-lite-shared-tjs.apk | lite，共享系统 tjs |
+| openlist-txiki-0.1.0-r69.apk | standard，自带 tjs，完整前端 |
+| openlist-txiki-0.1.0-r69-lite.apk | lite，自带 tjs，精简前端 |
+| openlist-txiki-0.1.0-r69-shared-tjs.apk | standard，共享系统 tjs |
+| openlist-txiki-0.1.0-r69-lite-shared-tjs.apk | lite，共享系统 tjs |
 
 各件字节数与 sha256 见 Release 附带的 `SHA256SUMS.release.txt`，自查命令见下节。
 
 shared 版本依赖系统里的 txiki-js>=26.9.0，可用本 Release 附带的 `txiki-js-26.9.0-r4.apk`。这个包用随附公钥验签的结果是 UNTRUSTED（与 r65/r66 同件同表现，不是本版退化），装的时候要显式跳过验签：`apk add --allow-untrusted ./txiki-js-26.9.0-r4.apk`。
 
-验签：Release 附 `openlist-txiki.rsa.pub`。把公钥拷进 `/etc/apk/keys/` 后，`apk add ./openlist-txiki-0.1.0-r68.apk` 会正常验签；`--allow-untrusted` 是跳过验签的装法。四个 openlist-txiki apk 都能用这把公钥验过；`txiki-js-26.9.0-r4.apk` 是例外，验签结果是 UNTRUSTED（见上）。
+验签：Release 附 `openlist-txiki.rsa.pub`。把公钥拷进 `/etc/apk/keys/` 后，`apk add ./openlist-txiki-0.1.0-r69.apk` 会正常验签；`--allow-untrusted` 是跳过验签的装法。四个 openlist-txiki apk 都能用这把公钥验过；`txiki-js-26.9.0-r4.apk` 是例外，验签结果是 UNTRUSTED（见上）。
 
 升级与卸载：
 

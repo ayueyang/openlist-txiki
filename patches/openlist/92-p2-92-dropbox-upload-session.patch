@@ -1,0 +1,555 @@
+diff --git a/src/backend/drivers/dropbox/driver.ts b/src/backend/drivers/dropbox/driver.ts
+index 4aefb63..4c653ab 100644
+--- a/src/backend/drivers/dropbox/driver.ts
++++ b/src/backend/drivers/dropbox/driver.ts
+@@ -1,3 +1,4 @@
++// 本地维护（SPEC p2-92）：txiki 无整包上传内存，先落盘 spool，再按 20MiB 走 upload_session。
+ import {
+   calcFileType,
+   FileItem,
+@@ -6,6 +7,21 @@ import {
+ import { sortFileItems } from "../../internal/driver/sort"
+ import { DropboxAddition } from "./types"
+ import { DropboxApiClient } from "./util"
++import {
++  assertSpoolSpace,
++  ensureDir,
++  openSpoolFile,
++  randomHex,
++  readSpoolExact,
++  resolveSpoolDir,
++  unlinkSpool,
++  SpoolHandle,
++} from "../../internal/upload/spool"
++
++/** upload_session 单次 append 分片；A/O 同为 20MiB（4MiB 倍数）。 */
++const DROPBOX_PART_SIZE = 20 * 1024 * 1024
++/** begin 时至少预留 expectedSize + 64MiB。 */
++const DROPBOX_SPOOL_MIN_FREE = 64 * 1024 * 1024
+ 
+ export class DropboxDriver implements StorageDriver {
+   private addition: DropboxAddition
+@@ -161,27 +177,165 @@ export class DropboxDriver implements StorageDriver {
+     await this.client.copy(from, to)
+   }
+ 
++  /**
++   * 本地维护：上传先顺序写 spool，commit 按 20MiB 走 upload_session 三步
++   * （start / append_v2 / finish）。内存峰值 = 一个分片，与文件大小无关。
++   */
++  async beginStream(
++    physicalPath: string,
++    expectedSize?: number,
++  ): Promise<{
++    write(chunk: Uint8Array): Promise<void>
++    commit(): Promise<void>
++    abort(): Promise<void>
++  }> {
++    const clean = this.cleanPath(physicalPath)
++    const dir = resolveSpoolDir("dropbox")
++    await ensureDir(dir)
++    const known =
++      typeof expectedSize === "number" &&
++      Number.isFinite(expectedSize) &&
++      expectedSize >= 0
++    await assertSpoolSpace(
++      dir,
++      known
++        ? (expectedSize as number) + DROPBOX_SPOOL_MIN_FREE
++        : DROPBOX_SPOOL_MIN_FREE,
++    )
++    const spoolPath = `${dir}/dropbox-${randomHex(8)}.part`
++    const fh = await openSpoolFile(spoolPath, "w")
++    let size = 0
++    let state: "open" | "done" | "aborted" = "open"
++
++    const closeQuietly = async () => {
++      try {
++        await fh.close()
++      } catch {}
++    }
++    const removeSpool = async () => {
++      try {
++        await unlinkSpool(spoolPath)
++      } catch (e: any) {
++        if (!String(e?.message || e).includes("ENOENT"))
++          console.warn(
++            `[dropbox] 清理 spool 失败：${spoolPath}: ${e?.message || e}`,
++          )
++      }
++    }
++
++    return {
++      write: async (chunk: Uint8Array) => {
++        if (state !== "open")
++          throw new Error("dropbox beginStream 已结束，不能继续写入")
++        if (known && size + chunk.byteLength > (expectedSize as number)) {
++          state = "aborted"
++          await closeQuietly()
++          await removeSpool()
++          throw new Error("dropbox 上传声明长度与实际不符")
++        }
++        await fh.write(chunk)
++        size += chunk.byteLength
++      },
++      commit: async () => {
++        if (state !== "open")
++          throw new Error("dropbox beginStream 已结束，不能重复 commit")
++        state = "done"
++        let reader: SpoolHandle | null = null
++        try {
++          await fh.close()
++          // 0 字节不进 session：/append_v2 收 0 字节分片的行为没有实测。
++          if (size === 0) {
++            await this.client.request("/2/files/upload", {
++              method: "POST",
++              isContentApi: true,
++              customHeaders: {
++                "Dropbox-API-Arg": JSON.stringify({
++                  path: clean,
++                  mode: "overwrite",
++                  autorename: false,
++                  mute: false,
++                  strict_conflict: false,
++                }),
++                "Content-Type": "application/octet-stream",
++              },
++              body: new Uint8Array(0),
++            })
++            return
++          }
++          const start = await this.client.request<{ session_id: string }>(
++            "/2/files/upload_session/start",
++            {
++              method: "POST",
++              isContentApi: true,
++              customHeaders: {
++                "Dropbox-API-Arg": JSON.stringify({ close: false }),
++                "Content-Type": "application/octet-stream",
++              },
++            },
++          )
++          const sessionId = start.session_id
++          reader = await openSpoolFile(spoolPath, "r")
++          for (let offset = 0; offset < size; offset += DROPBOX_PART_SIZE) {
++            const partLen = Math.min(DROPBOX_PART_SIZE, size - offset)
++            const part = new Uint8Array(partLen)
++            await readSpoolExact(reader, part, offset, "dropbox")
++            await this.client.request("/2/files/upload_session/append_v2", {
++              method: "POST",
++              isContentApi: true,
++              customHeaders: {
++                "Dropbox-API-Arg": JSON.stringify({
++                  close: false,
++                  cursor: { session_id: sessionId, offset },
++                }),
++                "Content-Type": "application/octet-stream",
++              },
++              body: part,
++            })
++          }
++          await this.client.request("/2/files/upload_session/finish", {
++            method: "POST",
++            isContentApi: true,
++            customHeaders: {
++              "Dropbox-API-Arg": JSON.stringify({
++                commit: {
++                  path: clean,
++                  mode: "overwrite",
++                  autorename: false,
++                  mute: false,
++                  strict_conflict: false,
++                },
++                cursor: { session_id: sessionId, offset: size },
++              }),
++              "Content-Type": "application/octet-stream",
++            },
++          })
++        } finally {
++          if (reader) {
++            try {
++              await reader.close()
++            } catch {}
++          }
++          await closeQuietly()
++          await removeSpool()
++        }
++      },
++      abort: async () => {
++        if (state !== "open") return
++        state = "aborted"
++        await closeQuietly()
++        await removeSpool()
++      },
++    }
++  }
++
+   async put(
+     virtualPath: string,
+     physicalPath: string,
+     content: Buffer | Uint8Array,
+   ): Promise<void> {
+-    const clean = this.cleanPath(physicalPath)
+-    await this.client.request("/2/files/upload", {
+-      method: "POST",
+-      isContentApi: true,
+-      customHeaders: {
+-        "Dropbox-API-Arg": JSON.stringify({
+-          path: clean,
+-          mode: "overwrite",
+-          autorename: false,
+-          mute: false,
+-          strict_conflict: false,
+-        }),
+-        "Content-Type": "application/octet-stream",
+-      },
+-      body: content,
+-    })
++    const w = await this.beginStream(physicalPath, content.length)
++    await w.write(content)
++    await w.commit()
+   }
+ 
+   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {
+diff --git a/src/backend/drivers/dropbox/upload-session.test.ts b/src/backend/drivers/dropbox/upload-session.test.ts
+new file mode 100644
+index 0000000..69c516a
+--- /dev/null
++++ b/src/backend/drivers/dropbox/upload-session.test.ts
+@@ -0,0 +1,208 @@
++// SPEC p2-92（补丁 92）：Dropbox upload_session 与落盘暂存单元测试。
++// mock globalThis.fetch 与 globalThis.tjs：不连网、不需要真实 Dropbox 账号。
++import assert from "node:assert/strict"
++import { afterEach, beforeEach, test } from "node:test"
++import * as fsp from "node:fs/promises"
++import { mkdtemp, readdir, rm } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++import { DropboxDriver } from "./driver"
++
++const MB = 1024 * 1024
++const PART = 20 * MB
++const realFetch = globalThis.fetch
++const realTjs = (globalThis as any).tjs
++
++interface Call {
++  url: string
++  method: string
++  headers: Record<string, string>
++  body: any
++}
++
++let calls: Call[] = []
++let spoolDir = ""
++let appendFailAt = -1
++let append401At = -1
++let refreshCount = 0
++let appendCalls: Array<{ offset: number; bytes: Uint8Array }> = []
++let uploadBodies: any[] = []
++
++function jsonResponse(body: any): any {
++  const text = JSON.stringify(body)
++  return {
++    ok: true,
++    status: 200,
++    headers: { get: () => "application/json" },
++    text: async () => text,
++    json: async () => JSON.parse(text),
++  }
++}
++
++function errResponse(status: number, text: string): any {
++  return {
++    ok: false,
++    status,
++    headers: { get: () => "text/plain" },
++    text: async () => text,
++    json: async () => ({}),
++  }
++}
++
++function apiArg(c: Call): any {
++  return JSON.parse(c.headers["Dropbox-API-Arg"])
++}
++
++function makeDriver(): DropboxDriver {
++  return new DropboxDriver({ access_token: "t0", refresh_token: "r0" } as any)
++}
++
++function countUrl(part: string): number {
++  return calls.filter((c) => c.url.includes(part)).length
++}
++
++beforeEach(async () => {
++  calls = []
++  appendFailAt = -1
++  append401At = -1
++  refreshCount = 0
++  appendCalls = []
++  uploadBodies = []
++  spoolDir = await mkdtemp(join(tmpdir(), "dropbox-p92-"))
++  ;(globalThis as any).tjs = {
++    env: { UPLOAD_SPOOL_DIR: spoolDir },
++    statFs: async () => ({ bsize: 4096, bavail: 1024 * 1024 }),
++    open: async (p: string, mode: "r" | "w") => {
++      const fh = await fsp.open(p, mode)
++      return {
++        write: async (chunk: Uint8Array) => (await fh.write(chunk)).bytesWritten,
++        read: async (buf: Uint8Array, position: number) => {
++          const r = await fh.read(buf, 0, buf.byteLength, position)
++          return r.bytesRead
++        },
++        close: async () => fh.close(),
++      }
++    },
++  }
++  globalThis.fetch = (async (input: any, init?: any) => {
++    const url = String(input)
++    const method = String(init?.method || "POST").toUpperCase()
++    const headers = (init?.headers || {}) as Record<string, string>
++    const call: Call = { url, method, headers, body: init?.body }
++    calls.push(call)
++    if (url.includes("/oauth2/token")) {
++      refreshCount++
++      return jsonResponse({ access_token: "t1", refresh_token: "r1" })
++    }
++    if (url.includes("/2/files/upload_session/start")) {
++      return jsonResponse({ session_id: "s1" })
++    }
++    if (url.includes("/2/files/upload_session/append_v2")) {
++      const arg = apiArg(call)
++      const idx = appendCalls.length
++      appendCalls.push({ offset: arg.cursor.offset, bytes: new Uint8Array(init.body) })
++      if (idx === appendFailAt) return errResponse(413, "payload too large")
++      if (idx === append401At) return errResponse(401, "expired_access_token")
++      return jsonResponse({})
++    }
++    if (url.includes("/2/files/upload_session/finish")) {
++      return jsonResponse({ name: "a.bin" })
++    }
++    if (url.endsWith("/2/files/upload")) {
++      uploadBodies.push(init?.body)
++      return jsonResponse({ name: "a.bin" })
++    }
++    throw new Error("unexpected fetch: " + url)
++  }) as any
++})
++
++afterEach(async () => {
++  globalThis.fetch = realFetch
++  ;(globalThis as any).tjs = realTjs
++  await rm(spoolDir, { recursive: true, force: true })
++})
++
++test("1 beginStream 存在", () => {
++  assert.equal(typeof (makeDriver() as any).beginStream, "function")
++})
++
++test("2 25MiB：start 1 + append 2 + finish 1，分片 20MiB，字节一致", async () => {
++  const size = 25 * MB
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * 31 + 7) & 0xff
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/a.bin", size)
++  await w.write(src)
++  await w.commit()
++
++  assert.equal(countUrl("/upload_session/start"), 1)
++  assert.equal(appendCalls.length, 2)
++  assert.equal(countUrl("/upload_session/finish"), 1)
++  assert.deepEqual(
++    appendCalls.map((a) => a.offset),
++    [0, PART],
++  )
++  assert.equal(Math.max(...appendCalls.map((a) => a.bytes.byteLength)), PART)
++  const joined = Buffer.concat(appendCalls.map((a) => Buffer.from(a.bytes)))
++  assert.equal(joined.byteLength, size)
++  assert.deepEqual(new Uint8Array(joined), src)
++
++  const fin = calls.find((c) => c.url.includes("/upload_session/finish"))!
++  const arg = apiArg(fin)
++  assert.equal(arg.commit.path, "/docs/a.bin")
++  assert.equal(arg.commit.mode, "overwrite")
++  assert.equal(arg.cursor.offset, size)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("3 0 字节：只发 /2/files/upload 一次，空 body，不进 session", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/empty.bin", 0)
++  await w.commit()
++  assert.equal(uploadBodies.length, 1)
++  assert.equal(uploadBodies[0].byteLength, 0)
++  assert.equal(countUrl("/upload_session/"), 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("4 首个 append 401：refreshToken 1 次、append 请求 3 次、finish 成功", async () => {
++  append401At = 0
++  const size = 25 * MB
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/a.bin", size)
++  await w.write(new Uint8Array(size))
++  await w.commit()
++  assert.equal(refreshCount, 1)
++  assert.equal(countUrl("/upload_session/append_v2"), 3)
++  assert.equal(appendCalls.length, 3)
++  assert.equal(countUrl("/upload_session/finish"), 1)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("5 append 413：commit 抛错含 413，finish 0 次，spool 已清", async () => {
++  appendFailAt = 0
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/a.bin", 25 * MB)
++  await w.write(new Uint8Array(25 * MB))
++  await assert.rejects(() => w.commit(), /413/)
++  assert.equal(countUrl("/upload_session/finish"), 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("6 声明长度 10 写 11：write 抛错，fetch 0 次，spool 已清", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/a.bin", 10)
++  await assert.rejects(() => w.write(new Uint8Array(11)), /dropbox 上传声明长度与实际不符/)
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
++
++test("7 abort：fetch 0 次，spool 已清", async () => {
++  const d = makeDriver()
++  const w = await (d as any).beginStream("/docs/a.bin", 1024)
++  await w.write(new Uint8Array(1024))
++  await w.abort()
++  assert.equal(calls.length, 0)
++  assert.deepEqual(await readdir(spoolDir), [])
++})
+diff --git a/src/backend/internal/upload/spool.test.ts b/src/backend/internal/upload/spool.test.ts
+new file mode 100644
+index 0000000..b930e33
+--- /dev/null
++++ b/src/backend/internal/upload/spool.test.ts
+@@ -0,0 +1,64 @@
++// SPEC p2-92（补丁 92）：spool 通用读函数单元测试。
++// 只覆盖 readSpoolExact / spoolReadStream：不连网、不碰真实 spool 目录。
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import * as spool from "./spool"
++
++interface FakeHandle {
++  readAt(buf: Uint8Array, position: number): Promise<number>
++}
++
++/** 假读句柄：plan 限定每次 readAt 最多回多少字节，缺省整块。 */
++function fakeHandle(data: Uint8Array, plan?: number[]): FakeHandle {
++  let calls = 0
++  return {
++    async readAt(buf: Uint8Array, position: number) {
++      const room = plan ? plan[Math.min(calls, plan.length - 1)] : buf.byteLength
++      calls++
++      const want = Math.min(buf.byteLength, room, Math.max(0, data.byteLength - position))
++      buf.set(data.subarray(position, position + want), 0)
++      return want
++    },
++  }
++}
++
++test("R1 readSpoolExact 以多段读填满缓冲", async () => {
++  assert.equal(typeof (spool as any).readSpoolExact, "function")
++  const src = Uint8Array.from({ length: 100 }, (_, i) => (i * 7) & 0xff)
++  const h = fakeHandle(src, [40, 30, 30])
++  const out = new Uint8Array(100)
++  await (spool as any).readSpoolExact(h, out, 0, "unit")
++  assert.deepEqual(out, src)
++})
++
++test("R2 readSpoolExact 提前 EOF 抛错", async () => {
++  const h = fakeHandle(new Uint8Array(10), [10])
++  const out = new Uint8Array(20)
++  await assert.rejects(
++    () => (spool as any).readSpoolExact(h, out, 0, "unit"),
++    /unit spool 读取提前结束/,
++  )
++})
++
++test("R3 spoolReadStream 分块读、拼回一致", async () => {
++  assert.equal(typeof (spool as any).spoolReadStream, "function")
++  const size = 150 * 1024 + 7
++  const src = new Uint8Array(size)
++  for (let i = 0; i < size; i++) src[i] = (i * 17 + 3) & 0xff
++  const h = fakeHandle(src)
++  const lens: number[] = []
++  const parts: Uint8Array[] = []
++  const reader = (spool as any).spoolReadStream(h, size, "unit").getReader()
++  for (;;) {
++    const { done, value } = await reader.read()
++    if (done) break
++    lens.push(value.byteLength)
++    parts.push(value)
++  }
++  assert.ok(Math.max(...lens) <= 64 * 1024, "读块 <= 64KiB")
++  assert.ok(Math.min(...lens) > 0)
++  const joined = Buffer.concat(parts.map((p) => Buffer.from(p)))
++  assert.equal(joined.byteLength, size)
++  assert.deepEqual(new Uint8Array(joined), src)
++})
+diff --git a/src/backend/internal/upload/spool.ts b/src/backend/internal/upload/spool.ts
+index eae3c2b..69b8bf6 100755
+--- a/src/backend/internal/upload/spool.ts
++++ b/src/backend/internal/upload/spool.ts
+@@ -156,3 +156,53 @@ export function randomHex(bytes: number): string {
+     .map((x) => x.toString(16).padStart(2, "0"))
+     .join("")
+ }
++
++
++/** 按 position 读满 buf；readAt 返回 0 视为提前结束。 */
++export async function readSpoolExact(
++  handle: SpoolHandle,
++  buf: Uint8Array,
++  position: number,
++  label: string,
++): Promise<void> {
++  let got = 0
++  while (got < buf.byteLength) {
++    const n = await handle.readAt(buf.subarray(got), position + got)
++    if (!(n > 0)) throw new Error(`${label} spool 读取提前结束`)
++    got += n
++  }
++}
++
++/**
++ * 从 spool 读句柄建出站流：pull 驱动、chunkSize 一块、读到 size 就 close。
++ * 一块读不满时继续读，readAt 返回 0 抛错（不静默截断）。
++ */
++export function spoolReadStream(
++  handle: SpoolHandle,
++  size: number,
++  label: string,
++  chunkSize = 64 * 1024,
++): ReadableStream<Uint8Array> {
++  let pos = 0
++  return new ReadableStream<Uint8Array>({
++    pull: async (controller) => {
++      if (pos >= size) {
++        controller.close()
++        return
++      }
++      const want = Math.min(chunkSize, size - pos)
++      const buf = new Uint8Array(want)
++      let got = 0
++      while (got < want) {
++        const n = await handle.readAt(buf.subarray(got), pos + got)
++        if (!(n > 0)) {
++          controller.error(new Error(`${label} spool 读取提前结束`))
++          return
++        }
++        got += n
++      }
++      pos += want
++      controller.enqueue(buf)
++    },
++  })
++}

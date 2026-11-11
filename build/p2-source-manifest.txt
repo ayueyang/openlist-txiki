@@ -155,7 +155,7 @@
 manifest_version 3
 upstream_commit 5f53f58dd0f5e5d03eb6079da7f637fa151d8dca
 checkout_eol crlf
-patch_count 91
+patch_count 95
 file_count 44
 patch 01 6fa41d80ee181fdad3d65c9f5723a5fbda191f56053e0cd447000de46d6c94d8 work/p1-b1-datadir-fix.patch
 patch 02 ccaf535d1e9df3b45388af8bb7c058db74fffe430f1add54db82c53db82f3b35 work/g2-schema.patch
@@ -548,3 +548,15 @@ patch 88 44d47fd152fce29ebbb0f1ddf0cb98c891f3d2efd082c2a2af744d2e39ef9f6b work/p
 patch 89 3934cbc757a3c83684cfea2b8e5887eb88a79c2f32c6998c659e3dc56433fa6b work/p2-89-weiyun-list-unbounded.patch
 patch 90 c733bea792171e2f38ecf20777b78419aa90fce049d31ed3fdc38d407c856365 work/p2-90-yandex-refresh-default-off.patch
 patch 91 f99c47e2181f4b39af500bdd93e2110064fa315b5941f9f36eb38cebf2410633 work/p2-91-wopan-init-failclosed.patch
+# 第 92 条（SPEC p2-92）：dropbox 上传改落盘 spool + upload_session 三步（20MiB 分片），
+#   0 字节仍走单请求 /2/files/upload；覆盖语义保持 overwrite。
+# 第 93 条（SPEC p2-93）：thunder 上传先落盘 spool，gcid 按块从盘流式计算（256KiB 起，<=2MiB），
+#   S3 用 ReadableStream + Content-Length 单 PUT；calcGcid 保留作对照。
+# 第 94 条（SPEC p2-94）：uss 上传先落盘 spool，再用 ReadableStream 单 PUT；
+#   0 字节用空 Uint8Array；错误文案带状态码与前 300 字符。
+# 第 95 条（SPEC p2-95）：yandex 上传先落盘 spool，getUploadLink 空 href 显式抛错，
+#   再用 ReadableStream + Content-Length 单 PUT。
+patch 92 ce3d1b607e5b9c35486c05bec20b4dd8485f0f933e186e4d71be07a60f06f0cd work/p2-92-dropbox-upload-session.patch
+patch 93 7d8732bcd665b83d7ac6620963099e0312bbca7f30b5f105b585187879ee2883 work/p2-93-thunder-gcid-spool.patch
+patch 94 0f3fd551e9f9c53190c465df675ad173202c96d8f239526d1a4aabc9c037f989 work/p2-94-uss-put-spool.patch
+patch 95 ba81c66af542d1f46f8c46808fe8916a4888c4cae31843b3026db7f70bf5fcf5 work/p2-95-yandex-put-spool.patch
